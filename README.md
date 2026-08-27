@@ -1,4 +1,7 @@
-# ecco
+<p align="center">
+ <img src="ecco.png" alt="Ecco logo" width="120px" height="120px">
+</p>
+<h2 align="center">Ecco</h2>
 
 Your agent talks to my agent.
 
