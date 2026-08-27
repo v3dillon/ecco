@@ -47,12 +47,33 @@ pub trait Store: Send + Sync {
     fn remove(&self, id: &str) -> Res<bool>;
 }
 
-/// The per-envelope expiry test, shared by the sweep statements. Parameter 1
-/// is `now`, parameter 2 the default window in days.
-const SQLITE_EXPIRED: &str = "COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), ?2) > 0
-     AND msgs.received_at < ?1 - COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), ?2) * 86400";
-const PG_EXPIRED: &str = "COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), $2) > 0
-     AND msgs.received_at < $1 - COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), $2)::bigint * 86400";
+/// Rows per sweep transaction. Each batch takes the store lock once and
+/// briefly, so requests interleave with a long sweep.
+pub const SWEEP_BATCH: usize = 1000;
+
+/// One batch of expired gseqs. Parameter 1 is `now`, 2 the default window in
+/// days, 3 the bound `now - min_window`: nothing newer can be expired, and
+/// `msgs_received` turns the scan into a range read of the old tail. The
+/// per-sender test after it is exact. ORDER BY makes the batch deterministic
+/// across the two DELETEs in one transaction.
+const SQLITE_BATCH: &str = "SELECT gseq FROM msgs WHERE msgs.received_at < ?3
+     AND COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), ?2) > 0
+     AND msgs.received_at < ?1 - COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), ?2) * 86400
+     ORDER BY gseq LIMIT 1000";
+const PG_BATCH: &str = "SELECT gseq FROM msgs WHERE msgs.received_at < $3
+     AND COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), $2) > 0
+     AND msgs.received_at < $1 - COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), $2)::bigint * 86400
+     ORDER BY gseq LIMIT 1000";
+
+/// The smallest positive window in play, or None when nothing can expire.
+fn min_window(default_days: u32, min_entry_days: Option<i64>) -> Option<u64> {
+    [Some(default_days as i64), min_entry_days]
+        .into_iter()
+        .flatten()
+        .filter(|d| *d > 0)
+        .map(|d| d as u64)
+        .min()
+}
 
 // ---- SqliteStore: single file, WAL mode — self-hosted and dedicated relays ----
 
@@ -69,6 +90,7 @@ CREATE TABLE IF NOT EXISTS msgs (
   env TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS msgs_about ON msgs(about, tseq);
+CREATE INDEX IF NOT EXISTS msgs_received ON msgs(received_at);
 CREATE TABLE IF NOT EXISTS msg_to (gseq INTEGER NOT NULL, addr TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS msg_to_addr ON msg_to(addr, gseq);
 CREATE TABLE IF NOT EXISTS retention (sender TEXT PRIMARY KEY, days INTEGER NOT NULL);
@@ -252,18 +274,40 @@ impl Store for SqliteStore {
     }
 
     fn sweep(&self, now: u64, default_days: u32) -> Res<u64> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = sq(conn.transaction())?;
-        let params = rusqlite::params![now as i64, default_days as i64];
-        sq(tx.execute(
-            &format!(
-                "DELETE FROM msg_to WHERE gseq IN (SELECT gseq FROM msgs WHERE {SQLITE_EXPIRED})"
-            ),
-            params,
-        ))?;
-        let n = sq(tx.execute(&format!("DELETE FROM msgs WHERE {SQLITE_EXPIRED}"), params))?;
-        sq(tx.commit())?;
-        Ok(n as u64)
+        let min_entry: Option<i64> = {
+            let conn = self.conn.lock().unwrap();
+            sq(
+                conn.query_row("SELECT MIN(days) FROM retention WHERE days > 0", [], |r| {
+                    r.get(0)
+                }),
+            )?
+        };
+        let Some(window) = min_window(default_days, min_entry) else {
+            return Ok(0);
+        };
+        let bound = now.saturating_sub(window * 86_400) as i64;
+        let mut total = 0u64;
+        loop {
+            let n = {
+                let mut conn = self.conn.lock().unwrap();
+                let tx = sq(conn.transaction())?;
+                let params = rusqlite::params![now as i64, default_days as i64, bound];
+                sq(tx.execute(
+                    &format!("DELETE FROM msg_to WHERE gseq IN ({SQLITE_BATCH})"),
+                    params,
+                ))?;
+                let n = sq(tx.execute(
+                    &format!("DELETE FROM msgs WHERE gseq IN ({SQLITE_BATCH})"),
+                    params,
+                ))?;
+                sq(tx.commit())?;
+                n
+            };
+            total += n as u64;
+            if n < SWEEP_BATCH {
+                return Ok(total);
+            }
+        }
     }
 
     fn remove(&self, id: &str) -> Res<bool> {
@@ -301,6 +345,7 @@ CREATE TABLE IF NOT EXISTS msgs (
   env TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS msgs_about ON msgs(about, tseq);
+CREATE INDEX IF NOT EXISTS msgs_received ON msgs(received_at);
 CREATE TABLE IF NOT EXISTS msg_to (
   gseq BIGINT NOT NULL REFERENCES msgs(gseq),
   addr TEXT NOT NULL
@@ -473,20 +518,41 @@ impl Store for PgStore {
     }
 
     fn sweep(&self, now: u64, default_days: u32) -> Res<u64> {
-        let mut c = self.client.lock().unwrap();
-        let mut tx = db(c.transaction())?;
+        let min_entry: Option<i64> = {
+            let mut c = self.client.lock().unwrap();
+            db(c.query_one(
+                "SELECT MIN(days)::bigint FROM retention WHERE days > 0",
+                &[],
+            ))?
+            .get(0)
+        };
+        let Some(window) = min_window(default_days, min_entry) else {
+            return Ok(0);
+        };
+        let bound = now.saturating_sub(window * 86_400) as i64;
         let now = now as i64;
         let days = default_days as i32;
-        db(tx.execute(
-            &format!("DELETE FROM msg_to WHERE gseq IN (SELECT gseq FROM msgs WHERE {PG_EXPIRED})"),
-            &[&now, &days],
-        ))?;
-        let n = db(tx.execute(
-            &format!("DELETE FROM msgs WHERE {PG_EXPIRED}"),
-            &[&now, &days],
-        ))?;
-        db(tx.commit())?;
-        Ok(n)
+        let mut total = 0u64;
+        loop {
+            let n = {
+                let mut c = self.client.lock().unwrap();
+                let mut tx = db(c.transaction())?;
+                db(tx.execute(
+                    &format!("DELETE FROM msg_to WHERE gseq IN ({PG_BATCH})"),
+                    &[&now, &days, &bound],
+                ))?;
+                let n = db(tx.execute(
+                    &format!("DELETE FROM msgs WHERE gseq IN ({PG_BATCH})"),
+                    &[&now, &days, &bound],
+                ))?;
+                db(tx.commit())?;
+                n
+            };
+            total += n;
+            if (n as usize) < SWEEP_BATCH {
+                return Ok(total);
+            }
+        }
     }
 
     fn remove(&self, id: &str) -> Res<bool> {
@@ -574,6 +640,41 @@ mod tests {
         // Thread seq keeps counting; nothing is reused after a sweep.
         let s = store.append(note(&alice, &bob, "a-next", 4), now).unwrap();
         assert_eq!(s.tseq, 4);
+    }
+
+    #[test]
+    fn min_window_picks_the_smallest_positive_days() {
+        assert_eq!(min_window(0, None), None);
+        assert_eq!(min_window(0, Some(0)), None);
+        assert_eq!(min_window(7, None), Some(7));
+        assert_eq!(min_window(0, Some(14)), Some(14));
+        assert_eq!(min_window(30, Some(14)), Some(14));
+        assert_eq!(min_window(7, Some(14)), Some(7));
+    }
+
+    #[test]
+    fn sweep_works_in_batches_and_leaves_fresh_rows() {
+        let store = fresh();
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        let now = 100 * DAY;
+        let old = 2 * SWEEP_BATCH + 5;
+        for i in 0..old {
+            store
+                .append(
+                    note(&alice, &bob, &format!("old-{i}"), i as u64),
+                    now - 10 * DAY,
+                )
+                .unwrap();
+        }
+        store
+            .append(note(&alice, &bob, "fresh", 9_999), now - DAY)
+            .unwrap();
+        assert_eq!(store.sweep(now, 7).unwrap(), old as u64);
+        assert_eq!(store.sweep(now, 7).unwrap(), 0);
+        let left = store.inbox(&bob.addr(), 0).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].env.body["text"], "fresh");
     }
 
     #[test]
