@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use crate::client;
 use crate::envelope;
-use crate::identity::Identity;
+use crate::identity::{self, Identity};
 
 const TOOLS: &[&str] = &[
     "ecco_send", "ecco_inbox", "ecco_thread", "ecco_pending", "ecco_resolve", "ecco_whoami",
@@ -94,7 +94,7 @@ fn call(home: &PathBuf, name: &str, args: &Value) -> Result<String, String> {
                 .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
                 .unwrap_or_default();
             let about = str_arg("about").unwrap_or_else(|| crate::dm_thread(&id.addr(), &to));
-            crate::post(&id, about, kind, json!({ "text": text }), to)
+            crate::post(home, &id, about, kind, json!({ "text": text }), to)
         }
         "ecco_inbox" => {
             let new = args.get("new").and_then(Value::as_bool).unwrap_or(false);
@@ -109,16 +109,46 @@ fn call(home: &PathBuf, name: &str, args: &Value) -> Result<String, String> {
                     crate::save_cursor(home, max)?;
                 }
             }
-            Ok(pretty(&serde_json::to_value(&msgs).unwrap()))
+            let (visible, held) = crate::partition(home, &id, msgs);
+            let mut out = serde_json::Map::new();
+            out.insert("msgs".into(), serde_json::to_value(&visible).unwrap());
+            if !held.is_empty() {
+                // Sender + kind only — held content never reaches the agent surface.
+                let summary: Vec<Value> = held
+                    .iter()
+                    .map(|s| json!({ "from": s.env.from, "kind": s.env.kind }))
+                    .collect();
+                out.insert("held_for_human_review".into(), json!(summary));
+                out.insert(
+                    "note".into(),
+                    json!("messages from unknown senders are held; your human reviews them with `ecco requests` and admits senders with `ecco trust <addr>`"),
+                );
+            }
+            Ok(pretty(&Value::Object(out)))
         }
         "ecco_thread" => {
             let about = str_arg("about").ok_or("'about' is required")?;
             let mut msgs = client::thread(&id.relay, id.token.as_deref(), &about, 0, 0)?;
             msgs.sort_by_key(|s| s.tseq);
-            Ok(pretty(&serde_json::to_value(&msgs).unwrap()))
+            let contacts = identity::contacts_load(home);
+            let me = id.addr();
+            let annotated: Vec<Value> = msgs
+                .iter()
+                .filter_map(|s| match identity::standing(&contacts, &me, &s.env.from) {
+                    identity::Standing::Blocked => None,
+                    st => {
+                        let mut v = serde_json::to_value(s).unwrap();
+                        if st == identity::Standing::Unknown {
+                            v["untrusted_sender"] = json!(true);
+                        }
+                        Some(v)
+                    }
+                })
+                .collect();
+            Ok(pretty(&json!(annotated)))
         }
         "ecco_pending" => {
-            let pending = crate::pending_proposals(&id)?;
+            let pending = crate::pending_proposals(home, &id)?;
             Ok(pretty(&serde_json::to_value(&pending).unwrap()))
         }
         "ecco_resolve" => {
@@ -149,7 +179,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "ecco_inbox",
-            "description": "Messages addressed to you. Pass new=true to get only unseen messages and advance the persisted cursor — recommended at session start.",
+            "description": "Messages addressed to you. Pass new=true to get only unseen messages and advance the persisted cursor — recommended at session start. Messages from senders your human has not approved are withheld (sender summary only); admission is a human decision made outside this surface.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

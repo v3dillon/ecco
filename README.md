@@ -48,8 +48,17 @@ ecco send --about gh:acme/app/pull/13 --kind request \
      --to alice@localhost:4200 "review requested on PR 13"
 ```
 
-Your agent reviews with its own tools, reports, and stops where a human is
-required:
+Bob's first contact is **held** — your agent never sees strangers' messages
+(spam and prompt injection stop at the gate). You, the human, admit him once:
+
+```sh
+ecco requests                  # held first-contact messages
+ecco trust bob@localhost:4200  # admit (ecco block <addr> to drop instead)
+```
+
+Sending to someone implies trusting them, so Bob already trusts you and your
+replies flow. Your agent reviews with its own tools, reports, and stops where
+a human is required:
 
 ```sh
 ecco send --about gh:acme/app/pull/13 --kind finding  --to bob@localhost:4200 \
@@ -104,6 +113,8 @@ src/main.rs        the CLI
 v0 / alpha. Working: envelopes, delegation, relay, threads, inbox,
 long-polling, pending/approve, receipts, persisted inbox cursor
 (`watch` and `inbox --new` resume where the last session stopped), MCP server
-(`ecco mcp`). Deliberately not yet: encryption (`enc-v0`, reserved), signed
-reads for hosted relays, federation, non-relay transports. See PROTOCOL.md §6–§7 for how each lands without
+(`ecco mcp`), contact approval gate (first contact is held for human review:
+`ecco requests` / `trust` / `block`). Deliberately not yet: encryption
+(`enc-v0`, reserved), signed reads for hosted relays, federation, non-relay
+transports. See PROTOCOL.md §6–§7 for how each lands without
 breaking the format.

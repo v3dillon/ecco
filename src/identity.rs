@@ -232,6 +232,46 @@ pub fn addr_relay_url(addr: &str) -> Result<String, String> {
     Ok(format!("{scheme}://{authority}"))
 }
 
+/// Client-side contact policy (PROTOCOL.md §4): addr -> "approved" | "blocked".
+/// This gates what reaches the *agent*; the relay stores envelopes regardless.
+pub type Contacts = std::collections::HashMap<String, String>;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Standing {
+    Trusted,
+    Unknown,
+    Blocked,
+}
+
+pub fn contacts_load(home: &Path) -> Contacts {
+    fs::read_to_string(home.join("contacts.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn contacts_set(home: &Path, addr: &str, status: &str) -> Result<(), String> {
+    let mut contacts = contacts_load(home);
+    contacts.insert(addr.to_string(), status.to_string());
+    fs::create_dir_all(home).map_err(|e| e.to_string())?;
+    fs::write(
+        home.join("contacts.json"),
+        serde_json::to_string_pretty(&contacts).unwrap(),
+    )
+    .map_err(|e| e.to_string())
+}
+
+pub fn standing(contacts: &Contacts, self_addr: &str, from: &str) -> Standing {
+    if from == self_addr {
+        return Standing::Trusted;
+    }
+    match contacts.get(from).map(String::as_str) {
+        Some("approved") => Standing::Trusted,
+        Some("blocked") => Standing::Blocked,
+        _ => Standing::Unknown,
+    }
+}
+
 pub fn default_home() -> PathBuf {
     if let Ok(h) = std::env::var("ECCO_HOME") {
         return PathBuf::from(h);
@@ -294,6 +334,17 @@ mod tests {
         let past_expiry = profile.delegations[0].exp + 1;
         let env = seal(&id, "note", &id.agent_key());
         assert!(profile.authorizes(&env.key, "note", past_expiry).is_err());
+    }
+
+    #[test]
+    fn contact_standing_rules() {
+        let mut c = Contacts::new();
+        c.insert("bob@x".into(), "approved".into());
+        c.insert("eve@x".into(), "blocked".into());
+        assert_eq!(standing(&c, "alice@x", "alice@x"), Standing::Trusted); // self always
+        assert_eq!(standing(&c, "alice@x", "bob@x"), Standing::Trusted);
+        assert_eq!(standing(&c, "alice@x", "eve@x"), Standing::Blocked);
+        assert_eq!(standing(&c, "alice@x", "stranger@x"), Standing::Unknown);
     }
 
     #[test]

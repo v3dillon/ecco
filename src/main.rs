@@ -72,6 +72,12 @@ enum Cmd {
     },
     /// Show a thread — the ledger for one artifact
     Log { about: String },
+    /// Held first-contact messages awaiting your (human) review
+    Requests,
+    /// Approve a sender — their messages become visible to your agent
+    Trust { addr: String },
+    /// Block a sender — their messages are dropped from view
+    Block { addr: String },
     /// List proposals awaiting your (human) decision
     Pending,
     /// Sign a decision approving a proposal — root key, human only
@@ -120,20 +126,24 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
         Cmd::Send { text, to, about, kind } => {
             let id = Identity::load(home)?;
             let about = about.unwrap_or_else(|| dm_thread(&id.addr(), &to));
-            let receipt = post(&id, about, kind, json!({ "text": text }), to)?;
+            let receipt = post(home, &id, about, kind, json!({ "text": text }), to)?;
             println!("{receipt}");
             Ok(())
         }
         Cmd::Inbox { since, new } => {
             let id = Identity::load(home)?;
             let start = if new { load_cursor(home) } else { since };
-            let mut cursor = start;
-            for s in client::inbox(&id.relay, id.token.as_deref(), &id.addr(), start, 0)? {
-                println!("{}", fmt(&s));
-                cursor = cursor.max(s.gseq);
+            let msgs = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), start, 0)?;
+            let max_gseq = msgs.iter().map(|s| s.gseq).max().unwrap_or(start);
+            let (visible, held) = partition(home, &id, msgs);
+            for s in &visible {
+                println!("{}", fmt(s, false));
+            }
+            if !held.is_empty() {
+                eprintln!("({} held from unknown senders — review with `ecco requests`)", held.len());
             }
             if new {
-                save_cursor(home, cursor)?;
+                save_cursor(home, max_gseq)?;
             }
             Ok(())
         }
@@ -142,9 +152,17 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             let mut cursor = since.unwrap_or_else(|| load_cursor(home));
             eprintln!("watching inbox for {} from #{cursor} (ctrl-c to stop)", id.addr());
             loop {
-                for s in client::inbox(&id.relay, id.token.as_deref(), &id.addr(), cursor, 25)? {
-                    println!("{}", fmt(&s));
-                    cursor = cursor.max(s.gseq);
+                let batch = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), cursor, 25)?;
+                let max_gseq = batch.iter().map(|s| s.gseq).max();
+                let (visible, held) = partition(home, &id, batch);
+                for s in &visible {
+                    println!("{}", fmt(s, false));
+                }
+                for s in &held {
+                    eprintln!("held: [{}] from {} — review with `ecco requests`", s.env.kind, s.env.from);
+                }
+                if let Some(m) = max_gseq {
+                    cursor = cursor.max(m);
                     save_cursor(home, cursor)?;
                 }
             }
@@ -153,19 +171,53 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             let id = Identity::load(home)?;
             let mut msgs = client::thread(&id.relay, id.token.as_deref(), &about, 0, 0)?;
             msgs.sort_by_key(|s| s.tseq);
+            let contacts = identity::contacts_load(home);
+            let me = id.addr();
             for s in msgs {
-                println!("{}", fmt(&s));
+                match identity::standing(&contacts, &me, &s.env.from) {
+                    identity::Standing::Blocked => {}
+                    st => println!("{}", fmt(&s, st == identity::Standing::Unknown)),
+                }
             }
+            Ok(())
+        }
+        Cmd::Requests => {
+            let id = Identity::load(home)?;
+            let msgs = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), 0, 0)?;
+            let (_, held) = partition(home, &id, msgs);
+            if held.is_empty() {
+                println!("no pending contact requests");
+                return Ok(());
+            }
+            for s in &held {
+                println!("{}", fmt(s, true));
+            }
+            eprintln!("approve with `ecco trust <addr>`; drop with `ecco block <addr>`");
+            Ok(())
+        }
+        Cmd::Trust { addr } => {
+            let id = Identity::load(home)?;
+            identity::contacts_set(home, &addr, "approved")?;
+            println!("trusted {addr}");
+            let msgs = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), 0, 0)?;
+            for s in msgs.iter().filter(|s| s.env.from == addr) {
+                println!("{}", fmt(s, false));
+            }
+            Ok(())
+        }
+        Cmd::Block { addr } => {
+            identity::contacts_set(home, &addr, "blocked")?;
+            println!("blocked {addr}");
             Ok(())
         }
         Cmd::Pending => {
             let id = Identity::load(home)?;
-            let pending = pending_proposals(&id)?;
+            let pending = pending_proposals(home, &id)?;
             if pending.is_empty() {
                 println!("nothing pending");
             }
             for s in pending {
-                println!("{}", fmt(&s));
+                println!("{}", fmt(&s, false));
             }
             Ok(())
         }
@@ -189,13 +241,21 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
 }
 
 /// Build, sign (agent key — or root key for decisions), and submit an envelope.
+/// Sending to an address implies trusting it (PROTOCOL.md §4) — unless blocked.
 fn post(
+    home: &PathBuf,
     id: &Identity,
     about: String,
     kind: String,
     body: serde_json::Value,
     to: Vec<String>,
 ) -> Result<String, String> {
+    let contacts = identity::contacts_load(home);
+    for addr in &to {
+        if identity::standing(&contacts, &id.addr(), addr) == identity::Standing::Unknown {
+            identity::contacts_set(home, addr, "approved")?;
+        }
+    }
     let prev = client::thread(&id.relay, id.token.as_deref(), &about, 0, 0)?
         .iter()
         .max_by_key(|s| s.tseq)
@@ -206,10 +266,25 @@ fn post(
     client::send(&id.relay, id.token.as_deref(), &env)
 }
 
+/// Split inbox messages by sender standing: (visible, held). Blocked are dropped.
+fn partition(home: &PathBuf, id: &Identity, msgs: Vec<Stored>) -> (Vec<Stored>, Vec<Stored>) {
+    let contacts = identity::contacts_load(home);
+    let me = id.addr();
+    let (mut visible, mut held) = (Vec::new(), Vec::new());
+    for s in msgs {
+        match identity::standing(&contacts, &me, &s.env.from) {
+            identity::Standing::Trusted => visible.push(s),
+            identity::Standing::Unknown => held.push(s),
+            identity::Standing::Blocked => {}
+        }
+    }
+    (visible, held)
+}
+
 /// A decision is the human ruling on a proposal: signed by the root key, never the agent's.
 fn decide(home: &PathBuf, target: &str, verb: &str) -> Result<(), String> {
     let id = Identity::load(home)?;
-    let proposal = pending_proposals(&id)?
+    let proposal = pending_proposals(home, &id)?
         .into_iter()
         .find(|s| s.env.id == target || s.env.id.trim_start_matches("b3:").starts_with(target))
         .ok_or_else(|| format!("no pending proposal matching '{target}'"))?;
@@ -217,6 +292,7 @@ fn decide(home: &PathBuf, target: &str, verb: &str) -> Result<(), String> {
     body.insert(verb.into(), json!(proposal.env.id));
     body.insert("text".into(), json!(format!("{verb} {}", short(&proposal.env.id))));
     let receipt = post(
+        home,
         &id,
         proposal.env.about.clone(),
         "decision".into(),
@@ -227,11 +303,12 @@ fn decide(home: &PathBuf, target: &str, verb: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Proposals in the inbox whose thread does not yet contain a decision about them.
-fn pending_proposals(id: &Identity) -> Result<Vec<Stored>, String> {
+/// Proposals from trusted senders whose thread does not yet contain a decision.
+fn pending_proposals(home: &PathBuf, id: &Identity) -> Result<Vec<Stored>, String> {
     let msgs = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), 0, 0)?;
+    let (visible, _) = partition(home, id, msgs);
     let mut pending = Vec::new();
-    for s in msgs.into_iter().filter(|s| s.env.kind == "proposal") {
+    for s in visible.into_iter().filter(|s| s.env.kind == "proposal") {
         let decided = client::thread(&id.relay, id.token.as_deref(), &s.env.about, 0, 0)?.iter().any(|t| {
             t.env.kind == "decision"
                 && t.env
@@ -269,10 +346,11 @@ fn dm_thread(own: &str, to: &[String]) -> String {
     format!("dm:{}", addrs.join(","))
 }
 
-fn fmt(s: &Stored) -> String {
+fn fmt(s: &Stored, untrusted: bool) -> String {
     let text = s.env.body.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    let tag = if untrusted { "[untrusted] " } else { "" };
     format!(
-        "#{:<3} [{}] {} · {} · {} ({} t={})",
+        "#{:<3} {tag}[{}] {} · {} · {} ({} t={})",
         s.tseq, s.env.kind, s.env.from, s.env.about, text, short(&s.env.id), s.received_at
     )
 }

@@ -154,6 +154,18 @@ above), not a workflow engine:
 | `proposal` | asks for a human decision | agent's stopping point |
 | `decision` | human ruling on a proposal | root-key-signed only |
 
+### Contact approval (client policy)
+
+What reaches the *agent* is gated at the reading client — the surface where
+prompt-injection exposure actually occurs. Messages from senders the user has
+neither messaged nor approved SHOULD be held away from agent-facing surfaces
+(inbox, watch, MCP tools), exposing at most the sender and kind until the
+human reviews and admits the sender; senders the user has messaged are
+implicitly approved; blocked senders' messages are dropped from view.
+Admitting or blocking a sender is a human action, like signing a `decision`.
+This is client policy, not protocol: the relay stores and serves envelopes
+regardless, and clients may choose stricter or looser policy.
+
 ## 5. Relay API
 
 A relay is a dumb store-and-forward server. It verifies (§2), stores, orders,
