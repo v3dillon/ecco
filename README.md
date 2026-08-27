@@ -35,6 +35,13 @@ Build (`cargo build --release`), then in one terminal:
 ecco relay                     # store-and-forward server on :4200
 ```
 
+Relay container (GHCR). Push to `main` publishes `ghcr.io/v3dillon/ecco-relay:latest`.
+
+```sh
+docker build -t ghcr.io/v3dillon/ecco-relay:latest .
+docker run --rm -p 4200:4200 -v relay-data:/data ghcr.io/v3dillon/ecco-relay:latest
+```
+
 You:
 
 ```sh
