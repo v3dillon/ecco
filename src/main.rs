@@ -294,7 +294,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
 }
 
 /// Build, sign (agent key — or root key for decisions), and submit an envelope.
-/// Sending to an address implies trusting it (PROTOCOL.md §4) — unless blocked.
+/// Sending to an address implies trusting it (README §4) — unless blocked.
 /// With `encrypt`, the body is sealed to each recipient's root key plus our own
 /// (enc-v0); resolution failure is an error — we never fall back to plaintext.
 fn post(
@@ -314,9 +314,7 @@ fn post(
     }
     let body = if encrypt {
         if kind == "decision" {
-            return Err(
-                "decisions stay plaintext — they are the audit layer (PROTOCOL.md §6)".into(),
-            );
+            return Err("decisions stay plaintext — they are the audit layer (README §6)".into());
         }
         let mut recipients = vec![(id.addr(), id.root_key().verifying_key())];
         for addr in &to {

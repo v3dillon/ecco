@@ -1,4 +1,4 @@
-//! HTTP client for the relay API. PROTOCOL.md §5.
+//! HTTP client for the relay API. README §5.
 
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
@@ -94,7 +94,7 @@ fn post(url: &str, token: Option<&str>, body: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Own-relay GET with auth-v0 headers (PROTOCOL.md §5) — signed reads are
+/// Own-relay GET with auth-v0 headers (README §5) — signed reads are
 /// required on multi-tenant relays and harmlessly ignored on open ones.
 fn get_signed(id: &Identity, path: &str, timeout_secs: u64) -> Result<String, String> {
     let mut req =

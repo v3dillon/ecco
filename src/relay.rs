@@ -128,7 +128,7 @@ pub fn run(
 
 impl Relay {
     fn handle(&self, mut req: tiny_http::Request) {
-        // Transport-level gate (PROTOCOL.md §5): deployment config, not protocol.
+        // Transport-level gate (README §5): deployment config, not protocol.
         if let Some(expected) = &self.token {
             let authed = req.headers().iter().any(|h| {
                 h.field.equiv("authorization") && h.value.as_str() == format!("Bearer {expected}")
@@ -151,7 +151,7 @@ impl Relay {
             .map(|a| a.ip().to_string())
             .unwrap_or_else(|| "unknown".into());
 
-        // auth-v0 (PROTOCOL.md §5): on a signed relay, reads must be signed by
+        // auth-v0 (README §5): on a signed relay, reads must be signed by
         // a key of a registered identity; writes are already self-certifying.
         let mut reader: Option<String> = None;
         if self.signed && method == "GET" && (path == "/threads" || path == "/inbox") {

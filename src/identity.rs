@@ -1,4 +1,4 @@
-//! Identity: root key (human), delegated agent subkeys, profile documents. PROTOCOL.md §1.
+//! Identity: root key (human), delegated agent subkeys, profile documents. README §1.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use serde::{Deserialize, Serialize};
@@ -73,7 +73,7 @@ impl Profile {
             .map_err(|_| "bad profile signature".to_string())
     }
 
-    /// PROTOCOL.md §2 verification steps 3–4: is `key` allowed to sign `kind` as this identity?
+    /// README §2 verification steps 3–4: is `key` allowed to sign `kind` as this identity?
     pub fn authorizes(&self, key: &str, kind: &str, at: u64) -> Result<(), String> {
         if key == self.root {
             return Ok(());
@@ -95,7 +95,7 @@ impl Profile {
         self.verify_delegation(d)
     }
 
-    /// auth-v0 (PROTOCOL.md §5): may `key` read as this identity? Root, or any
+    /// auth-v0 (README §5): may `key` read as this identity? Root, or any
     /// unexpired delegated subkey — kind scoping is a write concern.
     pub fn authorizes_read(&self, key: &str, at: u64) -> Result<(), String> {
         if key == self.root {
@@ -143,7 +143,7 @@ pub struct Identity {
     pub relay: String,
     pub root_secret: String,
     pub agent_secret: String,
-    /// Transport-level bearer token for a private relay (PROTOCOL.md §5).
+    /// Transport-level bearer token for a private relay (README §5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 }
@@ -258,7 +258,7 @@ pub fn addr_relay_url(addr: &str) -> Result<String, String> {
     Ok(format!("{scheme}://{authority}"))
 }
 
-/// Client-side contact policy (PROTOCOL.md §4): addr -> "approved" | "blocked".
+/// Client-side contact policy (README §4): addr -> "approved" | "blocked".
 /// This gates what reaches the *agent*; the relay stores envelopes regardless.
 pub type Contacts = std::collections::HashMap<String, String>;
 

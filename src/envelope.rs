@@ -1,4 +1,4 @@
-//! The envelope: signed, content-addressed, transport-independent. PROTOCOL.md §2–§4.
+//! The envelope: signed, content-addressed, transport-independent. README §2–§4.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ pub struct Envelope {
 }
 
 // Canonical views: serde_json emits struct fields in declaration order, and these
-// are declared alphabetically, satisfying PROTOCOL.md §3.
+// are declared alphabetically, satisfying README §3.
 #[derive(Serialize)]
 struct SigningView<'a> {
     about: &'a str,
@@ -86,7 +86,7 @@ impl Envelope {
     }
 
     /// Build and sign an envelope. The parameters mirror the wire fields in
-    /// PROTOCOL.md §2 one-to-one; a params struct would only rename them.
+    /// README §2 one-to-one; a params struct would only rename them.
     #[allow(clippy::too_many_arguments)]
     pub fn seal(
         about: String,
@@ -117,7 +117,7 @@ impl Envelope {
         env
     }
 
-    /// Structural verification: id and signature (PROTOCOL.md §2 steps 1–2).
+    /// Structural verification: id and signature (README §2 steps 1–2).
     /// Delegation rules (steps 3–4) need a Profile and live in identity.rs.
     pub fn verify(&self) -> Result<(), String> {
         if !KINDS.contains(&self.kind.as_str()) {
@@ -163,7 +163,7 @@ pub fn now() -> u64 {
         .as_secs()
 }
 
-// ---- enc-v0 (PROTOCOL.md §6) ----
+// ---- enc-v0 (README §6) ----
 // Libsodium-compatible sealed boxes over X25519 keys derived from the existing
 // Ed25519 root keys (standard birational map). The encrypted object replaces
 // `body`; signing, ids, and the relay are untouched — the relay stores
