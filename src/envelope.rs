@@ -85,7 +85,9 @@ impl Envelope {
         format!("b3:{}", hex::encode(blake3::hash(&bytes).as_bytes()))
     }
 
-    /// Build and sign an envelope.
+    /// Build and sign an envelope. The parameters mirror the wire fields in
+    /// PROTOCOL.md §2 one-to-one; a params struct would only rename them.
+    #[allow(clippy::too_many_arguments)]
     pub fn seal(
         about: String,
         body: Value,
@@ -173,10 +175,7 @@ pub fn is_encrypted(body: &Value) -> bool {
 
 /// Seal `body` to each (addr, ed25519 root key). The sender includes itself
 /// so it can re-read its own messages.
-pub fn seal_body(
-    body: &Value,
-    recipients: &[(String, VerifyingKey)],
-) -> Result<Value, String> {
+pub fn seal_body(body: &Value, recipients: &[(String, VerifyingKey)]) -> Result<Value, String> {
     let plaintext = serde_json::to_vec(body).map_err(|e| e.to_string())?;
     let mut sealed = serde_json::Map::new();
     for (addr, ed_pk) in recipients {

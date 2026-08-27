@@ -7,14 +7,18 @@ mod store;
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use client::Stored;
 use envelope::Envelope;
 use identity::Identity;
 
 #[derive(Parser)]
-#[command(name = "ecco", version, about = "Async messaging between agents owned by different people.")]
+#[command(
+    name = "ecco",
+    version,
+    about = "Async messaging between agents owned by different people."
+)]
 struct Cli {
     /// Identity directory (default: $ECCO_HOME or ~/.ecco)
     #[arg(long, global = true)]
@@ -111,7 +115,7 @@ fn main() {
     }
 }
 
-fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
+fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
     match cmd {
         Cmd::Init { name, relay, token } => {
             if Identity::load(home).is_ok() {
@@ -124,11 +128,23 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             client::register(&id)?;
             id.save(home)?;
             println!("registered {}", id.addr());
-            println!("root key (you):    {}", envelope::encode_key(&id.root_key().verifying_key()));
-            println!("agent key (bot):   {}", envelope::encode_key(&id.agent_key().verifying_key()));
+            println!(
+                "root key (you):    {}",
+                envelope::encode_key(&id.root_key().verifying_key())
+            );
+            println!(
+                "agent key (bot):   {}",
+                envelope::encode_key(&id.agent_key().verifying_key())
+            );
             Ok(())
         }
-        Cmd::Relay { port, data, token, signed, pg } => {
+        Cmd::Relay {
+            port,
+            data,
+            token,
+            signed,
+            pg,
+        } => {
             let data = data.unwrap_or_else(|| home.join("relay"));
             let token = token.or_else(|| std::env::var("ECCO_RELAY_TOKEN").ok());
             let signed = signed || std::env::var("ECCO_RELAY_SIGNED").is_ok();
@@ -137,7 +153,13 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
                 .or_else(|| std::env::var("DATABASE_URL").ok());
             relay::run(port, data, token, signed, pg)
         }
-        Cmd::Send { text, to, about, kind, encrypt } => {
+        Cmd::Send {
+            text,
+            to,
+            about,
+            kind,
+            encrypt,
+        } => {
             let id = Identity::load(home)?;
             let about = about.unwrap_or_else(|| dm_thread(&id.addr(), &to));
             let receipt = post(home, &id, about, kind, json!({ "text": text }), to, encrypt)?;
@@ -154,7 +176,10 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
                 println!("{}", fmt(&id, s, false));
             }
             if !held.is_empty() {
-                eprintln!("({} held from unknown senders — review with `ecco requests`)", held.len());
+                eprintln!(
+                    "({} held from unknown senders — review with `ecco requests`)",
+                    held.len()
+                );
             }
             if new {
                 save_cursor(home, max_gseq)?;
@@ -164,7 +189,10 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
         Cmd::Watch { since } => {
             let id = Identity::load(home)?;
             let mut cursor = since.unwrap_or_else(|| load_cursor(home));
-            eprintln!("watching inbox for {} from #{cursor} (ctrl-c to stop)", id.addr());
+            eprintln!(
+                "watching inbox for {} from #{cursor} (ctrl-c to stop)",
+                id.addr()
+            );
             loop {
                 let batch = client::inbox(&id, cursor, 25)?;
                 let max_gseq = batch.iter().map(|s| s.gseq).max();
@@ -173,7 +201,10 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
                     println!("{}", fmt(&id, s, false));
                 }
                 for s in &held {
-                    eprintln!("held: [{}] from {} — review with `ecco requests`", s.env.kind, s.env.from);
+                    eprintln!(
+                        "held: [{}] from {} — review with `ecco requests`",
+                        s.env.kind, s.env.from
+                    );
                 }
                 if let Some(m) = max_gseq {
                     cursor = cursor.max(m);
@@ -249,8 +280,14 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             let id = Identity::load(home)?;
             println!("{}", id.addr());
             println!("relay: {}", id.relay);
-            println!("root:  {}", envelope::encode_key(&id.root_key().verifying_key()));
-            println!("agent: {}", envelope::encode_key(&id.agent_key().verifying_key()));
+            println!(
+                "root:  {}",
+                envelope::encode_key(&id.root_key().verifying_key())
+            );
+            println!(
+                "agent: {}",
+                envelope::encode_key(&id.agent_key().verifying_key())
+            );
             Ok(())
         }
     }
@@ -261,7 +298,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
 /// With `encrypt`, the body is sealed to each recipient's root key plus our own
 /// (enc-v0); resolution failure is an error — we never fall back to plaintext.
 fn post(
-    home: &PathBuf,
+    home: &Path,
     id: &Identity,
     about: String,
     kind: String,
@@ -277,7 +314,9 @@ fn post(
     }
     let body = if encrypt {
         if kind == "decision" {
-            return Err("decisions stay plaintext — they are the audit layer (PROTOCOL.md §6)".into());
+            return Err(
+                "decisions stay plaintext — they are the audit layer (PROTOCOL.md §6)".into(),
+            );
         }
         let mut recipients = vec![(id.addr(), id.root_key().verifying_key())];
         for addr in &to {
@@ -293,19 +332,32 @@ fn post(
     };
     // Tolerate an unreadable thread (auth-v0 non-participant): post with empty
     // prev — writes are self-certifying, and posting is how you join a thread.
-    let prev = client::thread(&id, &about, 0, 0)
+    let prev = client::thread(id, &about, 0, 0)
         .unwrap_or_default()
         .iter()
         .max_by_key(|s| s.tseq)
         .map(|s| vec![s.env.id.clone()])
         .unwrap_or_default();
-    let key = if kind == "decision" { id.root_key() } else { id.agent_key() };
-    let env = Envelope::seal(about, body, id.addr(), kind, prev, to, envelope::now(), &key);
-    client::send(&id, &env)
+    let key = if kind == "decision" {
+        id.root_key()
+    } else {
+        id.agent_key()
+    };
+    let env = Envelope::seal(
+        about,
+        body,
+        id.addr(),
+        kind,
+        prev,
+        to,
+        envelope::now(),
+        &key,
+    );
+    client::send(id, &env)
 }
 
 /// Split inbox messages by sender standing: (visible, held). Blocked are dropped.
-fn partition(home: &PathBuf, id: &Identity, msgs: Vec<Stored>) -> (Vec<Stored>, Vec<Stored>) {
+fn partition(home: &Path, id: &Identity, msgs: Vec<Stored>) -> (Vec<Stored>, Vec<Stored>) {
     let contacts = identity::contacts_load(home);
     let me = id.addr();
     let (mut visible, mut held) = (Vec::new(), Vec::new());
@@ -320,7 +372,7 @@ fn partition(home: &PathBuf, id: &Identity, msgs: Vec<Stored>) -> (Vec<Stored>, 
 }
 
 /// A decision is the human ruling on a proposal: signed by the root key, never the agent's.
-fn decide(home: &PathBuf, target: &str, verb: &str) -> Result<(), String> {
+fn decide(home: &Path, target: &str, verb: &str) -> Result<(), String> {
     let id = Identity::load(home)?;
     let proposal = pending_proposals(home, &id)?
         .into_iter()
@@ -328,7 +380,10 @@ fn decide(home: &PathBuf, target: &str, verb: &str) -> Result<(), String> {
         .ok_or_else(|| format!("no pending proposal matching '{target}'"))?;
     let mut body = serde_json::Map::new();
     body.insert(verb.into(), json!(proposal.env.id));
-    body.insert("text".into(), json!(format!("{verb} {}", short(&proposal.env.id))));
+    body.insert(
+        "text".into(),
+        json!(format!("{verb} {}", short(&proposal.env.id))),
+    );
     let receipt = post(
         home,
         &id,
@@ -343,12 +398,12 @@ fn decide(home: &PathBuf, target: &str, verb: &str) -> Result<(), String> {
 }
 
 /// Proposals from trusted senders whose thread does not yet contain a decision.
-fn pending_proposals(home: &PathBuf, id: &Identity) -> Result<Vec<Stored>, String> {
-    let msgs = client::inbox(&id, 0, 0)?;
+fn pending_proposals(home: &Path, id: &Identity) -> Result<Vec<Stored>, String> {
+    let msgs = client::inbox(id, 0, 0)?;
     let (visible, _) = partition(home, id, msgs);
     let mut pending = Vec::new();
     for s in visible.into_iter().filter(|s| s.env.kind == "proposal") {
-        let decided = client::thread(&id, &s.env.about, 0, 0)?.iter().any(|t| {
+        let decided = client::thread(id, &s.env.about, 0, 0)?.iter().any(|t| {
             t.env.kind == "decision"
                 && t.env
                     .body
@@ -366,14 +421,14 @@ fn pending_proposals(home: &PathBuf, id: &Identity) -> Result<Vec<Stored>, Strin
 
 // The cursor is client-side state, not protocol: the last-seen inbox gseq for
 // this identity's relay, so each session resumes where the previous one stopped.
-fn load_cursor(home: &PathBuf) -> u64 {
+fn load_cursor(home: &Path) -> u64 {
     std::fs::read_to_string(home.join("cursor"))
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
 }
 
-fn save_cursor(home: &PathBuf, cursor: u64) -> Result<(), String> {
+fn save_cursor(home: &Path, cursor: u64) -> Result<(), String> {
     std::fs::write(home.join("cursor"), cursor.to_string()).map_err(|e| e.to_string())
 }
 
@@ -390,7 +445,7 @@ fn dm_thread(own: &str, to: &[String]) -> String {
 fn token_for<'a>(id: &'a Identity, addr: &str) -> Option<&'a str> {
     addr.rsplit_once('@')
         .filter(|(_, auth)| *auth == identity::authority(&id.relay))
-        .and_then(|_| id.token.as_deref())
+        .and(id.token.as_deref())
 }
 
 /// Decrypt an enc-v0 body for display; (body, was_encrypted).
@@ -412,7 +467,13 @@ fn fmt(id: &Identity, s: &Stored, untrusted: bool) -> String {
     let lock = if encrypted { "[enc] " } else { "" };
     format!(
         "#{:<3} {tag}{lock}[{}] {} · {} · {} ({} t={})",
-        s.tseq, s.env.kind, s.env.from, s.env.about, text, short(&s.env.id), s.received_at
+        s.tseq,
+        s.env.kind,
+        s.env.from,
+        s.env.about,
+        text,
+        short(&s.env.id),
+        s.received_at
     )
 }
 

@@ -6,17 +6,22 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::Path;
 
 use crate::client;
 use crate::envelope;
 use crate::identity::{self, Identity};
 
 const TOOLS: &[&str] = &[
-    "ecco_send", "ecco_inbox", "ecco_thread", "ecco_pending", "ecco_resolve", "ecco_whoami",
+    "ecco_send",
+    "ecco_inbox",
+    "ecco_thread",
+    "ecco_pending",
+    "ecco_resolve",
+    "ecco_whoami",
 ];
 
-pub fn run(home: &PathBuf) -> Result<(), String> {
+pub fn run(home: &Path) -> Result<(), String> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -24,9 +29,13 @@ pub fn run(home: &PathBuf) -> Result<(), String> {
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         // No id => notification; MCP forbids responding to those.
-        let Some(id) = msg.get("id").filter(|v| !v.is_null()).cloned() else { continue };
+        let Some(id) = msg.get("id").filter(|v| !v.is_null()).cloned() else {
+            continue;
+        };
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
         let reply = match method {
@@ -55,19 +64,28 @@ fn initialize(params: &Value) -> Value {
     })
 }
 
-fn tools_call(home: &PathBuf, id: &Value, params: &Value) -> String {
+fn tools_call(home: &Path, id: &Value, params: &Value) -> String {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     if !TOOLS.contains(&name) {
         return err(id, -32602, &format!("unknown tool '{name}'"));
     }
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     match call(home, name, &args) {
-        Ok(text) => ok(id, json!({ "content": [{ "type": "text", "text": text }], "isError": false })),
-        Err(e) => ok(id, json!({ "content": [{ "type": "text", "text": e }], "isError": true })),
+        Ok(text) => ok(
+            id,
+            json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
+        ),
+        Err(e) => ok(
+            id,
+            json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
+        ),
     }
 }
 
-fn call(home: &PathBuf, name: &str, args: &Value) -> Result<String, String> {
+fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
     let id = Identity::load(home)?;
     let str_arg = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_string);
     match name {
@@ -91,10 +109,18 @@ fn call(home: &PathBuf, name: &str, args: &Value) -> Result<String, String> {
             let to: Vec<String> = args
                 .get("to")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
                 .unwrap_or_default();
             let about = str_arg("about").unwrap_or_else(|| crate::dm_thread(&id.addr(), &to));
-            let encrypt = args.get("encrypt").and_then(Value::as_bool).unwrap_or(false);
+            let encrypt = args
+                .get("encrypt")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             crate::post(home, &id, about, kind, json!({ "text": text }), to, encrypt)
         }
         "ecco_inbox" => {

@@ -114,10 +114,9 @@ pub fn run(
     for _ in 0..16 {
         let server = server.clone();
         let relay = relay.clone();
-        workers.push(std::thread::spawn(move || loop {
-            match server.recv() {
-                Ok(req) => relay.handle(req),
-                Err(_) => break,
+        workers.push(std::thread::spawn(move || {
+            while let Ok(req) = server.recv() {
+                relay.handle(req);
             }
         }));
     }
@@ -132,8 +131,7 @@ impl Relay {
         // Transport-level gate (PROTOCOL.md §5): deployment config, not protocol.
         if let Some(expected) = &self.token {
             let authed = req.headers().iter().any(|h| {
-                h.field.equiv("authorization")
-                    && h.value.as_str() == format!("Bearer {expected}")
+                h.field.equiv("authorization") && h.value.as_str() == format!("Bearer {expected}")
             });
             if !authed {
                 let resp = tiny_http::Response::from_string("missing or bad bearer token")
@@ -160,8 +158,7 @@ impl Relay {
             match self.verify_read(&req, &url) {
                 Ok(addr) => reader = Some(addr),
                 Err(e) => {
-                    let _ = req
-                        .respond(tiny_http::Response::from_string(e).with_status_code(401));
+                    let _ = req.respond(tiny_http::Response::from_string(e).with_status_code(401));
                     return;
                 }
             }

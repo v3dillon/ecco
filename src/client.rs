@@ -34,7 +34,11 @@ pub fn resolve(addr: &str, token: Option<&str>) -> Result<Profile, String> {
     if let Some(t) = token {
         req = req.set("authorization", &format!("Bearer {t}"));
     }
-    let raw = req.call().map_err(describe)?.into_string().map_err(|e| e.to_string())?;
+    let raw = req
+        .call()
+        .map_err(describe)?
+        .into_string()
+        .map_err(|e| e.to_string())?;
     let profile: Profile = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     profile.verify()?;
     Ok(profile)
@@ -93,7 +97,8 @@ fn post(url: &str, token: Option<&str>, body: &str) -> Result<String, String> {
 /// Own-relay GET with auth-v0 headers (PROTOCOL.md §5) — signed reads are
 /// required on multi-tenant relays and harmlessly ignored on open ones.
 fn get_signed(id: &Identity, path: &str, timeout_secs: u64) -> Result<String, String> {
-    let mut req = ureq::get(&format!("{}{path}", id.relay)).timeout(Duration::from_secs(timeout_secs));
+    let mut req =
+        ureq::get(&format!("{}{path}", id.relay)).timeout(Duration::from_secs(timeout_secs));
     if let Some(t) = id.token.as_deref() {
         req = req.set("authorization", &format!("Bearer {t}"));
     }
@@ -103,7 +108,10 @@ fn get_signed(id: &Identity, path: &str, timeout_secs: u64) -> Result<String, St
         .set("x-ecco-addr", &id.addr())
         .set("x-ecco-key", &encode_key(&id.agent_key().verifying_key()))
         .set("x-ecco-ts", &ts.to_string())
-        .set("x-ecco-sig", &format!("ed25519:{}", hex::encode(sig.to_bytes())));
+        .set(
+            "x-ecco-sig",
+            &format!("ed25519:{}", hex::encode(sig.to_bytes())),
+        );
     req.call()
         .map_err(describe)?
         .into_string()

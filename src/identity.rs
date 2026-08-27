@@ -391,11 +391,21 @@ mod tests {
 
         // request signature binds method, path+query, and timestamp
         let path = "/inbox?addr=alice%40localhost%3A4200&since=0&wait=0";
-        let sig = id.agent_key().sign(&request_signing_bytes("GET", path, now));
+        let sig = id
+            .agent_key()
+            .sign(&request_signing_bytes("GET", path, now));
         let vk = id.agent_key().verifying_key();
-        vk.verify(&request_signing_bytes("GET", path, now), &sig).unwrap();
-        assert!(vk.verify(&request_signing_bytes("GET", path, now + 1), &sig).is_err());
-        assert!(vk.verify(&request_signing_bytes("GET", "/inbox?addr=other", now), &sig).is_err());
+        vk.verify(&request_signing_bytes("GET", path, now), &sig)
+            .unwrap();
+        assert!(vk
+            .verify(&request_signing_bytes("GET", path, now + 1), &sig)
+            .is_err());
+        assert!(vk
+            .verify(
+                &request_signing_bytes("GET", "/inbox?addr=other", now),
+                &sig
+            )
+            .is_err());
     }
 
     #[test]
@@ -413,11 +423,23 @@ mod tests {
         .unwrap();
         assert!(envelope::is_encrypted(&sealed));
         // both recipients (sender sealed to itself) recover the body
-        assert_eq!(envelope::open_body(&sealed, &alice.addr(), &alice.root_key()), Some(body.clone()));
-        assert_eq!(envelope::open_body(&sealed, &bob.addr(), &bob.root_key()), Some(body));
+        assert_eq!(
+            envelope::open_body(&sealed, &alice.addr(), &alice.root_key()),
+            Some(body.clone())
+        );
+        assert_eq!(
+            envelope::open_body(&sealed, &bob.addr(), &bob.root_key()),
+            Some(body)
+        );
         // wrong key, and an address it was never sealed to, both fail closed
-        assert_eq!(envelope::open_body(&sealed, &bob.addr(), &alice.root_key()), None);
-        assert_eq!(envelope::open_body(&sealed, "carol@localhost:4200", &bob.root_key()), None);
+        assert_eq!(
+            envelope::open_body(&sealed, &bob.addr(), &alice.root_key()),
+            None
+        );
+        assert_eq!(
+            envelope::open_body(&sealed, "carol@localhost:4200", &bob.root_key()),
+            None
+        );
     }
 
     #[test]
@@ -426,7 +448,10 @@ mod tests {
         let mallory = Identity::generate("mallory", "http://localhost:4200", None);
         let env = seal(&alice, "note", &mallory.agent_key());
         env.verify().unwrap(); // signature is internally consistent...
-        // ...but mallory's key holds no delegation from alice's root.
-        assert!(alice.profile().authorizes(&env.key, "note", envelope::now()).is_err());
+                               // ...but mallory's key holds no delegation from alice's root.
+        assert!(alice
+            .profile()
+            .authorizes(&env.key, "note", envelope::now())
+            .is_err());
     }
 }

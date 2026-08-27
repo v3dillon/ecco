@@ -66,8 +66,11 @@ impl SqliteStore {
         fs::create_dir_all(data).map_err(|e| e.to_string())?;
         let conn = rusqlite::Connection::open(data.join("relay.db")).map_err(|e| e.to_string())?;
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
-        conn.execute_batch(SQLITE_SCHEMA).map_err(|e| e.to_string())?;
-        let store = SqliteStore { conn: Mutex::new(conn) };
+        conn.execute_batch(SQLITE_SCHEMA)
+            .map_err(|e| e.to_string())?;
+        let store = SqliteStore {
+            conn: Mutex::new(conn),
+        };
         store.import_jsonl(data)?;
         Ok(store)
     }
@@ -110,8 +113,13 @@ impl SqliteStore {
                     "INSERT OR IGNORE INTO msgs(gseq,id,about,sender,tseq,received_at,env)
                      VALUES(?1,?2,?3,?4,?5,?6,?7)",
                     rusqlite::params![
-                        s.gseq as i64, s.env.id, s.env.about, s.env.from,
-                        s.tseq as i64, s.received_at as i64, env_json
+                        s.gseq as i64,
+                        s.env.id,
+                        s.env.about,
+                        s.env.from,
+                        s.tseq as i64,
+                        s.received_at as i64,
+                        env_json
                     ],
                 )
                 .map_err(|e| e.to_string())?;
@@ -168,7 +176,11 @@ impl Store for SqliteStore {
     fn register(&self, profile: Profile) -> Res<()> {
         let conn = self.conn.lock().unwrap();
         let existing: Option<String> = sq(conn
-            .query_row("SELECT root FROM profiles WHERE name=?1", [&profile.name], |r| r.get(0))
+            .query_row(
+                "SELECT root FROM profiles WHERE name=?1",
+                [&profile.name],
+                |r| r.get(0),
+            )
             .optional())?;
         if let Some(root) = existing {
             if root != profile.root {
@@ -187,7 +199,9 @@ impl Store for SqliteStore {
     fn profile(&self, name: &str) -> Res<Option<Profile>> {
         let conn = self.conn.lock().unwrap();
         let doc: Option<String> = sq(conn
-            .query_row("SELECT doc FROM profiles WHERE name=?1", [name], |r| r.get(0))
+            .query_row("SELECT doc FROM profiles WHERE name=?1", [name], |r| {
+                r.get(0)
+            })
             .optional())?;
         match doc {
             Some(d) => serde_json::from_str(&d)
@@ -220,7 +234,14 @@ impl Store for SqliteStore {
         let env_json = serde_json::to_string(&env).unwrap();
         sq(tx.execute(
             "INSERT INTO msgs(id,about,sender,tseq,received_at,env) VALUES(?1,?2,?3,?4,?5,?6)",
-            rusqlite::params![env.id, env.about, env.from, tseq, received_at as i64, env_json],
+            rusqlite::params![
+                env.id,
+                env.about,
+                env.from,
+                tseq,
+                received_at as i64,
+                env_json
+            ],
         ))?;
         let gseq = tx.last_insert_rowid();
         for addr in &env.to {
@@ -331,8 +352,8 @@ fn db<T>(r: Result<T, postgres::Error>) -> Res<T> {
 
 fn row_to_stored(row: &postgres::Row) -> Res<Stored> {
     let env_json: String = row.get(3);
-    let env: Envelope =
-        serde_json::from_str(&env_json).map_err(|e| (500, format!("corrupt stored envelope: {e}")))?;
+    let env: Envelope = serde_json::from_str(&env_json)
+        .map_err(|e| (500, format!("corrupt stored envelope: {e}")))?;
     Ok(Stored {
         gseq: row.get::<_, i64>(0) as u64,
         tseq: row.get::<_, i64>(1) as u64,
@@ -344,7 +365,9 @@ fn row_to_stored(row: &postgres::Row) -> Res<Stored> {
 impl Store for PgStore {
     fn register(&self, profile: Profile) -> Res<()> {
         let mut c = self.client.lock().unwrap();
-        if let Some(row) = db(c.query_opt("SELECT root FROM profiles WHERE name=$1", &[&profile.name]))? {
+        if let Some(row) =
+            db(c.query_opt("SELECT root FROM profiles WHERE name=$1", &[&profile.name]))?
+        {
             let root: String = row.get(0);
             if root != profile.root {
                 return Err((409, format!("name '{}' is taken", profile.name)));
@@ -392,11 +415,21 @@ impl Store for PgStore {
         let gseq: i64 = db(tx.query_one(
             "INSERT INTO msgs(id,about,sender,tseq,received_at,env)
              VALUES($1,$2,$3,$4,$5,$6) RETURNING gseq",
-            &[&env.id, &env.about, &env.from, &tseq, &(received_at as i64), &env_json],
+            &[
+                &env.id,
+                &env.about,
+                &env.from,
+                &tseq,
+                &(received_at as i64),
+                &env_json,
+            ],
         ))?
         .get(0);
         for addr in &env.to {
-            db(tx.execute("INSERT INTO msg_to(gseq,addr) VALUES($1,$2)", &[&gseq, &addr]))?;
+            db(tx.execute(
+                "INSERT INTO msg_to(gseq,addr) VALUES($1,$2)",
+                &[&gseq, &addr],
+            ))?;
         }
         db(tx.commit())?;
         Ok(Stored {
