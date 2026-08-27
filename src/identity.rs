@@ -174,7 +174,22 @@ impl Identity {
 
     /// Build the signed profile: one delegation for the agent key, one relay endpoint.
     pub fn profile(&self) -> Profile {
-        let root = self.root_key();
+        self.sign_profile(
+            vec![self.agent_delegation()],
+            vec![Endpoint {
+                kind: "relay".into(),
+                url: self.relay.clone(),
+            }],
+        )
+    }
+
+    /// Deactivation: no delegations, no endpoints. The agent key stops
+    /// working everywhere; the root key still owns the name (README §1).
+    pub fn profile_revoked(&self) -> Profile {
+        self.sign_profile(vec![], vec![])
+    }
+
+    fn agent_delegation(&self) -> Delegation {
         let addr = self.addr();
         let kinds: Vec<String> = AGENT_KINDS.iter().map(|s| s.to_string()).collect();
         let agent_pub = encode_key(&self.agent_key().verifying_key());
@@ -186,19 +201,21 @@ impl Identity {
             kinds: &kinds,
         })
         .expect("canonical encoding");
-        let dsig = root.sign(&bytes);
+        let dsig = self.root_key().sign(&bytes);
+        Delegation {
+            addr,
+            exp,
+            key: agent_pub,
+            kinds,
+            sig: format!("ed25519:{}", hex::encode(dsig.to_bytes())),
+        }
+    }
+
+    fn sign_profile(&self, delegations: Vec<Delegation>, endpoints: Vec<Endpoint>) -> Profile {
+        let root = self.root_key();
         let mut profile = Profile {
-            delegations: vec![Delegation {
-                addr,
-                exp,
-                key: agent_pub,
-                kinds,
-                sig: format!("ed25519:{}", hex::encode(dsig.to_bytes())),
-            }],
-            endpoints: vec![Endpoint {
-                kind: "relay".into(),
-                url: self.relay.clone(),
-            }],
+            delegations,
+            endpoints,
             name: self.name.clone(),
             root: encode_key(&root.verifying_key()),
             sig: String::new(),
@@ -360,6 +377,23 @@ mod tests {
         let past_expiry = profile.delegations[0].exp + 1;
         let env = seal(&id, "note", &id.agent_key());
         assert!(profile.authorizes(&env.key, "note", past_expiry).is_err());
+    }
+
+    #[test]
+    fn revoked_profile_keeps_the_name_and_rejects_the_agent_key() {
+        let id = Identity::generate("alice", "http://localhost:4200", None);
+        let revoked = id.profile_revoked();
+        revoked.verify().unwrap();
+        assert_eq!(revoked.name, id.profile().name);
+        assert_eq!(revoked.root, id.profile().root);
+        assert!(revoked.delegations.is_empty());
+        let now = envelope::now();
+        let agent_pub = encode_key(&id.agent_key().verifying_key());
+        assert!(revoked.authorizes(&agent_pub, "note", now).is_err());
+        assert!(revoked.authorizes_read(&agent_pub, now).is_err());
+        // The human can still act, and the same root can republish later.
+        let root_pub = encode_key(&id.root_key().verifying_key());
+        revoked.authorizes(&root_pub, "decision", now).unwrap();
     }
 
     #[test]

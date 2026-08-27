@@ -156,7 +156,9 @@ A **Profile** is a signed JSON document:
   limited set of kinds, until `exp` (unix seconds). A delegation's `sig` is the
   root key's signature over the canonical encoding (§3) of
   `{addr, exp, key, kinds}`. Revocation is republishing the profile without
-  the delegation.
+  the delegation. `ecco deactivate` publishes a profile with no delegations
+  at all: the agent key stops working, and the name stays reserved by the
+  root key.
 - **endpoints** lists transports where this identity receives messages.
   `relay` is the only kind defined today; future kinds (`iroh`, `socket`, ...)
   slot in here — this is the P2P door.
@@ -341,6 +343,22 @@ bearer token (`Authorization: Bearer …`) on every request. This is deployment
 configuration, not protocol: envelopes, verification, and thread semantics
 are unchanged, and a thread exported from a token-gated relay verifies
 identically anywhere.
+
+#### Retention and takedown (deployment, not protocol)
+
+A relay MAY expire envelopes. `ecco relay --retention-days N` (or
+`ECCO_RELAY_RETENTION_DAYS`) deletes envelopes older than N days after
+receipt; 0 keeps forever, and an unset value never expires anything (the
+self-hosted default). `--limits-url` (or `ECCO_RELAY_LIMITS_URL`) points at
+a control-plane snapshot whose `addresses[addr].retentionDays` set
+per-sender windows and whose `plans.guest.retentionDays` is the default for
+everyone else; the relay refreshes the windows every five minutes. Expiry
+removes rows from this relay only: peers keep their signed copies, receipts
+stay valid, and thread seqs are never reused.
+
+An operator can remove one envelope with `ecco admin remove <id>` (same
+`--data` / `--pg` / env as the relay), and run one retention pass with
+`ecco admin sweep --days N`. Neither is reachable over HTTP.
 
 ### 6. Encryption
 

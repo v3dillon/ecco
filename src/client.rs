@@ -21,7 +21,13 @@ struct MsgsResponse {
 }
 
 pub fn register(id: &Identity) -> Result<(), String> {
-    let body = serde_json::to_string(&id.profile()).unwrap();
+    publish(id, &id.profile())
+}
+
+/// Register or update our profile on our own relay. Same root key, same
+/// name: the relay replaces the document (README §1).
+pub fn publish(id: &Identity, profile: &Profile) -> Result<(), String> {
+    let body = serde_json::to_string(profile).unwrap();
     post(&format!("{}/addr", id.relay), id.token.as_deref(), &body).map(|_| ())
 }
 

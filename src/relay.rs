@@ -6,7 +6,7 @@ use ed25519_dalek::{Signer, SigningKey, Verifier};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,6 +14,8 @@ use crate::envelope::{self, encode_key, Envelope};
 use crate::store::{PgStore, SqliteStore, Store, Stored, ThreadAccess};
 
 const MAX_WAIT_SECS: u64 = 30;
+/// Retention pass cadence: refresh per-sender windows, then expire.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const POLL_STEP: Duration = Duration::from_millis(300);
 /// Public-tier abuse floors; generous for legitimate agents.
 const MAX_BODY_BYTES: u64 = 64 * 1024;
@@ -68,12 +70,41 @@ pub struct Relay {
     limiter: Limiter,
 }
 
+/// Envelope expiry. Not protocol: a deployment choice for relays that
+/// sell retention windows. Both fields unset means the relay never expires
+/// anything (self-hosted default).
+#[derive(Clone, Default)]
+pub struct Retention {
+    /// A limits snapshot (`/api/limits.json` on the control plane). Its
+    /// `addresses[addr].retentionDays` set per-sender windows; its
+    /// `plans.guest.retentionDays` is the default for everyone else.
+    pub limits_url: Option<String>,
+    /// Default window in days for senders without an entry; 0 keeps
+    /// forever. Overrides the snapshot's guest value when both exist.
+    pub default_days: Option<u32>,
+}
+
+impl Retention {
+    pub fn enabled(&self) -> bool {
+        self.limits_url.is_some() || self.default_days.is_some()
+    }
+}
+
+/// Open the relay's store: Postgres when a URL is given, else SQLite in `data`.
+pub fn open_store(data: &Path, pg: Option<&str>) -> Result<(Box<dyn Store>, &'static str), String> {
+    Ok(match pg {
+        Some(url) => (Box::new(PgStore::open(url)?), "postgres"),
+        None => (Box::new(SqliteStore::open(data)?), "sqlite"),
+    })
+}
+
 pub fn run(
     port: u16,
     data: PathBuf,
     token: Option<String>,
     signed: bool,
     pg: Option<String>,
+    retention: Retention,
 ) -> Result<(), String> {
     fs::create_dir_all(&data).map_err(|e| e.to_string())?;
     let key_path = data.join("relay_key");
@@ -91,10 +122,7 @@ pub fn run(
             key
         }
     };
-    let (store, backend): (Box<dyn Store>, &str) = match &pg {
-        Some(url) => (Box::new(PgStore::open(url)?), "postgres"),
-        None => (Box::new(SqliteStore::open(&data)?), "sqlite"),
-    };
+    let (store, backend) = open_store(&data, pg.as_deref())?;
     let relay = Arc::new(Relay {
         store,
         key,
@@ -106,10 +134,15 @@ pub fn run(
     });
     let server = Arc::new(tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| e.to_string())?);
     eprintln!(
-        "ecco relay on port {port} · {backend} · signed reads: {} · key {}",
+        "ecco relay on port {port} · {backend} · signed reads: {} · retention: {} · key {}",
         relay.signed,
+        describe_retention(&retention),
         encode_key(&relay.key.verifying_key())
     );
+    if retention.enabled() {
+        let relay = relay.clone();
+        std::thread::spawn(move || sweeper(relay, retention));
+    }
     let mut workers = Vec::new();
     for _ in 0..16 {
         let server = server.clone();
@@ -349,6 +382,85 @@ impl Relay {
             std::thread::sleep(POLL_STEP);
         }
     }
+}
+
+fn describe_retention(r: &Retention) -> String {
+    match (&r.limits_url, r.default_days) {
+        (None, None) => "off".into(),
+        (None, Some(d)) => format!("{d}d default"),
+        (Some(u), None) => format!("per-sender from {u}"),
+        (Some(u), Some(d)) => format!("per-sender from {u}, {d}d default"),
+    }
+}
+
+/// Per-sender windows parsed from a limits snapshot. Numbers only: the
+/// relay never learns a plan id for an address.
+struct LimitWindows {
+    per_sender: Vec<(String, u32)>,
+    guest_days: Option<u32>,
+}
+
+fn fetch_limits(url: &str) -> Result<LimitWindows, String> {
+    let raw = ureq::get(url)
+        .timeout(Duration::from_secs(15))
+        .call()
+        .map_err(|e| e.to_string())?
+        .into_string()
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let days = |v: &serde_json::Value| v.as_u64().and_then(|d| u32::try_from(d).ok());
+    let per_sender = v["addresses"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(addr, caps)| days(&caps["retentionDays"]).map(|d| (addr.clone(), d)))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(LimitWindows {
+        per_sender,
+        guest_days: days(&v["plans"]["guest"]["retentionDays"]),
+    })
+}
+
+/// One pass: refresh the per-sender table from the snapshot (when
+/// configured), then expire. A failed fetch keeps the last known windows
+/// and still sweeps with the configured default, if any.
+fn retention_pass(relay: &Relay, cfg: &Retention) {
+    let mut default_days = cfg.default_days;
+    if let Some(url) = &cfg.limits_url {
+        match fetch_limits(url) {
+            Ok(w) => {
+                if let Err((_, e)) = relay.store.set_retention(&w.per_sender) {
+                    eprintln!("relay: retention table update failed: {e}");
+                }
+                if default_days.is_none() {
+                    default_days = w.guest_days;
+                }
+            }
+            Err(e) => eprintln!("relay: limits fetch failed ({url}): {e}"),
+        }
+    }
+    let Some(days) = default_days else { return };
+    match relay.store.sweep(envelope::now(), days) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("relay: expired {n} envelope(s)"),
+        Err((_, e)) => eprintln!("relay: sweep failed: {e}"),
+    }
+}
+
+fn sweeper(relay: Arc<Relay>, cfg: Retention) {
+    loop {
+        retention_pass(&relay, &cfg);
+        std::thread::sleep(SWEEP_INTERVAL);
+    }
+}
+
+/// Admin entry: one retention pass against a store, no server.
+pub fn sweep_once(store: &dyn Store, default_days: u32) -> Result<u64, String> {
+    store
+        .sweep(envelope::now(), default_days)
+        .map_err(|(_, e)| e)
 }
 
 fn parse_query(q: &str) -> HashMap<String, String> {

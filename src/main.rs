@@ -54,6 +54,17 @@ enum Cmd {
         /// Postgres URL for the shared tier (or set ECCO_RELAY_PG / DATABASE_URL); default: SQLite in --data
         #[arg(long)]
         pg: Option<String>,
+        /// Limits snapshot URL for per-sender retention windows (or set ECCO_RELAY_LIMITS_URL)
+        #[arg(long)]
+        limits_url: Option<String>,
+        /// Default retention in days for senders without a window; 0 keeps forever (or set ECCO_RELAY_RETENTION_DAYS). Unset with no limits URL: never expire
+        #[arg(long)]
+        retention_days: Option<u32>,
+    },
+    /// Relay operator tools. Not protocol: they act on one relay's store.
+    Admin {
+        #[command(subcommand)]
+        cmd: AdminCmd,
     },
     /// Post a message to a thread
     Send {
@@ -104,6 +115,31 @@ enum Cmd {
     Resolve { addr: String },
     /// Show your identity
     Whoami,
+    /// Revoke the agent key: publish a profile with no delegations. The name stays yours (root key)
+    Deactivate,
+}
+
+#[derive(Subcommand)]
+enum AdminCmd {
+    /// Remove one envelope by id (takedown). Peers keep their signed copies
+    Remove {
+        id: String,
+        /// Relay data dir (default: $ECCO_HOME/relay); ignored with --pg
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// Postgres URL (or set ECCO_RELAY_PG / DATABASE_URL)
+        #[arg(long)]
+        pg: Option<String>,
+    },
+    /// Run one retention pass now with this default window in days (0 keeps forever)
+    Sweep {
+        #[arg(long)]
+        days: u32,
+        #[arg(long)]
+        data: Option<PathBuf>,
+        #[arg(long)]
+        pg: Option<String>,
+    },
 }
 
 fn main() {
@@ -144,15 +180,45 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             token,
             signed,
             pg,
+            limits_url,
+            retention_days,
         } => {
-            let data = data.unwrap_or_else(|| home.join("relay"));
+            let (data, pg) = relay_store_args(home, data, pg);
             let token = token.or_else(|| std::env::var("ECCO_RELAY_TOKEN").ok());
             let signed = signed || std::env::var("ECCO_RELAY_SIGNED").is_ok();
-            let pg = pg
-                .or_else(|| std::env::var("ECCO_RELAY_PG").ok())
-                .or_else(|| std::env::var("DATABASE_URL").ok());
-            relay::run(port, data, token, signed, pg)
+            let retention = relay::Retention {
+                limits_url: limits_url.or_else(|| std::env::var("ECCO_RELAY_LIMITS_URL").ok()),
+                default_days: match retention_days {
+                    Some(d) => Some(d),
+                    None => match std::env::var("ECCO_RELAY_RETENTION_DAYS") {
+                        Ok(v) => Some(v.trim().parse().map_err(|_| {
+                            format!("ECCO_RELAY_RETENTION_DAYS: '{v}' is not a day count")
+                        })?),
+                        Err(_) => None,
+                    },
+                },
+            };
+            relay::run(port, data, token, signed, pg, retention)
         }
+        Cmd::Admin { cmd } => match cmd {
+            AdminCmd::Remove { id, data, pg } => {
+                let (data, pg) = relay_store_args(home, data, pg);
+                let (store, _) = relay::open_store(&data, pg.as_deref())?;
+                if store.remove(&id).map_err(|(_, e)| e)? {
+                    println!("removed {id}");
+                    Ok(())
+                } else {
+                    Err(format!("no envelope with id {id}"))
+                }
+            }
+            AdminCmd::Sweep { days, data, pg } => {
+                let (data, pg) = relay_store_args(home, data, pg);
+                let (store, _) = relay::open_store(&data, pg.as_deref())?;
+                let n = relay::sweep_once(store.as_ref(), days)?;
+                println!("expired {n} envelope(s)");
+                Ok(())
+            }
+        },
         Cmd::Send {
             text,
             to,
@@ -290,7 +356,32 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             );
             Ok(())
         }
+        Cmd::Deactivate => {
+            let id = Identity::load(home)?;
+            client::publish(&id, &id.profile_revoked())?;
+            println!("deactivated {}", id.addr());
+            println!("the agent key no longer signs or reads as this address");
+            println!(
+                "the name stays reserved by your root key; identity.json is kept at {}",
+                home.display()
+            );
+            Ok(())
+        }
     }
+}
+
+/// Where a relay keeps its store: `--data` (default `$home/relay`) for
+/// SQLite, or a Postgres URL from `--pg` / ECCO_RELAY_PG / DATABASE_URL.
+fn relay_store_args(
+    home: &Path,
+    data: Option<PathBuf>,
+    pg: Option<String>,
+) -> (PathBuf, Option<String>) {
+    let data = data.unwrap_or_else(|| home.join("relay"));
+    let pg = pg
+        .or_else(|| std::env::var("ECCO_RELAY_PG").ok())
+        .or_else(|| std::env::var("DATABASE_URL").ok());
+    (data, pg)
 }
 
 /// Build, sign (agent key — or root key for decisions), and submit an envelope.

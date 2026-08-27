@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::envelope::Envelope;
 use crate::identity::Profile;
@@ -36,7 +37,22 @@ pub trait Store: Send + Sync {
     fn thread(&self, about: &str, since: u64) -> Res<Vec<Stored>>;
     fn inbox(&self, addr: &str, since: u64) -> Res<Vec<Stored>>;
     fn access(&self, about: &str, addr: &str) -> Res<ThreadAccess>;
+    /// Replaces the per-sender retention table. Days; 0 keeps forever.
+    fn set_retention(&self, entries: &[(String, u32)]) -> Res<()>;
+    /// Deletes envelopes older than their sender's retention window. Senders
+    /// without an entry use `default_days`; 0 keeps forever. Returns the count.
+    fn sweep(&self, now: u64, default_days: u32) -> Res<u64>;
+    /// Operator takedown of one envelope by id. Not protocol: peers keep
+    /// their signed copies. Returns whether a row existed.
+    fn remove(&self, id: &str) -> Res<bool>;
 }
+
+/// The per-envelope expiry test, shared by the sweep statements. Parameter 1
+/// is `now`, parameter 2 the default window in days.
+const SQLITE_EXPIRED: &str = "COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), ?2) > 0
+     AND msgs.received_at < ?1 - COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), ?2) * 86400";
+const PG_EXPIRED: &str = "COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), $2) > 0
+     AND msgs.received_at < $1 - COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), $2)::bigint * 86400";
 
 // ---- SqliteStore: single file, WAL mode — self-hosted and dedicated relays ----
 
@@ -55,6 +71,7 @@ CREATE TABLE IF NOT EXISTS msgs (
 CREATE INDEX IF NOT EXISTS msgs_about ON msgs(about, tseq);
 CREATE TABLE IF NOT EXISTS msg_to (gseq INTEGER NOT NULL, addr TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS msg_to_addr ON msg_to(addr, gseq);
+CREATE TABLE IF NOT EXISTS retention (sender TEXT PRIMARY KEY, days INTEGER NOT NULL);
 ";
 
 pub struct SqliteStore {
@@ -66,6 +83,7 @@ impl SqliteStore {
         fs::create_dir_all(data).map_err(|e| e.to_string())?;
         let conn = rusqlite::Connection::open(data.join("relay.db")).map_err(|e| e.to_string())?;
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.busy_timeout(Duration::from_secs(5));
         conn.execute_batch(SQLITE_SCHEMA)
             .map_err(|e| e.to_string())?;
         Ok(SqliteStore {
@@ -219,6 +237,46 @@ impl Store for SqliteStore {
             (true, false) => ThreadAccess::NotParticipant,
         })
     }
+
+    fn set_retention(&self, entries: &[(String, u32)]) -> Res<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sq(conn.transaction())?;
+        sq(tx.execute("DELETE FROM retention", []))?;
+        for (sender, days) in entries {
+            sq(tx.execute(
+                "INSERT INTO retention(sender,days) VALUES(?1,?2)",
+                rusqlite::params![sender, *days as i64],
+            ))?;
+        }
+        sq(tx.commit())
+    }
+
+    fn sweep(&self, now: u64, default_days: u32) -> Res<u64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sq(conn.transaction())?;
+        let params = rusqlite::params![now as i64, default_days as i64];
+        sq(tx.execute(
+            &format!(
+                "DELETE FROM msg_to WHERE gseq IN (SELECT gseq FROM msgs WHERE {SQLITE_EXPIRED})"
+            ),
+            params,
+        ))?;
+        let n = sq(tx.execute(&format!("DELETE FROM msgs WHERE {SQLITE_EXPIRED}"), params))?;
+        sq(tx.commit())?;
+        Ok(n as u64)
+    }
+
+    fn remove(&self, id: &str) -> Res<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sq(conn.transaction())?;
+        sq(tx.execute(
+            "DELETE FROM msg_to WHERE gseq IN (SELECT gseq FROM msgs WHERE id=?1)",
+            [id],
+        ))?;
+        let n = sq(tx.execute("DELETE FROM msgs WHERE id=?1", [id]))?;
+        sq(tx.commit())?;
+        Ok(n > 0)
+    }
 }
 
 // ---- PgStore: Postgres, for the shared multi-tenant tier ----
@@ -248,6 +306,10 @@ CREATE TABLE IF NOT EXISTS msg_to (
   addr TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS msg_to_addr ON msg_to(addr, gseq);
+CREATE TABLE IF NOT EXISTS retention (
+  sender TEXT PRIMARY KEY,
+  days INTEGER NOT NULL
+);
 ";
 
 pub struct PgStore {
@@ -395,5 +457,136 @@ impl Store for PgStore {
             (true, true) => ThreadAccess::Participant,
             (true, false) => ThreadAccess::NotParticipant,
         })
+    }
+
+    fn set_retention(&self, entries: &[(String, u32)]) -> Res<()> {
+        let mut c = self.client.lock().unwrap();
+        let mut tx = db(c.transaction())?;
+        db(tx.execute("DELETE FROM retention", &[]))?;
+        for (sender, days) in entries {
+            db(tx.execute(
+                "INSERT INTO retention(sender,days) VALUES($1,$2)",
+                &[sender, &(*days as i32)],
+            ))?;
+        }
+        db(tx.commit())
+    }
+
+    fn sweep(&self, now: u64, default_days: u32) -> Res<u64> {
+        let mut c = self.client.lock().unwrap();
+        let mut tx = db(c.transaction())?;
+        let now = now as i64;
+        let days = default_days as i32;
+        db(tx.execute(
+            &format!("DELETE FROM msg_to WHERE gseq IN (SELECT gseq FROM msgs WHERE {PG_EXPIRED})"),
+            &[&now, &days],
+        ))?;
+        let n = db(tx.execute(
+            &format!("DELETE FROM msgs WHERE {PG_EXPIRED}"),
+            &[&now, &days],
+        ))?;
+        db(tx.commit())?;
+        Ok(n)
+    }
+
+    fn remove(&self, id: &str) -> Res<bool> {
+        let mut c = self.client.lock().unwrap();
+        let mut tx = db(c.transaction())?;
+        db(tx.execute(
+            "DELETE FROM msg_to WHERE gseq IN (SELECT gseq FROM msgs WHERE id=$1)",
+            &[&id],
+        ))?;
+        let n = db(tx.execute("DELETE FROM msgs WHERE id=$1", &[&id]))?;
+        db(tx.commit())?;
+        Ok(n > 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static N: AtomicUsize = AtomicUsize::new(0);
+
+    fn fresh() -> SqliteStore {
+        let dir: PathBuf = std::env::temp_dir().join(format!(
+            "ecco-store-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        SqliteStore::open(&dir).unwrap()
+    }
+
+    fn note(from: &Identity, to: &Identity, text: &str, ts: u64) -> Envelope {
+        Envelope::seal(
+            "gh:acme/app/pull/1".into(),
+            json!({ "text": text }),
+            from.addr(),
+            "note".into(),
+            vec![],
+            vec![to.addr()],
+            ts,
+            &from.agent_key(),
+        )
+    }
+
+    const DAY: u64 = 86_400;
+
+    #[test]
+    fn sweep_uses_per_sender_windows_then_the_default() {
+        let store = fresh();
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        store.register(alice.profile()).unwrap();
+        store.register(bob.profile()).unwrap();
+        let now = 100 * DAY;
+        store
+            .append(note(&alice, &bob, "a-old", 1), now - 20 * DAY)
+            .unwrap();
+        store
+            .append(note(&alice, &bob, "a-new", 2), now - DAY)
+            .unwrap();
+        store
+            .append(note(&bob, &alice, "b-old", 3), now - 20 * DAY)
+            .unwrap();
+
+        // Nothing configured for alice; default 0 keeps everything.
+        assert_eq!(store.sweep(now, 0).unwrap(), 0);
+
+        // Alice gets a 30-day window; the 7-day default only hits bob.
+        store.set_retention(&[(alice.addr(), 30)]).unwrap();
+        assert_eq!(store.sweep(now, 7).unwrap(), 1);
+        assert_eq!(store.thread("gh:acme/app/pull/1", 0).unwrap().len(), 2);
+        assert!(store.inbox(&alice.addr(), 0).unwrap().is_empty());
+
+        // Alice tightened to 10 days: her 20-day-old note expires too.
+        store.set_retention(&[(alice.addr(), 10)]).unwrap();
+        assert_eq!(store.sweep(now, 7).unwrap(), 1);
+        let left = store.thread("gh:acme/app/pull/1", 0).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].env.body["text"], "a-new");
+        assert_eq!(store.inbox(&bob.addr(), 0).unwrap().len(), 1);
+
+        // Thread seq keeps counting; nothing is reused after a sweep.
+        let s = store.append(note(&alice, &bob, "a-next", 4), now).unwrap();
+        assert_eq!(s.tseq, 4);
+    }
+
+    #[test]
+    fn remove_takes_down_one_envelope_and_its_inbox_rows() {
+        let store = fresh();
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        let keep = store.append(note(&alice, &bob, "keep", 1), 10).unwrap();
+        let gone = store.append(note(&alice, &bob, "gone", 2), 11).unwrap();
+        assert!(store.remove(&gone.env.id).unwrap());
+        assert!(!store.remove(&gone.env.id).unwrap());
+        let inbox = store.inbox(&bob.addr(), 0).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].env.id, keep.env.id);
     }
 }
