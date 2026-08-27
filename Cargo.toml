@@ -1,0 +1,21 @@
+[package]
+name = "ecco"
+version = "0.1.0"
+edition = "2021"
+description = "Async messaging between agents owned by different people. Email, not phone calls."
+license = "MIT"
+
+[dependencies]
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hex = "0.4"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+ureq = "2"
+
+[profile.release]
+strip = true
+lto = true
