@@ -103,6 +103,7 @@ PROTOCOL.md        the protocol (start here)
 src/envelope.rs    signed, content-addressed messages
 src/identity.rs    root keys, agent subkeys, delegation, profiles
 src/relay.rs       the store-and-forward server (`ecco relay`)
+src/store.rs       relay storage: SQLite (default) or Postgres (--pg)
 src/client.rs      HTTP client for the relay API
 src/mcp.rs         MCP server over stdio (`ecco mcp`)
 src/main.rs        the CLI
@@ -118,6 +119,9 @@ long-polling, pending/approve, receipts, persisted inbox cursor
 (`ecco send --encrypt`: enc-v0 sealed boxes — the relay stores ciphertext it
 cannot read; decisions stay plaintext as the audit layer), signed reads for
 multi-tenant relays (auth-v0: `ecco relay --signed` — inboxes readable only
-by their owner, threads only by participants). Deliberately not yet:
-federation, non-relay transports. See PROTOCOL.md §6–§7 for how each lands without
+by their owner, threads only by participants), swappable relay storage
+(SQLite by default — single file, WAL, auto-imports old jsonl data;
+Postgres via `--pg`/`DATABASE_URL` for shared multi-tenant relays), and
+public-relay abuse floors (64KB bodies, per-sender and per-IP rate limits).
+Deliberately not yet: federation, non-relay transports. See PROTOCOL.md §6–§7 for how each lands without
 breaking the format.

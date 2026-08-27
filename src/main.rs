@@ -3,6 +3,7 @@ mod envelope;
 mod identity;
 mod mcp;
 mod relay;
+mod store;
 
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -46,6 +47,9 @@ enum Cmd {
         /// Require auth-v0 signed reads — for multi-tenant relays (or set ECCO_RELAY_SIGNED)
         #[arg(long)]
         signed: bool,
+        /// Postgres URL for the shared tier (or set ECCO_RELAY_PG / DATABASE_URL); default: SQLite in --data
+        #[arg(long)]
+        pg: Option<String>,
     },
     /// Post a message to a thread
     Send {
@@ -124,11 +128,14 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             println!("agent key (bot):   {}", envelope::encode_key(&id.agent_key().verifying_key()));
             Ok(())
         }
-        Cmd::Relay { port, data, token, signed } => {
+        Cmd::Relay { port, data, token, signed, pg } => {
             let data = data.unwrap_or_else(|| home.join("relay"));
             let token = token.or_else(|| std::env::var("ECCO_RELAY_TOKEN").ok());
             let signed = signed || std::env::var("ECCO_RELAY_SIGNED").is_ok();
-            relay::run(port, data, token, signed)
+            let pg = pg
+                .or_else(|| std::env::var("ECCO_RELAY_PG").ok())
+                .or_else(|| std::env::var("DATABASE_URL").ok());
+            relay::run(port, data, token, signed, pg)
         }
         Cmd::Send { text, to, about, kind, encrypt } => {
             let id = Identity::load(home)?;

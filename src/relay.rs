@@ -1,28 +1,24 @@
-//! The relay: a dumb store-and-forward server. Verifies, stores, orders, serves.
-//! State is a pair of append-only jsonl files, replayed into memory on start.
+//! The relay: a dumb store-and-forward server. Verifies, stores, orders,
+//! serves. Storage lives behind store::Store — SQLite by default, Postgres
+//! for the shared multi-tenant tier (--pg / DATABASE_URL).
 
-use ed25519_dalek::{Signer, SigningKey};
-use serde::{Deserialize, Serialize};
+use ed25519_dalek::{Signer, SigningKey, Verifier};
+use serde::Serialize;
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::envelope::{self, encode_key, Envelope};
-use crate::identity::Profile;
+use crate::store::{PgStore, SqliteStore, Store, Stored, ThreadAccess};
 
 const MAX_WAIT_SECS: u64 = 30;
 const POLL_STEP: Duration = Duration::from_millis(300);
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Stored {
-    pub gseq: u64,
-    pub tseq: u64,
-    pub received_at: u64,
-    pub env: Envelope,
-}
+/// Public-tier abuse floors; generous for legitimate agents.
+const MAX_BODY_BYTES: u64 = 64 * 1024;
+const MSGS_PER_MIN_PER_SENDER: u32 = 120;
+const REGISTRATIONS_PER_MIN_PER_IP: u32 = 10;
 
 #[derive(Serialize)]
 struct Receipt<'a> {
@@ -43,26 +39,75 @@ struct ReceiptSigningView<'a> {
     tseq: u64,
 }
 
-struct State {
-    msgs: Vec<Stored>,
-    profiles: HashMap<String, Profile>,
+/// Fixed-window rate limiter; coarse on purpose — an abuse floor, not QoS.
+struct Limiter {
+    buckets: Mutex<HashMap<String, (u64, u32)>>,
+}
+
+impl Limiter {
+    fn allow(&self, key: String, per_min: u32) -> bool {
+        let window = envelope::now() / 60;
+        let mut b = self.buckets.lock().unwrap();
+        if b.len() > 100_000 {
+            b.retain(|_, (w, _)| *w == window);
+        }
+        let e = b.entry(key).or_insert((window, 0));
+        if e.0 != window {
+            *e = (window, 0);
+        }
+        e.1 += 1;
+        e.1 <= per_min
+    }
 }
 
 pub struct Relay {
-    data: PathBuf,
+    store: Box<dyn Store>,
     key: SigningKey,
-    state: Mutex<State>,
     token: Option<String>,
     signed: bool,
+    limiter: Limiter,
 }
 
-pub fn run(port: u16, data: PathBuf, token: Option<String>, signed: bool) -> Result<(), String> {
-    let relay = Arc::new(Relay::open(data, token, signed)?);
-    let server = Arc::new(
-        tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| e.to_string())?,
-    );
+pub fn run(
+    port: u16,
+    data: PathBuf,
+    token: Option<String>,
+    signed: bool,
+    pg: Option<String>,
+) -> Result<(), String> {
+    fs::create_dir_all(&data).map_err(|e| e.to_string())?;
+    let key_path = data.join("relay_key");
+    let key = match fs::read_to_string(&key_path) {
+        Ok(hex_secret) => {
+            let bytes: [u8; 32] = hex::decode(hex_secret.trim())
+                .map_err(|_| "corrupt relay_key")?
+                .try_into()
+                .map_err(|_| "corrupt relay_key")?;
+            SigningKey::from_bytes(&bytes)
+        }
+        Err(_) => {
+            let key = SigningKey::generate(&mut rand::rngs::OsRng);
+            fs::write(&key_path, hex::encode(key.to_bytes())).map_err(|e| e.to_string())?;
+            key
+        }
+    };
+    let (store, backend): (Box<dyn Store>, &str) = match &pg {
+        Some(url) => (Box::new(PgStore::open(url)?), "postgres"),
+        None => (Box::new(SqliteStore::open(&data)?), "sqlite"),
+    };
+    let relay = Arc::new(Relay {
+        store,
+        key,
+        token,
+        signed,
+        limiter: Limiter {
+            buckets: Mutex::new(HashMap::new()),
+        },
+    });
+    let server = Arc::new(tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| e.to_string())?);
     eprintln!(
-        "ecco relay on port {port} · key {}",
+        "ecco relay on port {port} · {backend} · signed reads: {} · key {}",
+        relay.signed,
         encode_key(&relay.key.verifying_key())
     );
     let mut workers = Vec::new();
@@ -83,46 +128,6 @@ pub fn run(port: u16, data: PathBuf, token: Option<String>, signed: bool) -> Res
 }
 
 impl Relay {
-    fn open(data: PathBuf, token: Option<String>, signed: bool) -> Result<Relay, String> {
-        fs::create_dir_all(&data).map_err(|e| e.to_string())?;
-        let key_path = data.join("relay_key");
-        let key = match fs::read_to_string(&key_path) {
-            Ok(hex_secret) => {
-                let bytes: [u8; 32] = hex::decode(hex_secret.trim())
-                    .map_err(|_| "corrupt relay_key")?
-                    .try_into()
-                    .map_err(|_| "corrupt relay_key")?;
-                SigningKey::from_bytes(&bytes)
-            }
-            Err(_) => {
-                let key = SigningKey::generate(&mut rand::rngs::OsRng);
-                fs::write(&key_path, hex::encode(key.to_bytes())).map_err(|e| e.to_string())?;
-                key
-            }
-        };
-        let mut state = State {
-            msgs: Vec::new(),
-            profiles: HashMap::new(),
-        };
-        for line in read_lines(&data.join("msgs.jsonl")) {
-            if let Ok(s) = serde_json::from_str::<Stored>(&line) {
-                state.msgs.push(s);
-            }
-        }
-        for line in read_lines(&data.join("profiles.jsonl")) {
-            if let Ok(p) = serde_json::from_str::<Profile>(&line) {
-                state.profiles.insert(p.name.clone(), p); // last write wins on replay
-            }
-        }
-        Ok(Relay {
-            data,
-            key,
-            state: Mutex::new(state),
-            token,
-            signed,
-        })
-    }
-
     fn handle(&self, mut req: tiny_http::Request) {
         // Transport-level gate (PROTOCOL.md §5): deployment config, not protocol.
         if let Some(expected) = &self.token {
@@ -143,6 +148,10 @@ impl Relay {
             None => (url.clone(), HashMap::new()),
         };
         let method = req.method().as_str().to_string();
+        let ip = req
+            .remote_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "unknown".into());
 
         // auth-v0 (PROTOCOL.md §5): on a signed relay, reads must be signed by
         // a key of a registered identity; writes are already self-certifying.
@@ -151,38 +160,38 @@ impl Relay {
             match self.verify_read(&req, &url) {
                 Ok(addr) => reader = Some(addr),
                 Err(e) => {
-                    let _ = req.respond(
-                        tiny_http::Response::from_string(e).with_status_code(401),
-                    );
+                    let _ = req
+                        .respond(tiny_http::Response::from_string(e).with_status_code(401));
                     return;
                 }
             }
         }
 
         let mut body = String::new();
-        let _ = std::io::Read::read_to_string(&mut req.as_reader(), &mut body);
+        let _ = std::io::Read::read_to_string(
+            &mut std::io::Read::take(req.as_reader(), MAX_BODY_BYTES + 1),
+            &mut body,
+        );
 
-        let result = match (method.as_str(), path.as_str()) {
-            ("POST", "/addr") => self.post_addr(&body),
-            ("GET", p) if p.starts_with("/addr/") => self.get_addr(&p["/addr/".len()..]),
-            ("POST", "/msgs") => self.post_msgs(&body),
-            ("GET", "/threads") => self
-                .authorize_thread(reader.as_deref(), &query)
-                .and_then(|_| {
-                    self.query(&query, |s, q| {
-                        q.get("about").map_or(false, |about| &s.env.about == about)
-                    })
-                }),
-            ("GET", "/inbox") => {
-                if reader.is_some() && query.get("addr") != reader.as_ref() {
-                    Err((403, "an inbox is readable only by its own address".into()))
-                } else {
-                    self.query(&query, |s, q| {
-                        q.get("addr").map_or(false, |a| s.env.to.contains(a))
-                    })
+        let result = if body.len() as u64 > MAX_BODY_BYTES {
+            Err((413, "body exceeds 64KB".into()))
+        } else {
+            match (method.as_str(), path.as_str()) {
+                ("POST", "/addr") => self.post_addr(&body, &ip),
+                ("GET", p) if p.starts_with("/addr/") => self.get_addr(&p["/addr/".len()..]),
+                ("POST", "/msgs") => self.post_msgs(&body),
+                ("GET", "/threads") => self
+                    .authorize_thread(reader.as_deref(), &query)
+                    .and_then(|_| self.poll(&query, true)),
+                ("GET", "/inbox") => {
+                    if reader.is_some() && query.get("addr") != reader.as_ref() {
+                        Err((403, "an inbox is readable only by its own address".into()))
+                    } else {
+                        self.poll(&query, false)
+                    }
                 }
+                _ => Err((404, "not found".into())),
             }
-            _ => Err((404, "not found".into())),
         };
 
         let response = match result {
@@ -195,27 +204,24 @@ impl Relay {
         let _ = req.respond(response);
     }
 
-    fn post_addr(&self, body: &str) -> Result<String, (u16, String)> {
-        let profile: Profile =
+    fn post_addr(&self, body: &str, ip: &str) -> Result<String, (u16, String)> {
+        if !self
+            .limiter
+            .allow(format!("addr:{ip}"), REGISTRATIONS_PER_MIN_PER_IP)
+        {
+            return Err((429, "registration rate limit".into()));
+        }
+        let profile: crate::identity::Profile =
             serde_json::from_str(body).map_err(|e| (400, format!("bad profile: {e}")))?;
         profile.verify().map_err(|e| (400, e))?;
-        let mut state = self.state.lock().unwrap();
-        if let Some(existing) = state.profiles.get(&profile.name) {
-            if existing.root != profile.root {
-                return Err((409, format!("name '{}' is taken", profile.name)));
-            }
-        }
-        append_line(&self.data.join("profiles.jsonl"), &serde_json::to_string(&profile).unwrap());
-        state.profiles.insert(profile.name.clone(), profile);
+        self.store.register(profile)?;
         Ok("{\"ok\":true}".into())
     }
 
     fn get_addr(&self, name: &str) -> Result<String, (u16, String)> {
-        let state = self.state.lock().unwrap();
-        state
-            .profiles
-            .get(name)
-            .map(|p| serde_json::to_string(p).unwrap())
+        self.store
+            .profile(name)?
+            .map(|p| serde_json::to_string(&p).unwrap())
             .ok_or((404, format!("no profile for '{name}'")))
     }
 
@@ -223,38 +229,26 @@ impl Relay {
         let env: Envelope =
             serde_json::from_str(body).map_err(|e| (400, format!("bad envelope: {e}")))?;
         env.verify().map_err(|e| (400, e))?;
+        if !self
+            .limiter
+            .allow(format!("msgs:{}", env.from), MSGS_PER_MIN_PER_SENDER)
+        {
+            return Err((429, "message rate limit".into()));
+        }
         let sender_name = env
             .from
             .split_once('@')
             .ok_or((400, "bad from address".to_string()))?
-            .0
-            .to_string();
+            .0;
         let now = envelope::now();
-
-        let mut state = self.state.lock().unwrap();
-        let profile = state
-            .profiles
-            .get(&sender_name)
+        let profile = self
+            .store
+            .profile(sender_name)?
             .ok_or((400, format!("unknown sender '{}'", env.from)))?;
         profile
             .authorizes(&env.key, &env.kind, now)
             .map_err(|e| (403, e))?;
-
-        // Idempotent by id: resubmission returns a fresh receipt for the stored copy.
-        let stored = match state.msgs.iter().find(|s| s.env.id == env.id) {
-            Some(existing) => existing.clone(),
-            None => {
-                let stored = Stored {
-                    gseq: state.msgs.len() as u64 + 1,
-                    tseq: state.msgs.iter().filter(|s| s.env.about == env.about).count() as u64 + 1,
-                    received_at: now,
-                    env,
-                };
-                append_line(&self.data.join("msgs.jsonl"), &serde_json::to_string(&stored).unwrap());
-                state.msgs.push(stored.clone());
-                stored
-            }
-        };
+        let stored = self.store.append(env, now)?;
 
         let relay_key = encode_key(&self.key.verifying_key());
         let signing = serde_json::to_vec(&ReceiptSigningView {
@@ -297,19 +291,16 @@ impl Relay {
             return Err("request timestamp outside the 300s window".into());
         }
         let name = addr.split_once('@').ok_or("bad x-ecco-addr")?.0;
-        {
-            let state = self.state.lock().unwrap();
-            let profile = state
-                .profiles
-                .get(name)
-                .ok_or(format!("unknown identity '{addr}'"))?;
-            profile.authorizes_read(&key, now)?;
-        }
+        let profile = self
+            .store
+            .profile(name)
+            .map_err(|(_, e)| e)?
+            .ok_or(format!("unknown identity '{addr}'"))?;
+        profile.authorizes_read(&key, now)?;
         let vk = envelope::decode_key(&key)?;
         let sig_bytes: [u8; 64] = envelope::decode_prefixed(&sig, "ed25519:")?
             .try_into()
             .map_err(|_| "bad signature length".to_string())?;
-        use ed25519_dalek::Verifier;
         vk.verify(
             &crate::identity::request_signing_bytes("GET", path_query, ts),
             &ed25519_dalek::Signature::from_bytes(&sig_bytes),
@@ -329,46 +320,28 @@ impl Relay {
         let Some(about) = q.get("about") else {
             return Err((400, "about required".into()));
         };
-        let state = self.state.lock().unwrap();
-        let mut any = false;
-        for s in state.msgs.iter().filter(|s| &s.env.about == about) {
-            any = true;
-            if s.env.from == addr || s.env.to.iter().any(|t| t == addr) {
-                return Ok(());
-            }
-        }
-        if any {
-            Err((403, "not a participant in this thread".into()))
-        } else {
-            Ok(())
+        match self.store.access(about, addr)? {
+            ThreadAccess::NotParticipant => Err((403, "not a participant in this thread".into())),
+            _ => Ok(()),
         }
     }
 
-    /// Shared read path for /threads and /inbox, with long-polling.
-    fn query(
-        &self,
-        q: &HashMap<String, String>,
-        matches: fn(&Stored, &HashMap<String, String>) -> bool,
-    ) -> Result<String, (u16, String)> {
+    /// Shared read path for /threads (by_thread=true) and /inbox, long-polling.
+    fn poll(&self, q: &HashMap<String, String>, by_thread: bool) -> Result<String, (u16, String)> {
         let since: u64 = q.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
         let wait: u64 = q
             .get("wait")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0)
             .min(MAX_WAIT_SECS);
-        let seq_of = |s: &Stored, q: &HashMap<String, String>| {
-            if q.contains_key("about") { s.tseq } else { s.gseq }
-        };
         let deadline = Instant::now() + Duration::from_secs(wait);
         loop {
-            let found: Vec<Stored> = {
-                let state = self.state.lock().unwrap();
-                state
-                    .msgs
-                    .iter()
-                    .filter(|s| matches(s, q) && seq_of(s, q) > since)
-                    .cloned()
-                    .collect()
+            let found: Vec<Stored> = if by_thread {
+                let about = q.get("about").ok_or((400, "about required".to_string()))?;
+                self.store.thread(about, since)?
+            } else {
+                let addr = q.get("addr").ok_or((400, "addr required".to_string()))?;
+                self.store.inbox(addr, since)?
             };
             if !found.is_empty() || Instant::now() >= deadline {
                 return Ok(format!(
@@ -379,21 +352,6 @@ impl Relay {
             std::thread::sleep(POLL_STEP);
         }
     }
-}
-
-fn read_lines(path: &PathBuf) -> Vec<String> {
-    fs::read_to_string(path)
-        .map(|s| s.lines().map(str::to_string).collect())
-        .unwrap_or_default()
-}
-
-fn append_line(path: &PathBuf, line: &str) {
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .expect("open data file");
-    writeln!(f, "{line}").expect("append data file");
 }
 
 fn parse_query(q: &str) -> HashMap<String, String> {
