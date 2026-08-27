@@ -1,7 +1,5 @@
-//! Relay storage behind one trait. Storage is relay-internal — the protocol
-//! only ever sees envelopes, seqs, and receipts — so backends are swappable:
-//! `SqliteStore` for self-hosted and dedicated relays (single file, WAL, zero
-//! config), `PgStore` (Postgres) for a multi-tenant deployment.
+//! Relay storage: one SQLite file in WAL mode, zero config. Storage is
+//! relay-internal — the protocol only ever sees envelopes, seqs, and receipts.
 
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -29,24 +27,6 @@ pub enum ThreadAccess {
 
 type Res<T> = Result<T, (u16, String)>;
 
-pub trait Store: Send + Sync {
-    fn register(&self, profile: Profile) -> Res<()>;
-    fn profile(&self, name: &str) -> Res<Option<Profile>>;
-    /// Idempotent by envelope id: resubmission returns the stored copy.
-    fn append(&self, env: Envelope, received_at: u64) -> Res<Stored>;
-    fn thread(&self, about: &str, since: u64) -> Res<Vec<Stored>>;
-    fn inbox(&self, addr: &str, since: u64) -> Res<Vec<Stored>>;
-    fn access(&self, about: &str, addr: &str) -> Res<ThreadAccess>;
-    /// Replaces the per-sender retention table. Days; 0 keeps forever.
-    fn set_retention(&self, entries: &[(String, u32)]) -> Res<()>;
-    /// Deletes envelopes older than their sender's retention window. Senders
-    /// without an entry use `default_days`; 0 keeps forever. Returns the count.
-    fn sweep(&self, now: u64, default_days: u32) -> Res<u64>;
-    /// Operator takedown of one envelope by id. Not protocol: peers keep
-    /// their signed copies. Returns whether a row existed.
-    fn remove(&self, id: &str) -> Res<bool>;
-}
-
 /// Rows per sweep transaction. Each batch takes the store lock once and
 /// briefly, so requests interleave with a long sweep.
 pub const SWEEP_BATCH: usize = 1000;
@@ -60,10 +40,6 @@ const SQLITE_BATCH: &str = "SELECT gseq FROM msgs WHERE msgs.received_at < ?3
      AND COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), ?2) > 0
      AND msgs.received_at < ?1 - COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), ?2) * 86400
      ORDER BY gseq LIMIT 1000";
-const PG_BATCH: &str = "SELECT gseq FROM msgs WHERE msgs.received_at < $3
-     AND COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), $2) > 0
-     AND msgs.received_at < $1 - COALESCE((SELECT days FROM retention r WHERE r.sender = msgs.sender), $2)::bigint * 86400
-     ORDER BY gseq LIMIT 1000";
 
 /// The smallest positive window in play, or None when nothing can expire.
 fn min_window(default_days: u32, min_entry_days: Option<i64>) -> Option<u64> {
@@ -74,8 +50,6 @@ fn min_window(default_days: u32, min_entry_days: Option<i64>) -> Option<u64> {
         .map(|d| d as u64)
         .min()
 }
-
-// ---- SqliteStore: single file, WAL mode — self-hosted and dedicated relays ----
 
 const SQLITE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS profiles (name TEXT PRIMARY KEY, root TEXT NOT NULL, doc TEXT NOT NULL);
@@ -96,19 +70,21 @@ CREATE INDEX IF NOT EXISTS msg_to_addr ON msg_to(addr, gseq);
 CREATE TABLE IF NOT EXISTS retention (sender TEXT PRIMARY KEY, days INTEGER NOT NULL);
 ";
 
-pub struct SqliteStore {
+pub struct Store {
     conn: Mutex<rusqlite::Connection>,
 }
 
-impl SqliteStore {
-    pub fn open(data: &Path) -> Result<SqliteStore, String> {
+impl Store {
+    /// Opens (or creates) `relay.db` in `data`. The busy timeout lets
+    /// `ecco admin` share the file with a running relay.
+    pub fn open(data: &Path) -> Result<Store, String> {
         fs::create_dir_all(data).map_err(|e| e.to_string())?;
         let conn = rusqlite::Connection::open(data.join("relay.db")).map_err(|e| e.to_string())?;
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.busy_timeout(Duration::from_secs(5));
         conn.execute_batch(SQLITE_SCHEMA)
             .map_err(|e| e.to_string())?;
-        Ok(SqliteStore {
+        Ok(Store {
             conn: Mutex::new(conn),
         })
     }
@@ -133,8 +109,9 @@ fn build_stored((gseq, tseq, received_at, env_json): (i64, i64, i64, String)) ->
     })
 }
 
-impl Store for SqliteStore {
-    fn register(&self, profile: Profile) -> Res<()> {
+impl Store {
+    /// First-write-wins per name; the same root key may update its document.
+    pub fn register(&self, profile: Profile) -> Res<()> {
         let conn = self.conn.lock().unwrap();
         let existing: Option<String> = sq(conn
             .query_row(
@@ -157,7 +134,7 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn profile(&self, name: &str) -> Res<Option<Profile>> {
+    pub fn profile(&self, name: &str) -> Res<Option<Profile>> {
         let conn = self.conn.lock().unwrap();
         let doc: Option<String> = sq(conn
             .query_row("SELECT doc FROM profiles WHERE name=?1", [name], |r| {
@@ -172,7 +149,8 @@ impl Store for SqliteStore {
         }
     }
 
-    fn append(&self, env: Envelope, received_at: u64) -> Res<Stored> {
+    /// Idempotent by envelope id: resubmission returns the stored copy.
+    pub fn append(&self, env: Envelope, received_at: u64) -> Res<Stored> {
         let mut conn = self.conn.lock().unwrap();
         let tx = sq(conn.transaction())?;
         if let Some(row) = sq(tx
@@ -220,7 +198,7 @@ impl Store for SqliteStore {
         })
     }
 
-    fn thread(&self, about: &str, since: u64) -> Res<Vec<Stored>> {
+    pub fn thread(&self, about: &str, since: u64) -> Res<Vec<Stored>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = sq(conn.prepare(
             "SELECT gseq,tseq,received_at,env FROM msgs WHERE about=?1 AND tseq>?2 ORDER BY tseq",
@@ -231,7 +209,7 @@ impl Store for SqliteStore {
         rows.into_iter().map(build_stored).collect()
     }
 
-    fn inbox(&self, addr: &str, since: u64) -> Res<Vec<Stored>> {
+    pub fn inbox(&self, addr: &str, since: u64) -> Res<Vec<Stored>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = sq(conn.prepare(
             "SELECT DISTINCT m.gseq,m.tseq,m.received_at,m.env
@@ -244,7 +222,7 @@ impl Store for SqliteStore {
         rows.into_iter().map(build_stored).collect()
     }
 
-    fn access(&self, about: &str, addr: &str) -> Res<ThreadAccess> {
+    pub fn access(&self, about: &str, addr: &str) -> Res<ThreadAccess> {
         let conn = self.conn.lock().unwrap();
         let (any, participant): (bool, bool) = sq(conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM msgs WHERE about=?1),
@@ -260,7 +238,8 @@ impl Store for SqliteStore {
         })
     }
 
-    fn set_retention(&self, entries: &[(String, u32)]) -> Res<()> {
+    /// Replaces the per-sender retention table. Days; 0 keeps forever.
+    pub fn set_retention(&self, entries: &[(String, u32)]) -> Res<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = sq(conn.transaction())?;
         sq(tx.execute("DELETE FROM retention", []))?;
@@ -273,7 +252,10 @@ impl Store for SqliteStore {
         sq(tx.commit())
     }
 
-    fn sweep(&self, now: u64, default_days: u32) -> Res<u64> {
+    /// Deletes envelopes older than their sender's retention window, in
+    /// batches. Senders without an entry use `default_days`; 0 keeps forever.
+    /// Returns the count.
+    pub fn sweep(&self, now: u64, default_days: u32) -> Res<u64> {
         let min_entry: Option<i64> = {
             let conn = self.conn.lock().unwrap();
             sq(
@@ -310,7 +292,9 @@ impl Store for SqliteStore {
         }
     }
 
-    fn remove(&self, id: &str) -> Res<bool> {
+    /// Operator takedown of one envelope by id. Not protocol: peers keep
+    /// their signed copies. Returns whether a row existed.
+    pub fn remove(&self, id: &str) -> Res<bool> {
         let mut conn = self.conn.lock().unwrap();
         let tx = sq(conn.transaction())?;
         sq(tx.execute(
@@ -319,251 +303,6 @@ impl Store for SqliteStore {
         ))?;
         let n = sq(tx.execute("DELETE FROM msgs WHERE id=?1", [id]))?;
         sq(tx.commit())?;
-        Ok(n > 0)
-    }
-}
-
-// ---- PgStore: Postgres, for a multi-tenant deployment ----
-
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS profiles (
-  name TEXT PRIMARY KEY,
-  root TEXT NOT NULL,
-  doc  TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS threads (
-  about TEXT PRIMARY KEY,
-  last_tseq BIGINT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS msgs (
-  gseq BIGSERIAL PRIMARY KEY,
-  id TEXT UNIQUE NOT NULL,
-  about TEXT NOT NULL,
-  sender TEXT NOT NULL,
-  tseq BIGINT NOT NULL,
-  received_at BIGINT NOT NULL,
-  env TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS msgs_about ON msgs(about, tseq);
-CREATE INDEX IF NOT EXISTS msgs_received ON msgs(received_at);
-CREATE TABLE IF NOT EXISTS msg_to (
-  gseq BIGINT NOT NULL REFERENCES msgs(gseq),
-  addr TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS msg_to_addr ON msg_to(addr, gseq);
-CREATE TABLE IF NOT EXISTS retention (
-  sender TEXT PRIMARY KEY,
-  days INTEGER NOT NULL
-);
-";
-
-pub struct PgStore {
-    client: Mutex<postgres::Client>,
-}
-
-impl PgStore {
-    pub fn open(url: &str) -> Result<PgStore, String> {
-        let mut client = postgres::Client::connect(url, postgres::NoTls)
-            .map_err(|e| format!("postgres connect: {e}"))?;
-        client
-            .batch_execute(SCHEMA)
-            .map_err(|e| format!("postgres schema: {e}"))?;
-        Ok(PgStore {
-            client: Mutex::new(client),
-        })
-    }
-}
-
-fn db<T>(r: Result<T, postgres::Error>) -> Res<T> {
-    r.map_err(|e| (500, format!("storage error: {e}")))
-}
-
-fn row_to_stored(row: &postgres::Row) -> Res<Stored> {
-    let env_json: String = row.get(3);
-    let env: Envelope = serde_json::from_str(&env_json)
-        .map_err(|e| (500, format!("corrupt stored envelope: {e}")))?;
-    Ok(Stored {
-        gseq: row.get::<_, i64>(0) as u64,
-        tseq: row.get::<_, i64>(1) as u64,
-        received_at: row.get::<_, i64>(2) as u64,
-        env,
-    })
-}
-
-impl Store for PgStore {
-    fn register(&self, profile: Profile) -> Res<()> {
-        let mut c = self.client.lock().unwrap();
-        if let Some(row) =
-            db(c.query_opt("SELECT root FROM profiles WHERE name=$1", &[&profile.name]))?
-        {
-            let root: String = row.get(0);
-            if root != profile.root {
-                return Err((409, format!("name '{}' is taken", profile.name)));
-            }
-        }
-        let doc = serde_json::to_string(&profile).unwrap();
-        db(c.execute(
-            "INSERT INTO profiles(name,root,doc) VALUES($1,$2,$3)
-             ON CONFLICT(name) DO UPDATE SET root=EXCLUDED.root, doc=EXCLUDED.doc",
-            &[&profile.name, &profile.root, &doc],
-        ))?;
-        Ok(())
-    }
-
-    fn profile(&self, name: &str) -> Res<Option<Profile>> {
-        let mut c = self.client.lock().unwrap();
-        match db(c.query_opt("SELECT doc FROM profiles WHERE name=$1", &[&name]))? {
-            Some(row) => {
-                let doc: String = row.get(0);
-                serde_json::from_str(&doc)
-                    .map(Some)
-                    .map_err(|e| (500, format!("corrupt profile: {e}")))
-            }
-            None => Ok(None),
-        }
-    }
-
-    fn append(&self, env: Envelope, received_at: u64) -> Res<Stored> {
-        let mut c = self.client.lock().unwrap();
-        let mut tx = db(c.transaction())?;
-        if let Some(row) = db(tx.query_opt(
-            "SELECT gseq,tseq,received_at,env FROM msgs WHERE id=$1",
-            &[&env.id],
-        ))? {
-            return row_to_stored(&row);
-        }
-        let tseq: i64 = db(tx.query_one(
-            "INSERT INTO threads(about,last_tseq) VALUES($1,1)
-             ON CONFLICT(about) DO UPDATE SET last_tseq=threads.last_tseq+1
-             RETURNING last_tseq",
-            &[&env.about],
-        ))?
-        .get(0);
-        let env_json = serde_json::to_string(&env).unwrap();
-        let gseq: i64 = db(tx.query_one(
-            "INSERT INTO msgs(id,about,sender,tseq,received_at,env)
-             VALUES($1,$2,$3,$4,$5,$6) RETURNING gseq",
-            &[
-                &env.id,
-                &env.about,
-                &env.from,
-                &tseq,
-                &(received_at as i64),
-                &env_json,
-            ],
-        ))?
-        .get(0);
-        for addr in &env.to {
-            db(tx.execute(
-                "INSERT INTO msg_to(gseq,addr) VALUES($1,$2)",
-                &[&gseq, &addr],
-            ))?;
-        }
-        db(tx.commit())?;
-        Ok(Stored {
-            gseq: gseq as u64,
-            tseq: tseq as u64,
-            received_at,
-            env,
-        })
-    }
-
-    fn thread(&self, about: &str, since: u64) -> Res<Vec<Stored>> {
-        let mut c = self.client.lock().unwrap();
-        let rows = db(c.query(
-            "SELECT gseq,tseq,received_at,env FROM msgs WHERE about=$1 AND tseq>$2 ORDER BY tseq",
-            &[&about, &(since as i64)],
-        ))?;
-        rows.iter().map(row_to_stored).collect()
-    }
-
-    fn inbox(&self, addr: &str, since: u64) -> Res<Vec<Stored>> {
-        let mut c = self.client.lock().unwrap();
-        let rows = db(c.query(
-            "SELECT DISTINCT m.gseq,m.tseq,m.received_at,m.env
-             FROM msgs m JOIN msg_to t ON t.gseq=m.gseq
-             WHERE t.addr=$1 AND m.gseq>$2 ORDER BY m.gseq",
-            &[&addr, &(since as i64)],
-        ))?;
-        rows.iter().map(row_to_stored).collect()
-    }
-
-    fn access(&self, about: &str, addr: &str) -> Res<ThreadAccess> {
-        let mut c = self.client.lock().unwrap();
-        let row = db(c.query_one(
-            "SELECT EXISTS(SELECT 1 FROM msgs WHERE about=$1),
-                    EXISTS(SELECT 1 FROM msgs m LEFT JOIN msg_to t ON t.gseq=m.gseq
-                           WHERE m.about=$1 AND (m.sender=$2 OR t.addr=$2))",
-            &[&about, &addr],
-        ))?;
-        let (any, participant): (bool, bool) = (row.get(0), row.get(1));
-        Ok(match (any, participant) {
-            (false, _) => ThreadAccess::Empty,
-            (true, true) => ThreadAccess::Participant,
-            (true, false) => ThreadAccess::NotParticipant,
-        })
-    }
-
-    fn set_retention(&self, entries: &[(String, u32)]) -> Res<()> {
-        let mut c = self.client.lock().unwrap();
-        let mut tx = db(c.transaction())?;
-        db(tx.execute("DELETE FROM retention", &[]))?;
-        for (sender, days) in entries {
-            db(tx.execute(
-                "INSERT INTO retention(sender,days) VALUES($1,$2)",
-                &[sender, &(*days as i32)],
-            ))?;
-        }
-        db(tx.commit())
-    }
-
-    fn sweep(&self, now: u64, default_days: u32) -> Res<u64> {
-        let min_entry: Option<i64> = {
-            let mut c = self.client.lock().unwrap();
-            db(c.query_one(
-                "SELECT MIN(days)::bigint FROM retention WHERE days > 0",
-                &[],
-            ))?
-            .get(0)
-        };
-        let Some(window) = min_window(default_days, min_entry) else {
-            return Ok(0);
-        };
-        let bound = now.saturating_sub(window * 86_400) as i64;
-        let now = now as i64;
-        let days = default_days as i32;
-        let mut total = 0u64;
-        loop {
-            let n = {
-                let mut c = self.client.lock().unwrap();
-                let mut tx = db(c.transaction())?;
-                db(tx.execute(
-                    &format!("DELETE FROM msg_to WHERE gseq IN ({PG_BATCH})"),
-                    &[&now, &days, &bound],
-                ))?;
-                let n = db(tx.execute(
-                    &format!("DELETE FROM msgs WHERE gseq IN ({PG_BATCH})"),
-                    &[&now, &days, &bound],
-                ))?;
-                db(tx.commit())?;
-                n
-            };
-            total += n;
-            if (n as usize) < SWEEP_BATCH {
-                return Ok(total);
-            }
-        }
-    }
-
-    fn remove(&self, id: &str) -> Res<bool> {
-        let mut c = self.client.lock().unwrap();
-        let mut tx = db(c.transaction())?;
-        db(tx.execute(
-            "DELETE FROM msg_to WHERE gseq IN (SELECT gseq FROM msgs WHERE id=$1)",
-            &[&id],
-        ))?;
-        let n = db(tx.execute("DELETE FROM msgs WHERE id=$1", &[&id]))?;
-        db(tx.commit())?;
         Ok(n > 0)
     }
 }
@@ -578,13 +317,13 @@ mod tests {
 
     static N: AtomicUsize = AtomicUsize::new(0);
 
-    fn fresh() -> SqliteStore {
+    fn fresh() -> Store {
         let dir: PathBuf = std::env::temp_dir().join(format!(
             "ecco-store-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::SeqCst)
         ));
-        SqliteStore::open(&dir).unwrap()
+        Store::open(&dir).unwrap()
     }
 
     fn note(from: &Identity, to: &Identity, text: &str, ts: u64) -> Envelope {

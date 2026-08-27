@@ -51,9 +51,6 @@ enum Cmd {
         /// Require signed reads — for multi-tenant relays (or set ECCO_RELAY_SIGNED)
         #[arg(long)]
         signed: bool,
-        /// Postgres URL for a multi-tenant deployment (or set ECCO_RELAY_PG / DATABASE_URL); default: SQLite in --data
-        #[arg(long)]
-        pg: Option<String>,
         /// Limits snapshot URL for per-sender retention windows (or set ECCO_RELAY_LIMITS_URL)
         #[arg(long)]
         limits_url: Option<String>,
@@ -124,21 +121,17 @@ enum AdminCmd {
     /// Remove one envelope by id (takedown). Peers keep their signed copies
     Remove {
         id: String,
-        /// Relay data dir (default: $ECCO_HOME/relay); ignored with --pg
+        /// Relay data dir (default: $ECCO_HOME/relay)
         #[arg(long)]
         data: Option<PathBuf>,
-        /// Postgres URL (or set ECCO_RELAY_PG / DATABASE_URL)
-        #[arg(long)]
-        pg: Option<String>,
     },
     /// Run one retention pass now with this default window in days (0 keeps forever)
     Sweep {
         #[arg(long)]
         days: u32,
+        /// Relay data dir (default: $ECCO_HOME/relay)
         #[arg(long)]
         data: Option<PathBuf>,
-        #[arg(long)]
-        pg: Option<String>,
     },
 }
 
@@ -179,11 +172,10 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             data,
             token,
             signed,
-            pg,
             limits_url,
             retention_days,
         } => {
-            let (data, pg) = relay_store_args(home, data, pg);
+            let data = data.unwrap_or_else(|| home.join("relay"));
             let token = token.or_else(|| std::env::var("ECCO_RELAY_TOKEN").ok());
             let signed = signed || std::env::var("ECCO_RELAY_SIGNED").is_ok();
             let retention = relay::Retention {
@@ -198,12 +190,11 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                     },
                 },
             };
-            relay::run(port, data, token, signed, pg, retention)
+            relay::run(port, data, token, signed, retention)
         }
         Cmd::Admin { cmd } => match cmd {
-            AdminCmd::Remove { id, data, pg } => {
-                let (data, pg) = relay_store_args(home, data, pg);
-                let (store, _) = relay::open_store(&data, pg.as_deref())?;
+            AdminCmd::Remove { id, data } => {
+                let store = store::Store::open(&data.unwrap_or_else(|| home.join("relay")))?;
                 if store.remove(&id).map_err(|(_, e)| e)? {
                     println!("removed {id}");
                     Ok(())
@@ -211,10 +202,9 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                     Err(format!("no envelope with id {id}"))
                 }
             }
-            AdminCmd::Sweep { days, data, pg } => {
-                let (data, pg) = relay_store_args(home, data, pg);
-                let (store, _) = relay::open_store(&data, pg.as_deref())?;
-                let n = relay::sweep_once(store.as_ref(), days)?;
+            AdminCmd::Sweep { days, data } => {
+                let store = store::Store::open(&data.unwrap_or_else(|| home.join("relay")))?;
+                let n = relay::sweep_once(&store, days)?;
                 println!("expired {n} envelope(s)");
                 Ok(())
             }
@@ -368,20 +358,6 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             Ok(())
         }
     }
-}
-
-/// Where a relay keeps its store: `--data` (default `$home/relay`) for
-/// SQLite, or a Postgres URL from `--pg` / ECCO_RELAY_PG / DATABASE_URL.
-fn relay_store_args(
-    home: &Path,
-    data: Option<PathBuf>,
-    pg: Option<String>,
-) -> (PathBuf, Option<String>) {
-    let data = data.unwrap_or_else(|| home.join("relay"));
-    let pg = pg
-        .or_else(|| std::env::var("ECCO_RELAY_PG").ok())
-        .or_else(|| std::env::var("DATABASE_URL").ok());
-    (data, pg)
 }
 
 /// Build, sign (agent key — or root key for decisions), and submit an envelope.

@@ -357,7 +357,7 @@ removes rows from this relay only: peers keep their signed copies, receipts
 stay valid, and thread seqs are never reused.
 
 An operator can remove one envelope with `ecco admin remove <id>` (same
-`--data` / `--pg` / env as the relay), and run one retention pass with
+`--data` as the relay), and run one retention pass with
 `ecco admin sweep --days N`. Neither is reachable over HTTP.
 
 ### 6. Encryption

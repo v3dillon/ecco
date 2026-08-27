@@ -1,17 +1,16 @@
 //! The relay: a dumb store-and-forward server. Verifies, stores, orders,
-//! serves. Storage lives behind store::Store — SQLite by default, Postgres
-//! for a multi-tenant deployment (--pg / DATABASE_URL).
+//! serves. Storage is one SQLite file under --data (store::Store).
 
 use ed25519_dalek::{Signer, SigningKey, Verifier};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::envelope::{self, encode_key, Envelope};
-use crate::store::{PgStore, SqliteStore, Store, Stored, ThreadAccess};
+use crate::store::{Store, Stored, ThreadAccess};
 
 const MAX_WAIT_SECS: u64 = 30;
 /// Retention pass cadence: refresh per-sender windows, then expire.
@@ -63,7 +62,7 @@ impl Limiter {
 }
 
 pub struct Relay {
-    store: Box<dyn Store>,
+    store: Store,
     key: SigningKey,
     token: Option<String>,
     signed: bool,
@@ -90,20 +89,11 @@ impl Retention {
     }
 }
 
-/// Open the relay's store: Postgres when a URL is given, else SQLite in `data`.
-pub fn open_store(data: &Path, pg: Option<&str>) -> Result<(Box<dyn Store>, &'static str), String> {
-    Ok(match pg {
-        Some(url) => (Box::new(PgStore::open(url)?), "postgres"),
-        None => (Box::new(SqliteStore::open(data)?), "sqlite"),
-    })
-}
-
 pub fn run(
     port: u16,
     data: PathBuf,
     token: Option<String>,
     signed: bool,
-    pg: Option<String>,
     retention: Retention,
 ) -> Result<(), String> {
     fs::create_dir_all(&data).map_err(|e| e.to_string())?;
@@ -122,7 +112,7 @@ pub fn run(
             key
         }
     };
-    let (store, backend) = open_store(&data, pg.as_deref())?;
+    let store = Store::open(&data)?;
     let relay = Arc::new(Relay {
         store,
         key,
@@ -134,7 +124,8 @@ pub fn run(
     });
     let server = Arc::new(tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| e.to_string())?);
     eprintln!(
-        "ecco relay on port {port} · {backend} · signed reads: {} · retention: {} · key {}",
+        "ecco relay on port {port} · {} · signed reads: {} · retention: {} · key {}",
+        data.join("relay.db").display(),
         relay.signed,
         describe_retention(&retention),
         encode_key(&relay.key.verifying_key())
@@ -457,7 +448,7 @@ fn sweeper(relay: Arc<Relay>, cfg: Retention) {
 }
 
 /// Admin entry: one retention pass against a store, no server.
-pub fn sweep_once(store: &dyn Store, default_days: u32) -> Result<u64, String> {
+pub fn sweep_once(store: &Store, default_days: u32) -> Result<u64, String> {
     store
         .sweep(envelope::now(), default_days)
         .map_err(|(_, e)| e)
