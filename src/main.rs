@@ -296,7 +296,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
 /// Build, sign (agent key — or root key for decisions), and submit an envelope.
 /// Sending to an address implies trusting it (README §4) — unless blocked.
 /// With `encrypt`, the body is sealed to each recipient's root key plus our own
-/// (enc-v0); resolution failure is an error — we never fall back to plaintext.
+/// resolution failure is an error — we never fall back to plaintext.
 fn post(
     home: &Path,
     id: &Identity,
@@ -446,12 +446,12 @@ fn token_for<'a>(id: &'a Identity, addr: &str) -> Option<&'a str> {
         .and(id.token.as_deref())
 }
 
-/// Decrypt an enc-v0 body for display; (body, was_encrypted).
+/// Decrypt a sealed body for display; (body, was_encrypted).
 fn resolved_body(id: &Identity, env: &Envelope) -> (serde_json::Value, bool) {
     if envelope::is_encrypted(&env.body) {
         match envelope::open_body(&env.body, &id.addr(), &id.root_key()) {
             Some(v) => (v, true),
-            None => (json!({ "text": "<enc-v0: not sealed to you>" }), true),
+            None => (json!({ "text": "<encrypted: not sealed to you>" }), true),
         }
     } else {
         (env.body.clone(), false)

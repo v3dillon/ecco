@@ -342,7 +342,7 @@ timestamps) remains visible: encryption hides content, not traffic.
 An encrypted envelope's `body` is:
 
 ```json
-{ "enc": "enc-v0",
+{ "enc": "x25519-sealed",
   "sealed": { "<addr>": "x25519-sealed:<hex ciphertext>", "..." : "..." } }
 ```
 

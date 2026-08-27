@@ -163,14 +163,14 @@ pub fn now() -> u64 {
         .as_secs()
 }
 
-// ---- enc-v0 (README §6) ----
+// ---- encryption (README §6) ----
 // Libsodium-compatible sealed boxes over X25519 keys derived from the existing
 // Ed25519 root keys (standard birational map). The encrypted object replaces
 // `body`; signing, ids, and the relay are untouched — the relay stores
 // ciphertext it cannot read.
 
 pub fn is_encrypted(body: &Value) -> bool {
-    body.get("enc").and_then(Value::as_str) == Some("enc-v0")
+    body.get("enc").and_then(Value::as_str) == Some("x25519-sealed")
 }
 
 /// Seal `body` to each (addr, ed25519 root key). The sender includes itself
@@ -188,10 +188,10 @@ pub fn seal_body(body: &Value, recipients: &[(String, VerifyingKey)]) -> Result<
             Value::String(format!("x25519-sealed:{}", hex::encode(ct))),
         );
     }
-    Ok(serde_json::json!({ "enc": "enc-v0", "sealed": sealed }))
+    Ok(serde_json::json!({ "enc": "x25519-sealed", "sealed": sealed }))
 }
 
-/// Open an enc-v0 body with our Ed25519 root key. None if it isn't sealed to
+/// Open an encrypted body with our Ed25519 root key. None if it isn't sealed to
 /// `self_addr` or the ciphertext doesn't open with this key.
 pub fn open_body(body: &Value, self_addr: &str, ed_sk: &SigningKey) -> Option<Value> {
     let ct_str = body.get("sealed")?.get(self_addr)?.as_str()?;

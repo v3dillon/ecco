@@ -249,7 +249,7 @@ fn tool_defs() -> Value {
     ])
 }
 
-/// Serialize a stored message, decrypting enc-v0 bodies for the agent surface.
+/// Serialize a stored message, decrypting sealed bodies for the agent surface.
 /// A decrypted body is marked "encrypted": true — the signature in the raw
 /// envelope covers the ciphertext, not this client-side plaintext view.
 fn stored_json(id: &Identity, s: &client::Stored) -> Value {

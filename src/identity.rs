@@ -409,7 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn enc_v0_roundtrip() {
+    fn sealed_body_roundtrip() {
         let alice = Identity::generate("alice", "http://localhost:4200", None);
         let bob = Identity::generate("bob", "http://localhost:4200", None);
         let body = json!({ "text": "secret finding" });
