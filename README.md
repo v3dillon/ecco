@@ -77,6 +77,16 @@ Hooking up an agent is nothing more than telling it the CLI exists — e.g. in a
 CLAUDE.md: *"coordinate with collaborators via `ecco inbox --new` /
 `ecco send`; stop and file a `proposal` for anything needing human sign-off."*
 
+Or give an MCP-capable harness native tools:
+
+```sh
+claude mcp add ecco -- ecco mcp
+```
+
+which exposes `ecco_send`, `ecco_inbox`, `ecco_thread`, `ecco_pending`,
+`ecco_resolve`, and `ecco_whoami`. The MCP surface cannot sign decisions —
+`ecco approve` stays a human command in a terminal.
+
 ## Layout
 
 ```
@@ -85,6 +95,7 @@ src/envelope.rs    signed, content-addressed messages
 src/identity.rs    root keys, agent subkeys, delegation, profiles
 src/relay.rs       the store-and-forward server (`ecco relay`)
 src/client.rs      HTTP client for the relay API
+src/mcp.rs         MCP server over stdio (`ecco mcp`)
 src/main.rs        the CLI
 ```
 
@@ -92,7 +103,7 @@ src/main.rs        the CLI
 
 v0 / alpha. Working: envelopes, delegation, relay, threads, inbox,
 long-polling, pending/approve, receipts, persisted inbox cursor
-(`watch` and `inbox --new` resume where the last session stopped). Deliberately not yet: encryption
-(`enc-v0`, reserved), signed reads for hosted relays, federation, MCP server,
-non-relay transports. See PROTOCOL.md §6–§7 for how each lands without
+(`watch` and `inbox --new` resume where the last session stopped), MCP server
+(`ecco mcp`). Deliberately not yet: encryption (`enc-v0`, reserved), signed
+reads for hosted relays, federation, non-relay transports. See PROTOCOL.md §6–§7 for how each lands without
 breaking the format.

@@ -1,6 +1,7 @@
 mod client;
 mod envelope;
 mod identity;
+mod mcp;
 mod relay;
 
 use clap::{Parser, Subcommand};
@@ -71,6 +72,8 @@ enum Cmd {
     Approve { id: String },
     /// Sign a decision rejecting a proposal — root key, human only
     Reject { id: String },
+    /// Serve ecco as MCP tools over stdio (for agent harnesses)
+    Mcp,
     /// Fetch and verify another address's profile
     Resolve { addr: String },
     /// Show your identity
@@ -161,6 +164,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
         }
         Cmd::Approve { id: target } => decide(home, &target, "approves"),
         Cmd::Reject { id: target } => decide(home, &target, "rejects"),
+        Cmd::Mcp => mcp::run(home),
         Cmd::Resolve { addr } => {
             let profile = client::resolve(&addr)?;
             println!("{}", serde_json::to_string_pretty(&profile).unwrap());

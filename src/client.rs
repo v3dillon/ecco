@@ -1,12 +1,12 @@
 //! HTTP client for the relay API. PROTOCOL.md §5.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::envelope::Envelope;
 use crate::identity::{addr_relay_url, Profile};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Stored {
     pub gseq: u64,
     pub tseq: u64,

@@ -1,0 +1,202 @@
+//! `ecco mcp`: an MCP server over stdio, so any MCP-capable harness gets ecco
+//! as native tools. Line-delimited JSON-RPC 2.0; no extra dependencies.
+//!
+//! The trust boundary holds here too: this surface is the *agent's*, so it can
+//! propose but never sign a `decision` — approval stays a human CLI command.
+
+use serde_json::{json, Value};
+use std::io::{BufRead, Write};
+use std::path::PathBuf;
+
+use crate::client;
+use crate::envelope;
+use crate::identity::Identity;
+
+const TOOLS: &[&str] = &[
+    "ecco_send", "ecco_inbox", "ecco_thread", "ecco_pending", "ecco_resolve", "ecco_whoami",
+];
+
+pub fn run(home: &PathBuf) -> Result<(), String> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+        // No id => notification; MCP forbids responding to those.
+        let Some(id) = msg.get("id").filter(|v| !v.is_null()).cloned() else { continue };
+        let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
+        let reply = match method {
+            "initialize" => ok(&id, initialize(&params)),
+            "ping" => ok(&id, json!({})),
+            "tools/list" => ok(&id, json!({ "tools": tool_defs() })),
+            "tools/call" => tools_call(home, &id, &params),
+            _ => err(&id, -32601, &format!("method not found: {method}")),
+        };
+        let mut out = stdout.lock();
+        writeln!(out, "{reply}").map_err(|e| e.to_string())?;
+        out.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn initialize(params: &Value) -> Value {
+    let version = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("2025-06-18");
+    json!({
+        "protocolVersion": version,
+        "capabilities": { "tools": {} },
+        "serverInfo": { "name": "ecco", "version": env!("CARGO_PKG_VERSION") }
+    })
+}
+
+fn tools_call(home: &PathBuf, id: &Value, params: &Value) -> String {
+    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+    if !TOOLS.contains(&name) {
+        return err(id, -32602, &format!("unknown tool '{name}'"));
+    }
+    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    match call(home, name, &args) {
+        Ok(text) => ok(id, json!({ "content": [{ "type": "text", "text": text }], "isError": false })),
+        Err(e) => ok(id, json!({ "content": [{ "type": "text", "text": e }], "isError": true })),
+    }
+}
+
+fn call(home: &PathBuf, name: &str, args: &Value) -> Result<String, String> {
+    let id = Identity::load(home)?;
+    let str_arg = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_string);
+    match name {
+        "ecco_whoami" => Ok(pretty(&json!({
+            "addr": id.addr(),
+            "relay": id.relay,
+            "root": envelope::encode_key(&id.root_key().verifying_key()),
+            "agent": envelope::encode_key(&id.agent_key().verifying_key()),
+        }))),
+        "ecco_send" => {
+            let text = str_arg("text").ok_or("'text' is required")?;
+            let kind = str_arg("kind").unwrap_or_else(|| "note".into());
+            if kind == "decision" {
+                return Err(
+                    "decisions are human-only: ask your human to run `ecco approve <id>`".into(),
+                );
+            }
+            if !envelope::KINDS.contains(&kind.as_str()) {
+                return Err(format!("unknown kind '{kind}'"));
+            }
+            let to: Vec<String> = args
+                .get("to")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default();
+            let about = str_arg("about").unwrap_or_else(|| crate::dm_thread(&id.addr(), &to));
+            crate::post(&id, about, kind, json!({ "text": text }), to)
+        }
+        "ecco_inbox" => {
+            let new = args.get("new").and_then(Value::as_bool).unwrap_or(false);
+            let since = if new {
+                crate::load_cursor(home)
+            } else {
+                args.get("since").and_then(Value::as_u64).unwrap_or(0)
+            };
+            let msgs = client::inbox(&id.relay, &id.addr(), since, 0)?;
+            if new {
+                if let Some(max) = msgs.iter().map(|s| s.gseq).max() {
+                    crate::save_cursor(home, max)?;
+                }
+            }
+            Ok(pretty(&serde_json::to_value(&msgs).unwrap()))
+        }
+        "ecco_thread" => {
+            let about = str_arg("about").ok_or("'about' is required")?;
+            let mut msgs = client::thread(&id.relay, &about, 0, 0)?;
+            msgs.sort_by_key(|s| s.tseq);
+            Ok(pretty(&serde_json::to_value(&msgs).unwrap()))
+        }
+        "ecco_pending" => {
+            let pending = crate::pending_proposals(&id)?;
+            Ok(pretty(&serde_json::to_value(&pending).unwrap()))
+        }
+        "ecco_resolve" => {
+            let addr = str_arg("addr").ok_or("'addr' is required")?;
+            let profile = client::resolve(&addr)?;
+            Ok(pretty(&serde_json::to_value(&profile).unwrap()))
+        }
+        _ => unreachable!("gated by TOOLS"),
+    }
+}
+
+fn tool_defs() -> Value {
+    let no_args = json!({ "type": "object", "properties": {} });
+    json!([
+        {
+            "name": "ecco_send",
+            "description": "Post a signed message to an ecco thread. Kinds: note (default); claim (announce you are starting work — check the thread for existing claims first); release (withdraw a claim); request (ask a collaborator's agent to act); finding (report a result); proposal (ask your human for a decision, then stop and wait). Decisions cannot be sent from this surface.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" },
+                    "to": { "type": "array", "items": { "type": "string" }, "description": "recipient addresses, name@authority" },
+                    "about": { "type": "string", "description": "thread anchor, e.g. gh:owner/repo/pull/13; defaults to a DM thread with the recipients" },
+                    "kind": { "type": "string", "enum": ["note", "claim", "release", "request", "finding", "proposal"] }
+                },
+                "required": ["text"]
+            }
+        },
+        {
+            "name": "ecco_inbox",
+            "description": "Messages addressed to you. Pass new=true to get only unseen messages and advance the persisted cursor — recommended at session start.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "new": { "type": "boolean" },
+                    "since": { "type": "integer", "description": "explicit gseq cursor; ignored when new=true" }
+                }
+            }
+        },
+        {
+            "name": "ecco_thread",
+            "description": "Full history of one thread — the signed ledger for an artifact — oldest first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "about": { "type": "string" } },
+                "required": ["about"]
+            }
+        },
+        {
+            "name": "ecco_pending",
+            "description": "Proposals still awaiting a human decision. Surface these to your human; approval happens outside this surface via `ecco approve`.",
+            "inputSchema": no_args
+        },
+        {
+            "name": "ecco_resolve",
+            "description": "Fetch and verify a collaborator's signed profile by address (name@authority). Use to confirm an address exists before sending.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "addr": { "type": "string" } },
+                "required": ["addr"]
+            }
+        },
+        {
+            "name": "ecco_whoami",
+            "description": "Your own ecco address, relay, and public keys.",
+            "inputSchema": no_args
+        }
+    ])
+}
+
+fn pretty(v: &Value) -> String {
+    serde_json::to_string_pretty(v).unwrap()
+}
+
+fn ok(id: &Value, result: Value) -> String {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
+}
+
+fn err(id: &Value, code: i64, message: &str) -> String {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }).to_string()
+}
