@@ -1,6 +1,6 @@
 //! The relay: a dumb store-and-forward server. Verifies, stores, orders,
 //! serves. Storage lives behind store::Store — SQLite by default, Postgres
-//! for the shared multi-tenant tier (--pg / DATABASE_URL).
+//! for a multi-tenant deployment (--pg / DATABASE_URL).
 
 use ed25519_dalek::{Signer, SigningKey, Verifier};
 use serde::Serialize;

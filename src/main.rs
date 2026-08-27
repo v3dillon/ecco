@@ -51,7 +51,7 @@ enum Cmd {
         /// Require signed reads — for multi-tenant relays (or set ECCO_RELAY_SIGNED)
         #[arg(long)]
         signed: bool,
-        /// Postgres URL for the shared tier (or set ECCO_RELAY_PG / DATABASE_URL); default: SQLite in --data
+        /// Postgres URL for a multi-tenant deployment (or set ECCO_RELAY_PG / DATABASE_URL); default: SQLite in --data
         #[arg(long)]
         pg: Option<String>,
         /// Limits snapshot URL for per-sender retention windows (or set ECCO_RELAY_LIMITS_URL)

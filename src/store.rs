@@ -1,7 +1,7 @@
 //! Relay storage behind one trait. Storage is relay-internal — the protocol
 //! only ever sees envelopes, seqs, and receipts — so backends are swappable:
 //! `SqliteStore` for self-hosted and dedicated relays (single file, WAL, zero
-//! config), `PgStore` (Postgres) for the shared multi-tenant tier.
+//! config), `PgStore` (Postgres) for a multi-tenant deployment.
 
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -323,7 +323,7 @@ impl Store for SqliteStore {
     }
 }
 
-// ---- PgStore: Postgres, for the shared multi-tenant tier ----
+// ---- PgStore: Postgres, for a multi-tenant deployment ----
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS profiles (
