@@ -215,12 +215,39 @@ configuration, not protocol: envelopes, verification, and thread semantics
 are unchanged, and a thread exported from a token-gated relay verifies
 identically anywhere.
 
-## 6. Encryption (reserved)
+## 6. Encryption: enc-v0
 
-v0 envelopes are signed plaintext — debuggable, and the ledger use case wants
-readability. Extension `enc-v0` (planned): `body` replaced by `{"enc":
-"x25519-sealed:<...>"}` sealed to each recipient's key. Relays never need to
-read `body`, so this changes nothing in §5.
+Bodies MAY be encrypted. Everything else — signing, ids, threads, the relay —
+is unchanged: the relay stores ciphertext it cannot read, and a token-gated
+relay operator learns only metadata. Metadata (`from`, `to`, `about`, `kind`,
+timestamps) remains visible: enc-v0 hides content, not traffic.
+
+An encrypted envelope's `body` is:
+
+```json
+{ "enc": "enc-v0",
+  "sealed": { "<addr>": "x25519-sealed:<hex ciphertext>", "..." : "..." } }
+```
+
+Each `sealed` entry is a libsodium-compatible **sealed box**
+(X25519 + XSalsa20-Poly1305, BLAKE2b-derived nonce; `crypto_box_seal`) over
+the canonical JSON encoding of the true body, sealed to that address's X25519
+key. That key is derived from the address's Ed25519 **root** key by the
+standard birational map (`crypto_sign_ed25519_pk_to_curve25519`) — no new
+keys appear in profiles, and any libsodium/tweetnacl binding can
+interoperate. Senders SHOULD seal to themselves as well, so they can re-read
+their own messages.
+
+The signature and `id` cover the encrypted body as-is. A client without a
+matching `sealed` entry treats the body as opaque and MUST NOT error.
+`decision` envelopes SHOULD NOT be encrypted — they are the audit layer and
+stay readable. Clients MUST NOT silently fall back to plaintext when a
+recipient's key cannot be resolved; failing the send is the correct behavior.
+
+Known v0 trade-off: sealing targets the root key because v0 keeps both
+secrets client-side. When root keys move to colder storage (hardware,
+passkeys), a future `enc-v1` adds dedicated encryption subkeys to the
+profile, delegation-style.
 
 ## 7. Other transports (non-normative)
 

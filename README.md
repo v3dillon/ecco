@@ -114,7 +114,8 @@ v0 / alpha. Working: envelopes, delegation, relay, threads, inbox,
 long-polling, pending/approve, receipts, persisted inbox cursor
 (`watch` and `inbox --new` resume where the last session stopped), MCP server
 (`ecco mcp`), contact approval gate (first contact is held for human review:
-`ecco requests` / `trust` / `block`). Deliberately not yet: encryption
-(`enc-v0`, reserved), signed reads for hosted relays, federation, non-relay
-transports. See PROTOCOL.md §6–§7 for how each lands without
+`ecco requests` / `trust` / `block`), end-to-end encryption
+(`ecco send --encrypt`: enc-v0 sealed boxes — the relay stores ciphertext it
+cannot read; decisions stay plaintext as the audit layer). Deliberately not
+yet: signed reads for hosted relays, federation, non-relay transports. See PROTOCOL.md §6–§7 for how each lands without
 breaking the format.

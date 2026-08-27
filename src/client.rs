@@ -24,12 +24,12 @@ pub fn register(relay: &str, token: Option<&str>, profile: &Profile) -> Result<(
     post(&format!("{relay}/addr"), token, &body).map(|_| ())
 }
 
-/// Tokenless by design: profile resolution targets public relays. A token-gated
-/// relay's profiles are resolvable only by its own members via their client.
-pub fn resolve(addr: &str) -> Result<Profile, String> {
+/// Pass a token only when resolving on a relay you hold the token for —
+/// callers must never send their bearer token to a foreign relay.
+pub fn resolve(addr: &str, token: Option<&str>) -> Result<Profile, String> {
     let relay = addr_relay_url(addr)?;
     let name = addr.split_once('@').unwrap().0;
-    let raw = get(&format!("{relay}/addr/{name}"), None, 35)?;
+    let raw = get(&format!("{relay}/addr/{name}"), token, 35)?;
     let profile: Profile = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     profile.verify()?;
     Ok(profile)

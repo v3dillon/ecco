@@ -55,6 +55,9 @@ enum Cmd {
         about: Option<String>,
         #[arg(long, default_value = "note", value_parser = envelope::KINDS.to_vec())]
         kind: String,
+        /// Encrypt the body to the recipients' root keys (enc-v0)
+        #[arg(long, short = 'e')]
+        encrypt: bool,
     },
     /// Show messages addressed to you
     Inbox {
@@ -123,10 +126,10 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             let token = token.or_else(|| std::env::var("ECCO_RELAY_TOKEN").ok());
             relay::run(port, data, token)
         }
-        Cmd::Send { text, to, about, kind } => {
+        Cmd::Send { text, to, about, kind, encrypt } => {
             let id = Identity::load(home)?;
             let about = about.unwrap_or_else(|| dm_thread(&id.addr(), &to));
-            let receipt = post(home, &id, about, kind, json!({ "text": text }), to)?;
+            let receipt = post(home, &id, about, kind, json!({ "text": text }), to, encrypt)?;
             println!("{receipt}");
             Ok(())
         }
@@ -137,7 +140,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             let max_gseq = msgs.iter().map(|s| s.gseq).max().unwrap_or(start);
             let (visible, held) = partition(home, &id, msgs);
             for s in &visible {
-                println!("{}", fmt(s, false));
+                println!("{}", fmt(&id, s, false));
             }
             if !held.is_empty() {
                 eprintln!("({} held from unknown senders — review with `ecco requests`)", held.len());
@@ -156,7 +159,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
                 let max_gseq = batch.iter().map(|s| s.gseq).max();
                 let (visible, held) = partition(home, &id, batch);
                 for s in &visible {
-                    println!("{}", fmt(s, false));
+                    println!("{}", fmt(&id, s, false));
                 }
                 for s in &held {
                     eprintln!("held: [{}] from {} — review with `ecco requests`", s.env.kind, s.env.from);
@@ -176,7 +179,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             for s in msgs {
                 match identity::standing(&contacts, &me, &s.env.from) {
                     identity::Standing::Blocked => {}
-                    st => println!("{}", fmt(&s, st == identity::Standing::Unknown)),
+                    st => println!("{}", fmt(&id, &s, st == identity::Standing::Unknown)),
                 }
             }
             Ok(())
@@ -190,7 +193,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
                 return Ok(());
             }
             for s in &held {
-                println!("{}", fmt(s, true));
+                println!("{}", fmt(&id, s, true));
             }
             eprintln!("approve with `ecco trust <addr>`; drop with `ecco block <addr>`");
             Ok(())
@@ -201,7 +204,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             println!("trusted {addr}");
             let msgs = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), 0, 0)?;
             for s in msgs.iter().filter(|s| s.env.from == addr) {
-                println!("{}", fmt(s, false));
+                println!("{}", fmt(&id, s, false));
             }
             Ok(())
         }
@@ -217,7 +220,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
                 println!("nothing pending");
             }
             for s in pending {
-                println!("{}", fmt(&s, false));
+                println!("{}", fmt(&id, &s, false));
             }
             Ok(())
         }
@@ -225,7 +228,9 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
         Cmd::Reject { id: target } => decide(home, &target, "rejects"),
         Cmd::Mcp => mcp::run(home),
         Cmd::Resolve { addr } => {
-            let profile = client::resolve(&addr)?;
+            let own = Identity::load(home).ok();
+            let token = own.as_ref().and_then(|id| token_for(id, &addr));
+            let profile = client::resolve(&addr, token)?;
             println!("{}", serde_json::to_string_pretty(&profile).unwrap());
             Ok(())
         }
@@ -242,6 +247,8 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
 
 /// Build, sign (agent key — or root key for decisions), and submit an envelope.
 /// Sending to an address implies trusting it (PROTOCOL.md §4) — unless blocked.
+/// With `encrypt`, the body is sealed to each recipient's root key plus our own
+/// (enc-v0); resolution failure is an error — we never fall back to plaintext.
 fn post(
     home: &PathBuf,
     id: &Identity,
@@ -249,6 +256,7 @@ fn post(
     kind: String,
     body: serde_json::Value,
     to: Vec<String>,
+    encrypt: bool,
 ) -> Result<String, String> {
     let contacts = identity::contacts_load(home);
     for addr in &to {
@@ -256,6 +264,22 @@ fn post(
             identity::contacts_set(home, addr, "approved")?;
         }
     }
+    let body = if encrypt {
+        if kind == "decision" {
+            return Err("decisions stay plaintext — they are the audit layer (PROTOCOL.md §6)".into());
+        }
+        let mut recipients = vec![(id.addr(), id.root_key().verifying_key())];
+        for addr in &to {
+            if *addr == id.addr() {
+                continue;
+            }
+            let profile = client::resolve(addr, token_for(id, addr))?;
+            recipients.push((addr.clone(), envelope::decode_key(&profile.root)?));
+        }
+        envelope::seal_body(&body, &recipients)?
+    } else {
+        body
+    };
     let prev = client::thread(&id.relay, id.token.as_deref(), &about, 0, 0)?
         .iter()
         .max_by_key(|s| s.tseq)
@@ -298,6 +322,7 @@ fn decide(home: &PathBuf, target: &str, verb: &str) -> Result<(), String> {
         "decision".into(),
         serde_json::Value::Object(body),
         vec![proposal.env.from.clone()],
+        false,
     )?;
     println!("{receipt}");
     Ok(())
@@ -346,11 +371,33 @@ fn dm_thread(own: &str, to: &[String]) -> String {
     format!("dm:{}", addrs.join(","))
 }
 
-fn fmt(s: &Stored, untrusted: bool) -> String {
-    let text = s.env.body.get("text").and_then(|t| t.as_str()).unwrap_or("");
+/// Our bearer token, but only for addresses on our own relay — a token must
+/// never travel to a foreign relay.
+fn token_for<'a>(id: &'a Identity, addr: &str) -> Option<&'a str> {
+    addr.rsplit_once('@')
+        .filter(|(_, auth)| *auth == identity::authority(&id.relay))
+        .and_then(|_| id.token.as_deref())
+}
+
+/// Decrypt an enc-v0 body for display; (body, was_encrypted).
+fn resolved_body(id: &Identity, env: &Envelope) -> (serde_json::Value, bool) {
+    if envelope::is_encrypted(&env.body) {
+        match envelope::open_body(&env.body, &id.addr(), &id.root_key()) {
+            Some(v) => (v, true),
+            None => (json!({ "text": "<enc-v0: not sealed to you>" }), true),
+        }
+    } else {
+        (env.body.clone(), false)
+    }
+}
+
+fn fmt(id: &Identity, s: &Stored, untrusted: bool) -> String {
+    let (body, encrypted) = resolved_body(id, &s.env);
+    let text = body.get("text").and_then(|t| t.as_str()).unwrap_or("");
     let tag = if untrusted { "[untrusted] " } else { "" };
+    let lock = if encrypted { "[enc] " } else { "" };
     format!(
-        "#{:<3} {tag}[{}] {} · {} · {} ({} t={})",
+        "#{:<3} {tag}{lock}[{}] {} · {} · {} ({} t={})",
         s.tseq, s.env.kind, s.env.from, s.env.about, text, short(&s.env.id), s.received_at
     )
 }

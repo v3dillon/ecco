@@ -160,3 +160,44 @@ pub fn now() -> u64 {
         .expect("clock before epoch")
         .as_secs()
 }
+
+// ---- enc-v0 (PROTOCOL.md §6) ----
+// Libsodium-compatible sealed boxes over X25519 keys derived from the existing
+// Ed25519 root keys (standard birational map). The encrypted object replaces
+// `body`; signing, ids, and the relay are untouched — the relay stores
+// ciphertext it cannot read.
+
+pub fn is_encrypted(body: &Value) -> bool {
+    body.get("enc").and_then(Value::as_str) == Some("enc-v0")
+}
+
+/// Seal `body` to each (addr, ed25519 root key). The sender includes itself
+/// so it can re-read its own messages.
+pub fn seal_body(
+    body: &Value,
+    recipients: &[(String, VerifyingKey)],
+) -> Result<Value, String> {
+    let plaintext = serde_json::to_vec(body).map_err(|e| e.to_string())?;
+    let mut sealed = serde_json::Map::new();
+    for (addr, ed_pk) in recipients {
+        let x_pk = crypto_box::PublicKey::from(ed_pk.to_montgomery().to_bytes());
+        let ct = x_pk
+            .seal(&mut rand::rngs::OsRng, &plaintext)
+            .map_err(|_| "sealing failed".to_string())?;
+        sealed.insert(
+            addr.clone(),
+            Value::String(format!("x25519-sealed:{}", hex::encode(ct))),
+        );
+    }
+    Ok(serde_json::json!({ "enc": "enc-v0", "sealed": sealed }))
+}
+
+/// Open an enc-v0 body with our Ed25519 root key. None if it isn't sealed to
+/// `self_addr` or the ciphertext doesn't open with this key.
+pub fn open_body(body: &Value, self_addr: &str, ed_sk: &SigningKey) -> Option<Value> {
+    let ct_str = body.get("sealed")?.get(self_addr)?.as_str()?;
+    let ct = decode_prefixed(ct_str, "x25519-sealed:").ok()?;
+    let x_sk = crypto_box::SecretKey::from(ed_sk.to_scalar_bytes());
+    let pt = x_sk.unseal(&ct).ok()?;
+    serde_json::from_slice(&pt).ok()
+}

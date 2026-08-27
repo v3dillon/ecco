@@ -94,7 +94,8 @@ fn call(home: &PathBuf, name: &str, args: &Value) -> Result<String, String> {
                 .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
                 .unwrap_or_default();
             let about = str_arg("about").unwrap_or_else(|| crate::dm_thread(&id.addr(), &to));
-            crate::post(home, &id, about, kind, json!({ "text": text }), to)
+            let encrypt = args.get("encrypt").and_then(Value::as_bool).unwrap_or(false);
+            crate::post(home, &id, about, kind, json!({ "text": text }), to, encrypt)
         }
         "ecco_inbox" => {
             let new = args.get("new").and_then(Value::as_bool).unwrap_or(false);
@@ -111,7 +112,8 @@ fn call(home: &PathBuf, name: &str, args: &Value) -> Result<String, String> {
             }
             let (visible, held) = crate::partition(home, &id, msgs);
             let mut out = serde_json::Map::new();
-            out.insert("msgs".into(), serde_json::to_value(&visible).unwrap());
+            let decrypted: Vec<Value> = visible.iter().map(|s| stored_json(&id, s)).collect();
+            out.insert("msgs".into(), json!(decrypted));
             if !held.is_empty() {
                 // Sender + kind only — held content never reaches the agent surface.
                 let summary: Vec<Value> = held
@@ -137,7 +139,7 @@ fn call(home: &PathBuf, name: &str, args: &Value) -> Result<String, String> {
                 .filter_map(|s| match identity::standing(&contacts, &me, &s.env.from) {
                     identity::Standing::Blocked => None,
                     st => {
-                        let mut v = serde_json::to_value(s).unwrap();
+                        let mut v = stored_json(&id, s);
                         if st == identity::Standing::Unknown {
                             v["untrusted_sender"] = json!(true);
                         }
@@ -149,11 +151,12 @@ fn call(home: &PathBuf, name: &str, args: &Value) -> Result<String, String> {
         }
         "ecco_pending" => {
             let pending = crate::pending_proposals(home, &id)?;
-            Ok(pretty(&serde_json::to_value(&pending).unwrap()))
+            let decrypted: Vec<Value> = pending.iter().map(|s| stored_json(&id, s)).collect();
+            Ok(pretty(&json!(decrypted)))
         }
         "ecco_resolve" => {
             let addr = str_arg("addr").ok_or("'addr' is required")?;
-            let profile = client::resolve(&addr)?;
+            let profile = client::resolve(&addr, crate::token_for(&id, &addr))?;
             Ok(pretty(&serde_json::to_value(&profile).unwrap()))
         }
         _ => unreachable!("gated by TOOLS"),
@@ -172,7 +175,8 @@ fn tool_defs() -> Value {
                     "text": { "type": "string" },
                     "to": { "type": "array", "items": { "type": "string" }, "description": "recipient addresses, name@authority" },
                     "about": { "type": "string", "description": "thread anchor, e.g. gh:owner/repo/pull/13; defaults to a DM thread with the recipients" },
-                    "kind": { "type": "string", "enum": ["note", "claim", "release", "request", "finding", "proposal"] }
+                    "kind": { "type": "string", "enum": ["note", "claim", "release", "request", "finding", "proposal"] },
+                    "encrypt": { "type": "boolean", "description": "seal the body to the recipients' root keys (enc-v0); the relay cannot read it" }
                 },
                 "required": ["text"]
             }
@@ -217,6 +221,19 @@ fn tool_defs() -> Value {
             "inputSchema": no_args
         }
     ])
+}
+
+/// Serialize a stored message, decrypting enc-v0 bodies for the agent surface.
+/// A decrypted body is marked "encrypted": true — the signature in the raw
+/// envelope covers the ciphertext, not this client-side plaintext view.
+fn stored_json(id: &Identity, s: &client::Stored) -> Value {
+    let mut v = serde_json::to_value(s).unwrap();
+    let (body, encrypted) = crate::resolved_body(id, &s.env);
+    if encrypted {
+        v["env"]["body"] = body;
+        v["env"]["encrypted"] = json!(true);
+    }
+    v
 }
 
 fn pretty(v: &Value) -> String {

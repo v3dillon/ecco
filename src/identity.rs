@@ -348,6 +348,28 @@ mod tests {
     }
 
     #[test]
+    fn enc_v0_roundtrip() {
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        let body = json!({ "text": "secret finding" });
+        let sealed = envelope::seal_body(
+            &body,
+            &[
+                (alice.addr(), alice.root_key().verifying_key()),
+                (bob.addr(), bob.root_key().verifying_key()),
+            ],
+        )
+        .unwrap();
+        assert!(envelope::is_encrypted(&sealed));
+        // both recipients (sender sealed to itself) recover the body
+        assert_eq!(envelope::open_body(&sealed, &alice.addr(), &alice.root_key()), Some(body.clone()));
+        assert_eq!(envelope::open_body(&sealed, &bob.addr(), &bob.root_key()), Some(body));
+        // wrong key, and an address it was never sealed to, both fail closed
+        assert_eq!(envelope::open_body(&sealed, &bob.addr(), &alice.root_key()), None);
+        assert_eq!(envelope::open_body(&sealed, "carol@localhost:4200", &bob.root_key()), None);
+    }
+
+    #[test]
     fn foreign_key_is_rejected() {
         let alice = Identity::generate("alice", "http://localhost:4200", None);
         let mallory = Identity::generate("mallory", "http://localhost:4200", None);
