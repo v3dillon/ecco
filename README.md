@@ -333,10 +333,14 @@ own address; a thread is readable by its participants — an address that sent,
 or is addressed by, at least one message in it — and empty threads by any
 authenticated identity. Writes need no request signature: envelopes and
 profiles are self-certifying, and profile documents (`GET /addr/{name}`) are
-public by design. Posting is how you join a thread, so clients SHOULD
-tolerate an unreadable thread by posting with empty `prev`. Clients SHOULD
-attach the signed-read headers to every own-relay read; open relays ignore
-them.
+public by design.
+
+Threads are closed: a post to an existing anchor is accepted only from a
+participant (403 otherwise). Anyone may start an empty anchor, and being
+addressed by a participant is how you join. So two parties who pick the
+same anchor never share a thread — the second one is refused and picks
+another anchor. Clients SHOULD attach the signed-read headers to every
+own-relay read; open relays ignore them.
 
 A private or single-tenant relay MAY instead require a transport-level HTTP
 bearer token (`Authorization: Bearer …`) on every request. This is deployment

@@ -269,6 +269,19 @@ impl Relay {
         profile
             .authorizes(&env.key, &env.kind, now)
             .map_err(|e| (403, e))?;
+        // Closed threads: an existing anchor accepts posts from its
+        // participants only. Anyone may start an empty anchor, and being
+        // addressed is how you join. A stranger reusing your anchor gets
+        // this error, never your thread.
+        if let ThreadAccess::NotParticipant = self.store.access(&env.about, &env.from)? {
+            return Err((
+                403,
+                format!(
+                    "'{}' is an existing thread you are not part of; pick another anchor or ask a participant to address you",
+                    env.about
+                ),
+            ));
+        }
         let stored = self.store.append(env, now)?;
 
         let relay_key = encode_key(&self.key.verifying_key());
@@ -477,4 +490,81 @@ fn urldecode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::Identity;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static N: AtomicUsize = AtomicUsize::new(0);
+
+    fn relay() -> Relay {
+        let dir = std::env::temp_dir().join(format!(
+            "ecco-relay-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        Relay {
+            store: Store::open(&dir).unwrap(),
+            key: SigningKey::generate(&mut rand::rngs::OsRng),
+            token: None,
+            signed: true,
+            limiter: Limiter {
+                buckets: Mutex::new(HashMap::new()),
+            },
+        }
+    }
+
+    fn post(
+        r: &Relay,
+        from: &Identity,
+        about: &str,
+        to: &[&Identity],
+        text: &str,
+    ) -> Result<String, (u16, String)> {
+        let env = Envelope::seal(
+            about.into(),
+            json!({ "text": text }),
+            from.addr(),
+            "note".into(),
+            vec![],
+            to.iter().map(|i| i.addr()).collect(),
+            envelope::now(),
+            &from.agent_key(),
+        );
+        r.post_msgs(&serde_json::to_string(&env).unwrap())
+    }
+
+    #[test]
+    fn existing_threads_accept_participants_only() {
+        let r = relay();
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        let mallory = Identity::generate("mallory", "http://localhost:4200", None);
+        for id in [&alice, &bob, &mallory] {
+            r.store.register(id.profile()).unwrap();
+        }
+        let pr = "gh:acme/app/pull/13";
+        // Anyone may start an empty anchor; alice addresses bob.
+        post(&r, &alice, pr, &[&bob], "review requested").unwrap();
+        // Bob joined by being addressed.
+        post(&r, &bob, pr, &[&alice], "on it").unwrap();
+        // Mallory reuses the anchor: refused, and still not a participant.
+        let (code, msg) = post(&r, &mallory, pr, &[], "hi").unwrap_err();
+        assert_eq!(code, 403);
+        assert!(msg.contains("not part of"));
+        assert!(matches!(
+            r.store.access(pr, &mallory.addr()).unwrap(),
+            ThreadAccess::NotParticipant
+        ));
+        // Mallory can still start her own anchor.
+        post(&r, &mallory, "gh:acme/app/pull/14", &[], "mine").unwrap();
+        // And joins PR 13 once a participant addresses her.
+        post(&r, &alice, pr, &[&mallory], "join us").unwrap();
+        post(&r, &mallory, pr, &[&alice], "thanks").unwrap();
+        assert_eq!(r.store.thread(pr, 0).unwrap().len(), 4);
+    }
 }

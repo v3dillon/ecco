@@ -395,8 +395,8 @@ fn post(
     } else {
         body
     };
-    // Tolerate an unreadable thread (auth-v0 non-participant): post with empty
-    // prev — writes are self-certifying, and posting is how you join a thread.
+    // An unreadable thread (auth-v0 non-participant) yields empty prev. The
+    // relay then refuses the post unless the anchor is still empty (README §5).
     let prev = client::thread(id, &about, 0, 0)
         .unwrap_or_default()
         .iter()
