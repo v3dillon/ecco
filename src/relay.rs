@@ -17,7 +17,7 @@ const MAX_WAIT_SECS: u64 = 30;
 /// Retention pass cadence: refresh per-sender windows, then expire.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const POLL_STEP: Duration = Duration::from_millis(300);
-/// Public-tier abuse floors; generous for legitimate agents.
+/// Abuse floors for a public relay; generous for legitimate agents.
 const MAX_BODY_BYTES: u64 = 64 * 1024;
 const MSGS_PER_MIN_PER_SENDER: u32 = 120;
 const REGISTRATIONS_PER_MIN_PER_IP: u32 = 10;
