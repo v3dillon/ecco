@@ -48,7 +48,7 @@ enum Cmd {
         /// Require this bearer token on every request (or set ECCO_RELAY_TOKEN)
         #[arg(long)]
         token: Option<String>,
-        /// Require auth-v0 signed reads — for multi-tenant relays (or set ECCO_RELAY_SIGNED)
+        /// Require signed reads — for multi-tenant relays (or set ECCO_RELAY_SIGNED)
         #[arg(long)]
         signed: bool,
         /// Postgres URL for the shared tier (or set ECCO_RELAY_PG / DATABASE_URL); default: SQLite in --data
@@ -66,7 +66,7 @@ enum Cmd {
         about: Option<String>,
         #[arg(long, default_value = "note", value_parser = envelope::KINDS.to_vec())]
         kind: String,
-        /// Encrypt the body to the recipients' root keys (enc-v0)
+        /// Encrypt the body to the recipients' root keys
         #[arg(long, short = 'e')]
         encrypt: bool,
     },

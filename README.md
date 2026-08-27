@@ -95,18 +95,6 @@ which exposes `ecco_send`, `ecco_inbox`, `ecco_thread`, `ecco_pending`,
 `ecco_resolve`, and `ecco_whoami`. The MCP surface cannot sign decisions —
 `ecco approve` stays a human command in a terminal.
 
-## Layout
-
-```
-src/envelope.rs    signed, content-addressed messages
-src/identity.rs    root keys, agent subkeys, delegation, profiles
-src/relay.rs       the store-and-forward server (`ecco relay`)
-src/store.rs       relay storage: SQLite (default) or Postgres (--pg)
-src/client.rs      HTTP client for the relay API
-src/mcp.rs         MCP server over stdio (`ecco mcp`)
-src/main.rs        the CLI
-```
-
 ## Protocol
 
 The human stays in the loop cryptographically, not by promise. Three design
@@ -117,7 +105,7 @@ rules everything below follows:
    delay, but cannot forge, alter, or silently rewrite history.
 2. **Clients are ephemeral.** An agent may exist for one CLI session. Nothing
    requires both parties online at once, and nothing requires a local daemon.
-3. **Relay-first, P2P-capable.** v0 speaks HTTP to a relay. Because envelopes
+3. **Relay-first, P2P-capable.** Ecco speaks HTTP to a relay. Because envelopes
    are self-certifying and hash-linked, any future transport (direct QUIC,
    unix socket, a git ref) can carry them without a spec change.
 
@@ -157,11 +145,11 @@ A **Profile** is a signed JSON document:
 - **delegations** grant agent subkeys the right to post as this address, for a
   limited set of kinds, until `exp` (unix seconds). A delegation's `sig` is the
   root key's signature over the canonical encoding (§3) of
-  `{addr, exp, key, kinds}`. Revocation in v0 is republishing the profile
-  without the delegation.
-- **endpoints** lists transports where this identity receives messages. v0
-  defines `relay`. Future kinds (`iroh`, `socket`, ...) slot in here — this is
-  the P2P door.
+  `{addr, exp, key, kinds}`. Revocation is republishing the profile without
+  the delegation.
+- **endpoints** lists transports where this identity receives messages.
+  `relay` is the only kind defined today; future kinds (`iroh`, `socket`, ...)
+  slot in here — this is the P2P door.
 
 The profile `sig` is the root signature over the canonical profile with `sig`
 removed. Relays store profiles first-write-wins per name; updates require the
@@ -238,7 +226,7 @@ links among them. **The thread is the ledger** — signed, append-only,
 tamper-evident, exportable.
 
 `about` is deterministic so strangers' agents converge without negotiation.
-v0 conventions:
+Conventions:
 
 | prefix | example | anchors to |
 |---|---|---|
@@ -246,7 +234,7 @@ v0 conventions:
 | `dm:` | `dm:bob@x.io,dillon@y.io` | a pair of addresses |
 | anything else | `deploy:acme/app/prod` | whatever you agree on |
 
-**Kinds** are a closed set in v0. They are conventions with teeth (rule 4
+**Kinds** are a closed set. They are conventions with teeth (rule 4
 above), not a workflow engine:
 
 | kind | meaning | notes |
@@ -286,8 +274,8 @@ GET  /inbox?addr=&since=&wait=      envelopes addressed to addr, global_seq > si
 
 Reads return `{"msgs": [{"gseq": n, "tseq": n, "received_at": ts, "env": {...}}, ...]}`.
 `wait` (seconds, max 30) long-polls: the relay holds the request until a
-matching message arrives or the wait expires. Long-polling is v0's push;
-webhooks and SSE are relay extensions.
+matching message arrives or the wait expires. Long-polling is the built-in
+push; webhooks and SSE are relay extensions.
 
 On accept, the relay assigns the next **thread_seq** for the envelope's
 `about` and a **global_seq**, and returns a **Receipt**:
@@ -304,14 +292,14 @@ order attestation used for tiebreaks — "who claimed first" has one answer,
 and the relay is on the record for it. A relay that reorders history breaks
 its own receipt chain.
 
-v0 is single-relay per thread: participants use a shared relay (the normal
-case for collaborators). Clients MAY best-effort dual-post to a recipient's
+A thread lives on a single relay: participants share one (the normal case
+for collaborators). Clients MAY best-effort dual-post to a recipient's
 different home relay, but the thread's seq authority is the relay where it
-lives. Real federation is a v1 concern; the address format already carries
-the authority, so nothing breaks later.
+lives. Real federation can come later; the address format already carries
+the authority, so nothing breaks.
 
 Read authentication is not required on open relays (self-hosted/trusted).
-Multi-tenant relays SHOULD enable **auth-v0** signed reads: `GET /threads`
+Multi-tenant relays SHOULD require **signed reads**: `GET /threads`
 and `GET /inbox` then require headers
 
 ```
@@ -335,7 +323,8 @@ authenticated identity. Writes need no request signature: envelopes and
 profiles are self-certifying, and profile documents (`GET /addr/{name}`) are
 public by design. Posting is how you join a thread, so clients SHOULD
 tolerate an unreadable thread by posting with empty `prev`. Clients SHOULD
-attach auth-v0 headers to every own-relay read; open relays ignore them.
+attach the signed-read headers to every own-relay read; open relays ignore
+them.
 
 A private or single-tenant relay MAY instead require a transport-level HTTP
 bearer token (`Authorization: Bearer …`) on every request. This is deployment
@@ -343,12 +332,12 @@ configuration, not protocol: envelopes, verification, and thread semantics
 are unchanged, and a thread exported from a token-gated relay verifies
 identically anywhere.
 
-### 6. Encryption: enc-v0
+### 6. Encryption
 
 Bodies MAY be encrypted. Everything else — signing, ids, threads, the relay —
 is unchanged: the relay stores ciphertext it cannot read, and a token-gated
 relay operator learns only metadata. Metadata (`from`, `to`, `about`, `kind`,
-timestamps) remains visible: enc-v0 hides content, not traffic.
+timestamps) remains visible: encryption hides content, not traffic.
 
 An encrypted envelope's `body` is:
 
@@ -372,14 +361,14 @@ matching `sealed` entry treats the body as opaque and MUST NOT error.
 stay readable. Clients MUST NOT silently fall back to plaintext when a
 recipient's key cannot be resolved; failing the send is the correct behavior.
 
-Known v0 trade-off: sealing targets the root key because v0 keeps both
-secrets client-side. When root keys move to colder storage (hardware,
-passkeys), a future `enc-v1` adds dedicated encryption subkeys to the
+Known trade-off: sealing targets the root key because both secrets live
+client-side today. When root keys move to colder storage (hardware,
+passkeys), a future revision adds dedicated encryption subkeys to the
 profile, delegation-style.
 
 ### 7. Other transports (non-normative)
 
-The envelope is the protocol; HTTP-to-a-relay is just v0's carrier. The same
+The envelope is the protocol; HTTP-to-a-relay is just today's carrier. The same
 bytes work over: a unix socket or shared directory between agents on one
 machine; a direct QUIC connection (e.g. iroh) advertised as a profile
 endpoint, with the relay as fallback and receipt authority; or a git ref

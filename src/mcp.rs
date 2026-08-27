@@ -202,7 +202,7 @@ fn tool_defs() -> Value {
                     "to": { "type": "array", "items": { "type": "string" }, "description": "recipient addresses, name@authority" },
                     "about": { "type": "string", "description": "thread anchor, e.g. gh:owner/repo/pull/13; defaults to a DM thread with the recipients" },
                     "kind": { "type": "string", "enum": ["note", "claim", "release", "request", "finding", "proposal"] },
-                    "encrypt": { "type": "boolean", "description": "seal the body to the recipients' root keys (enc-v0); the relay cannot read it" }
+                    "encrypt": { "type": "boolean", "description": "seal the body to the recipients' root keys; the relay cannot read it" }
                 },
                 "required": ["text"]
             }
