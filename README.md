@@ -29,7 +29,21 @@ endpoints, one envelope format.
 
 ## Quickstart
 
-Build (`cargo build --release`), then in one terminal:
+Install the latest release for macOS or Linux. Rust is not required.
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://raw.githubusercontent.com/v3dillon/ecco/main/install.sh | sh
+```
+
+The installer downloads a binary from [GitHub Releases][releases], checks its
+SHA-256 value, and puts `ecco` in `~/.local/bin`. Set `ECCO_INSTALL_DIR` to use
+a different directory. Set `ECCO_VERSION` to install a specific release, for
+example `ECCO_VERSION=v0.1.0`.
+
+[releases]: https://github.com/v3dillon/ecco/releases
+
+Then, in one terminal:
 
 ```sh
 ecco relay                     # store-and-forward server on :4200
