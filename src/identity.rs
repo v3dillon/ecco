@@ -92,6 +92,27 @@ impl Profile {
         if !d.kinds.iter().any(|k| k == kind) {
             return Err(format!("delegation does not permit kind '{kind}'"));
         }
+        self.verify_delegation(d)
+    }
+
+    /// auth-v0 (PROTOCOL.md §5): may `key` read as this identity? Root, or any
+    /// unexpired delegated subkey — kind scoping is a write concern.
+    pub fn authorizes_read(&self, key: &str, at: u64) -> Result<(), String> {
+        if key == self.root {
+            return Ok(());
+        }
+        let d = self
+            .delegations
+            .iter()
+            .find(|d| d.key == key)
+            .ok_or("key not delegated by this identity")?;
+        if d.exp <= at {
+            return Err("delegation expired".into());
+        }
+        self.verify_delegation(d)
+    }
+
+    fn verify_delegation(&self, d: &Delegation) -> Result<(), String> {
         let root = decode_key(&self.root)?;
         let sig: [u8; 64] = decode_prefixed(&d.sig, "ed25519:")?
             .try_into()
@@ -106,6 +127,11 @@ impl Profile {
         root.verify(&bytes, &Signature::from_bytes(&sig))
             .map_err(|_| "bad delegation signature".to_string())
     }
+}
+
+/// auth-v0 canonical request string: `{METHOD}\n{path-and-query}\n{ts}`.
+pub fn request_signing_bytes(method: &str, path_query: &str, ts: u64) -> Vec<u8> {
+    format!("{method}\n{path_query}\n{ts}").into_bytes()
 }
 
 /// Local identity file: both secrets in v0. The root secret should eventually
@@ -345,6 +371,31 @@ mod tests {
         assert_eq!(standing(&c, "alice@x", "bob@x"), Standing::Trusted);
         assert_eq!(standing(&c, "alice@x", "eve@x"), Standing::Blocked);
         assert_eq!(standing(&c, "alice@x", "stranger@x"), Standing::Unknown);
+    }
+
+    #[test]
+    fn auth_v0_read_authorization() {
+        let id = Identity::generate("alice", "http://localhost:4200", None);
+        let profile = id.profile();
+        let now = envelope::now();
+        let agent_pub = encode_key(&id.agent_key().verifying_key());
+        let root_pub = encode_key(&id.root_key().verifying_key());
+        profile.authorizes_read(&agent_pub, now).unwrap();
+        profile.authorizes_read(&root_pub, now).unwrap();
+        assert!(profile
+            .authorizes_read(&agent_pub, profile.delegations[0].exp + 1)
+            .is_err()); // expired delegation
+        let mallory = Identity::generate("mallory", "http://localhost:4200", None);
+        let mk = encode_key(&mallory.agent_key().verifying_key());
+        assert!(profile.authorizes_read(&mk, now).is_err()); // undelegated key
+
+        // request signature binds method, path+query, and timestamp
+        let path = "/inbox?addr=alice%40localhost%3A4200&since=0&wait=0";
+        let sig = id.agent_key().sign(&request_signing_bytes("GET", path, now));
+        let vk = id.agent_key().verifying_key();
+        vk.verify(&request_signing_bytes("GET", path, now), &sig).unwrap();
+        assert!(vk.verify(&request_signing_bytes("GET", path, now + 1), &sig).is_err());
+        assert!(vk.verify(&request_signing_bytes("GET", "/inbox?addr=other", now), &sig).is_err());
     }
 
     #[test]

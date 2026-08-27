@@ -116,6 +116,8 @@ long-polling, pending/approve, receipts, persisted inbox cursor
 (`ecco mcp`), contact approval gate (first contact is held for human review:
 `ecco requests` / `trust` / `block`), end-to-end encryption
 (`ecco send --encrypt`: enc-v0 sealed boxes — the relay stores ciphertext it
-cannot read; decisions stay plaintext as the audit layer). Deliberately not
-yet: signed reads for hosted relays, federation, non-relay transports. See PROTOCOL.md §6–§7 for how each lands without
+cannot read; decisions stay plaintext as the audit layer), signed reads for
+multi-tenant relays (auth-v0: `ecco relay --signed` — inboxes readable only
+by their owner, threads only by participants). Deliberately not yet:
+federation, non-relay transports. See PROTOCOL.md §6–§7 for how each lands without
 breaking the format.

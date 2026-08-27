@@ -53,10 +53,11 @@ pub struct Relay {
     key: SigningKey,
     state: Mutex<State>,
     token: Option<String>,
+    signed: bool,
 }
 
-pub fn run(port: u16, data: PathBuf, token: Option<String>) -> Result<(), String> {
-    let relay = Arc::new(Relay::open(data, token)?);
+pub fn run(port: u16, data: PathBuf, token: Option<String>, signed: bool) -> Result<(), String> {
+    let relay = Arc::new(Relay::open(data, token, signed)?);
     let server = Arc::new(
         tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| e.to_string())?,
     );
@@ -82,7 +83,7 @@ pub fn run(port: u16, data: PathBuf, token: Option<String>) -> Result<(), String
 }
 
 impl Relay {
-    fn open(data: PathBuf, token: Option<String>) -> Result<Relay, String> {
+    fn open(data: PathBuf, token: Option<String>, signed: bool) -> Result<Relay, String> {
         fs::create_dir_all(&data).map_err(|e| e.to_string())?;
         let key_path = data.join("relay_key");
         let key = match fs::read_to_string(&key_path) {
@@ -118,6 +119,7 @@ impl Relay {
             key,
             state: Mutex::new(state),
             token,
+            signed,
         })
     }
 
@@ -141,6 +143,22 @@ impl Relay {
             None => (url.clone(), HashMap::new()),
         };
         let method = req.method().as_str().to_string();
+
+        // auth-v0 (PROTOCOL.md §5): on a signed relay, reads must be signed by
+        // a key of a registered identity; writes are already self-certifying.
+        let mut reader: Option<String> = None;
+        if self.signed && method == "GET" && (path == "/threads" || path == "/inbox") {
+            match self.verify_read(&req, &url) {
+                Ok(addr) => reader = Some(addr),
+                Err(e) => {
+                    let _ = req.respond(
+                        tiny_http::Response::from_string(e).with_status_code(401),
+                    );
+                    return;
+                }
+            }
+        }
+
         let mut body = String::new();
         let _ = std::io::Read::read_to_string(&mut req.as_reader(), &mut body);
 
@@ -148,12 +166,22 @@ impl Relay {
             ("POST", "/addr") => self.post_addr(&body),
             ("GET", p) if p.starts_with("/addr/") => self.get_addr(&p["/addr/".len()..]),
             ("POST", "/msgs") => self.post_msgs(&body),
-            ("GET", "/threads") => self.query(&query, |s, q| {
-                q.get("about").map_or(false, |about| &s.env.about == about)
-            }),
-            ("GET", "/inbox") => self.query(&query, |s, q| {
-                q.get("addr").map_or(false, |a| s.env.to.contains(a))
-            }),
+            ("GET", "/threads") => self
+                .authorize_thread(reader.as_deref(), &query)
+                .and_then(|_| {
+                    self.query(&query, |s, q| {
+                        q.get("about").map_or(false, |about| &s.env.about == about)
+                    })
+                }),
+            ("GET", "/inbox") => {
+                if reader.is_some() && query.get("addr") != reader.as_ref() {
+                    Err((403, "an inbox is readable only by its own address".into()))
+                } else {
+                    self.query(&query, |s, q| {
+                        q.get("addr").map_or(false, |a| s.env.to.contains(a))
+                    })
+                }
+            }
             _ => Err((404, "not found".into())),
         };
 
@@ -247,6 +275,73 @@ impl Relay {
             tseq: stored.tseq,
         };
         Ok(serde_json::to_string(&receipt).unwrap())
+    }
+
+    /// auth-v0: validate the X-Ecco-* headers and return the authenticated addr.
+    fn verify_read(&self, req: &tiny_http::Request, path_query: &str) -> Result<String, String> {
+        let header = |name: &str| {
+            req.headers()
+                .iter()
+                .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+                .map(|h| h.value.as_str().to_string())
+        };
+        let addr = header("x-ecco-addr").ok_or("missing x-ecco-addr")?;
+        let key = header("x-ecco-key").ok_or("missing x-ecco-key")?;
+        let sig = header("x-ecco-sig").ok_or("missing x-ecco-sig")?;
+        let ts: u64 = header("x-ecco-ts")
+            .ok_or("missing x-ecco-ts")?
+            .parse()
+            .map_err(|_| "bad x-ecco-ts")?;
+        let now = envelope::now();
+        if now.abs_diff(ts) > 300 {
+            return Err("request timestamp outside the 300s window".into());
+        }
+        let name = addr.split_once('@').ok_or("bad x-ecco-addr")?.0;
+        {
+            let state = self.state.lock().unwrap();
+            let profile = state
+                .profiles
+                .get(name)
+                .ok_or(format!("unknown identity '{addr}'"))?;
+            profile.authorizes_read(&key, now)?;
+        }
+        let vk = envelope::decode_key(&key)?;
+        let sig_bytes: [u8; 64] = envelope::decode_prefixed(&sig, "ed25519:")?
+            .try_into()
+            .map_err(|_| "bad signature length".to_string())?;
+        use ed25519_dalek::Verifier;
+        vk.verify(
+            &crate::identity::request_signing_bytes("GET", path_query, ts),
+            &ed25519_dalek::Signature::from_bytes(&sig_bytes),
+        )
+        .map_err(|_| "bad request signature".to_string())?;
+        Ok(addr)
+    }
+
+    /// auth-v0: a thread is readable by its participants; empty threads by
+    /// any authenticated identity. Evaluated at request time.
+    fn authorize_thread(
+        &self,
+        reader: Option<&str>,
+        q: &HashMap<String, String>,
+    ) -> Result<(), (u16, String)> {
+        let Some(addr) = reader else { return Ok(()) };
+        let Some(about) = q.get("about") else {
+            return Err((400, "about required".into()));
+        };
+        let state = self.state.lock().unwrap();
+        let mut any = false;
+        for s in state.msgs.iter().filter(|s| &s.env.about == about) {
+            any = true;
+            if s.env.from == addr || s.env.to.iter().any(|t| t == addr) {
+                return Ok(());
+            }
+        }
+        if any {
+            Err((403, "not a participant in this thread".into()))
+        } else {
+            Ok(())
+        }
     }
 
     /// Shared read path for /threads and /inbox, with long-polling.

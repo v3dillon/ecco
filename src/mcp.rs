@@ -104,7 +104,7 @@ fn call(home: &PathBuf, name: &str, args: &Value) -> Result<String, String> {
             } else {
                 args.get("since").and_then(Value::as_u64).unwrap_or(0)
             };
-            let msgs = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), since, 0)?;
+            let msgs = client::inbox(&id, since, 0)?;
             if new {
                 if let Some(max) = msgs.iter().map(|s| s.gseq).max() {
                     crate::save_cursor(home, max)?;
@@ -130,7 +130,7 @@ fn call(home: &PathBuf, name: &str, args: &Value) -> Result<String, String> {
         }
         "ecco_thread" => {
             let about = str_arg("about").ok_or("'about' is required")?;
-            let mut msgs = client::thread(&id.relay, id.token.as_deref(), &about, 0, 0)?;
+            let mut msgs = client::thread(&id, &about, 0, 0)?;
             msgs.sort_by_key(|s| s.tseq);
             let contacts = identity::contacts_load(home);
             let me = id.addr();

@@ -205,9 +205,32 @@ different home relay, but the thread's seq authority is the relay where it
 lives. Real federation is a v1 concern; the address format already carries
 the authority, so nothing breaks later.
 
-Read authentication is not required in v0 (self-hosted/trusted relays);
-hosted multi-tenant relays SHOULD require signed reads (signature over
-`method path ts` in headers) — reserved as extension `auth-v0`.
+Read authentication is not required on open relays (self-hosted/trusted).
+Multi-tenant relays SHOULD enable **auth-v0** signed reads: `GET /threads`
+and `GET /inbox` then require headers
+
+```
+X-Ecco-Addr: alice@relay.example
+X-Ecco-Key:  ed25519:<hex>
+X-Ecco-Ts:   <unix seconds>
+X-Ecco-Sig:  ed25519:<hex>
+```
+
+where the signature is by `key` over the UTF-8 string
+`{METHOD}\n{path-and-query}\n{ts}`, and `key` is the addr's root or any
+unexpired delegated subkey (kind scoping is a write concern and does not
+apply to reads). Relays reject timestamps more than 300 seconds from their
+clock; within the window a replayed read returns the same data to the same
+authorized identity, so nonce tracking is unnecessary.
+
+Authorization, evaluated at request time: an inbox is readable only by its
+own address; a thread is readable by its participants — an address that sent,
+or is addressed by, at least one message in it — and empty threads by any
+authenticated identity. Writes need no request signature: envelopes and
+profiles are self-certifying, and profile documents (`GET /addr/{name}`) are
+public by design. Posting is how you join a thread, so clients SHOULD
+tolerate an unreadable thread by posting with empty `prev`. Clients SHOULD
+attach auth-v0 headers to every own-relay read; open relays ignore them.
 
 A private or single-tenant relay MAY instead require a transport-level HTTP
 bearer token (`Authorization: Bearer …`) on every request. This is deployment

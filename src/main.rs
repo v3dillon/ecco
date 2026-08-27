@@ -43,6 +43,9 @@ enum Cmd {
         /// Require this bearer token on every request (or set ECCO_RELAY_TOKEN)
         #[arg(long)]
         token: Option<String>,
+        /// Require auth-v0 signed reads — for multi-tenant relays (or set ECCO_RELAY_SIGNED)
+        #[arg(long)]
+        signed: bool,
     },
     /// Post a message to a thread
     Send {
@@ -114,17 +117,18 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
                 ));
             }
             let id = Identity::generate(&name, &relay, token);
-            client::register(&id.relay, id.token.as_deref(), &id.profile())?;
+            client::register(&id)?;
             id.save(home)?;
             println!("registered {}", id.addr());
             println!("root key (you):    {}", envelope::encode_key(&id.root_key().verifying_key()));
             println!("agent key (bot):   {}", envelope::encode_key(&id.agent_key().verifying_key()));
             Ok(())
         }
-        Cmd::Relay { port, data, token } => {
+        Cmd::Relay { port, data, token, signed } => {
             let data = data.unwrap_or_else(|| home.join("relay"));
             let token = token.or_else(|| std::env::var("ECCO_RELAY_TOKEN").ok());
-            relay::run(port, data, token)
+            let signed = signed || std::env::var("ECCO_RELAY_SIGNED").is_ok();
+            relay::run(port, data, token, signed)
         }
         Cmd::Send { text, to, about, kind, encrypt } => {
             let id = Identity::load(home)?;
@@ -136,7 +140,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
         Cmd::Inbox { since, new } => {
             let id = Identity::load(home)?;
             let start = if new { load_cursor(home) } else { since };
-            let msgs = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), start, 0)?;
+            let msgs = client::inbox(&id, start, 0)?;
             let max_gseq = msgs.iter().map(|s| s.gseq).max().unwrap_or(start);
             let (visible, held) = partition(home, &id, msgs);
             for s in &visible {
@@ -155,7 +159,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             let mut cursor = since.unwrap_or_else(|| load_cursor(home));
             eprintln!("watching inbox for {} from #{cursor} (ctrl-c to stop)", id.addr());
             loop {
-                let batch = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), cursor, 25)?;
+                let batch = client::inbox(&id, cursor, 25)?;
                 let max_gseq = batch.iter().map(|s| s.gseq).max();
                 let (visible, held) = partition(home, &id, batch);
                 for s in &visible {
@@ -172,7 +176,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
         }
         Cmd::Log { about } => {
             let id = Identity::load(home)?;
-            let mut msgs = client::thread(&id.relay, id.token.as_deref(), &about, 0, 0)?;
+            let mut msgs = client::thread(&id, &about, 0, 0)?;
             msgs.sort_by_key(|s| s.tseq);
             let contacts = identity::contacts_load(home);
             let me = id.addr();
@@ -186,7 +190,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
         }
         Cmd::Requests => {
             let id = Identity::load(home)?;
-            let msgs = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), 0, 0)?;
+            let msgs = client::inbox(&id, 0, 0)?;
             let (_, held) = partition(home, &id, msgs);
             if held.is_empty() {
                 println!("no pending contact requests");
@@ -202,7 +206,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             let id = Identity::load(home)?;
             identity::contacts_set(home, &addr, "approved")?;
             println!("trusted {addr}");
-            let msgs = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), 0, 0)?;
+            let msgs = client::inbox(&id, 0, 0)?;
             for s in msgs.iter().filter(|s| s.env.from == addr) {
                 println!("{}", fmt(&id, s, false));
             }
@@ -280,14 +284,17 @@ fn post(
     } else {
         body
     };
-    let prev = client::thread(&id.relay, id.token.as_deref(), &about, 0, 0)?
+    // Tolerate an unreadable thread (auth-v0 non-participant): post with empty
+    // prev — writes are self-certifying, and posting is how you join a thread.
+    let prev = client::thread(&id, &about, 0, 0)
+        .unwrap_or_default()
         .iter()
         .max_by_key(|s| s.tseq)
         .map(|s| vec![s.env.id.clone()])
         .unwrap_or_default();
     let key = if kind == "decision" { id.root_key() } else { id.agent_key() };
     let env = Envelope::seal(about, body, id.addr(), kind, prev, to, envelope::now(), &key);
-    client::send(&id.relay, id.token.as_deref(), &env)
+    client::send(&id, &env)
 }
 
 /// Split inbox messages by sender standing: (visible, held). Blocked are dropped.
@@ -330,11 +337,11 @@ fn decide(home: &PathBuf, target: &str, verb: &str) -> Result<(), String> {
 
 /// Proposals from trusted senders whose thread does not yet contain a decision.
 fn pending_proposals(home: &PathBuf, id: &Identity) -> Result<Vec<Stored>, String> {
-    let msgs = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), 0, 0)?;
+    let msgs = client::inbox(&id, 0, 0)?;
     let (visible, _) = partition(home, id, msgs);
     let mut pending = Vec::new();
     for s in visible.into_iter().filter(|s| s.env.kind == "proposal") {
-        let decided = client::thread(&id.relay, id.token.as_deref(), &s.env.about, 0, 0)?.iter().any(|t| {
+        let decided = client::thread(&id, &s.env.about, 0, 0)?.iter().any(|t| {
             t.env.kind == "decision"
                 && t.env
                     .body
