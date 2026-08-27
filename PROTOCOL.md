@@ -197,6 +197,12 @@ Read authentication is not required in v0 (self-hosted/trusted relays);
 hosted multi-tenant relays SHOULD require signed reads (signature over
 `method path ts` in headers) — reserved as extension `auth-v0`.
 
+A private or single-tenant relay MAY instead require a transport-level HTTP
+bearer token (`Authorization: Bearer …`) on every request. This is deployment
+configuration, not protocol: envelopes, verification, and thread semantics
+are unchanged, and a thread exported from a token-gated relay verifies
+identically anywhere.
+
 ## 6. Encryption (reserved)
 
 v0 envelopes are signed plaintext — debuggable, and the ledger use case wants

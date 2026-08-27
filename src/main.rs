@@ -30,6 +30,9 @@ enum Cmd {
         name: String,
         #[arg(long, default_value = "http://localhost:4200")]
         relay: String,
+        /// Bearer token, if the relay is private
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Run a relay
     Relay {
@@ -37,6 +40,9 @@ enum Cmd {
         port: u16,
         #[arg(long)]
         data: Option<PathBuf>,
+        /// Require this bearer token on every request (or set ECCO_RELAY_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Post a message to a thread
     Send {
@@ -91,24 +97,25 @@ fn main() {
 
 fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
     match cmd {
-        Cmd::Init { name, relay } => {
+        Cmd::Init { name, relay, token } => {
             if Identity::load(home).is_ok() {
                 return Err(format!(
                     "identity already exists at {} (use --home for another)",
                     home.display()
                 ));
             }
-            let id = Identity::generate(&name, &relay);
-            client::register(&id.relay, &id.profile())?;
+            let id = Identity::generate(&name, &relay, token);
+            client::register(&id.relay, id.token.as_deref(), &id.profile())?;
             id.save(home)?;
             println!("registered {}", id.addr());
             println!("root key (you):    {}", envelope::encode_key(&id.root_key().verifying_key()));
             println!("agent key (bot):   {}", envelope::encode_key(&id.agent_key().verifying_key()));
             Ok(())
         }
-        Cmd::Relay { port, data } => {
+        Cmd::Relay { port, data, token } => {
             let data = data.unwrap_or_else(|| home.join("relay"));
-            relay::run(port, data)
+            let token = token.or_else(|| std::env::var("ECCO_RELAY_TOKEN").ok());
+            relay::run(port, data, token)
         }
         Cmd::Send { text, to, about, kind } => {
             let id = Identity::load(home)?;
@@ -121,7 +128,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             let id = Identity::load(home)?;
             let start = if new { load_cursor(home) } else { since };
             let mut cursor = start;
-            for s in client::inbox(&id.relay, &id.addr(), start, 0)? {
+            for s in client::inbox(&id.relay, id.token.as_deref(), &id.addr(), start, 0)? {
                 println!("{}", fmt(&s));
                 cursor = cursor.max(s.gseq);
             }
@@ -135,7 +142,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
             let mut cursor = since.unwrap_or_else(|| load_cursor(home));
             eprintln!("watching inbox for {} from #{cursor} (ctrl-c to stop)", id.addr());
             loop {
-                for s in client::inbox(&id.relay, &id.addr(), cursor, 25)? {
+                for s in client::inbox(&id.relay, id.token.as_deref(), &id.addr(), cursor, 25)? {
                     println!("{}", fmt(&s));
                     cursor = cursor.max(s.gseq);
                     save_cursor(home, cursor)?;
@@ -144,7 +151,7 @@ fn run(cmd: Cmd, home: &PathBuf) -> Result<(), String> {
         }
         Cmd::Log { about } => {
             let id = Identity::load(home)?;
-            let mut msgs = client::thread(&id.relay, &about, 0, 0)?;
+            let mut msgs = client::thread(&id.relay, id.token.as_deref(), &about, 0, 0)?;
             msgs.sort_by_key(|s| s.tseq);
             for s in msgs {
                 println!("{}", fmt(&s));
@@ -189,14 +196,14 @@ fn post(
     body: serde_json::Value,
     to: Vec<String>,
 ) -> Result<String, String> {
-    let prev = client::thread(&id.relay, &about, 0, 0)?
+    let prev = client::thread(&id.relay, id.token.as_deref(), &about, 0, 0)?
         .iter()
         .max_by_key(|s| s.tseq)
         .map(|s| vec![s.env.id.clone()])
         .unwrap_or_default();
     let key = if kind == "decision" { id.root_key() } else { id.agent_key() };
     let env = Envelope::seal(about, body, id.addr(), kind, prev, to, envelope::now(), &key);
-    client::send(&id.relay, &env)
+    client::send(&id.relay, id.token.as_deref(), &env)
 }
 
 /// A decision is the human ruling on a proposal: signed by the root key, never the agent's.
@@ -222,10 +229,10 @@ fn decide(home: &PathBuf, target: &str, verb: &str) -> Result<(), String> {
 
 /// Proposals in the inbox whose thread does not yet contain a decision about them.
 fn pending_proposals(id: &Identity) -> Result<Vec<Stored>, String> {
-    let msgs = client::inbox(&id.relay, &id.addr(), 0, 0)?;
+    let msgs = client::inbox(&id.relay, id.token.as_deref(), &id.addr(), 0, 0)?;
     let mut pending = Vec::new();
     for s in msgs.into_iter().filter(|s| s.env.kind == "proposal") {
-        let decided = client::thread(&id.relay, &s.env.about, 0, 0)?.iter().any(|t| {
+        let decided = client::thread(&id.relay, id.token.as_deref(), &s.env.about, 0, 0)?.iter().any(|t| {
             t.env.kind == "decision"
                 && t.env
                     .body

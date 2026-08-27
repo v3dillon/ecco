@@ -52,10 +52,11 @@ pub struct Relay {
     data: PathBuf,
     key: SigningKey,
     state: Mutex<State>,
+    token: Option<String>,
 }
 
-pub fn run(port: u16, data: PathBuf) -> Result<(), String> {
-    let relay = Arc::new(Relay::open(data)?);
+pub fn run(port: u16, data: PathBuf, token: Option<String>) -> Result<(), String> {
+    let relay = Arc::new(Relay::open(data, token)?);
     let server = Arc::new(
         tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| e.to_string())?,
     );
@@ -81,7 +82,7 @@ pub fn run(port: u16, data: PathBuf) -> Result<(), String> {
 }
 
 impl Relay {
-    fn open(data: PathBuf) -> Result<Relay, String> {
+    fn open(data: PathBuf, token: Option<String>) -> Result<Relay, String> {
         fs::create_dir_all(&data).map_err(|e| e.to_string())?;
         let key_path = data.join("relay_key");
         let key = match fs::read_to_string(&key_path) {
@@ -116,10 +117,24 @@ impl Relay {
             data,
             key,
             state: Mutex::new(state),
+            token,
         })
     }
 
     fn handle(&self, mut req: tiny_http::Request) {
+        // Transport-level gate (PROTOCOL.md §5): deployment config, not protocol.
+        if let Some(expected) = &self.token {
+            let authed = req.headers().iter().any(|h| {
+                h.field.equiv("authorization")
+                    && h.value.as_str() == format!("Bearer {expected}")
+            });
+            if !authed {
+                let resp = tiny_http::Response::from_string("missing or bad bearer token")
+                    .with_status_code(401);
+                let _ = req.respond(resp);
+                return;
+            }
+        }
         let url = req.url().to_string();
         let (path, query) = match url.split_once('?') {
             Some((p, q)) => (p.to_string(), parse_query(q)),

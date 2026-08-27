@@ -117,6 +117,9 @@ pub struct Identity {
     pub relay: String,
     pub root_secret: String,
     pub agent_secret: String,
+    /// Transport-level bearer token for a private relay (PROTOCOL.md §5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 impl Identity {
@@ -132,13 +135,14 @@ impl Identity {
         signing_key(&self.agent_secret)
     }
 
-    pub fn generate(name: &str, relay: &str) -> Identity {
+    pub fn generate(name: &str, relay: &str, token: Option<String>) -> Identity {
         let mut rng = rand::rngs::OsRng;
         Identity {
             name: name.to_string(),
             relay: relay.trim_end_matches('/').to_string(),
             root_secret: hex::encode(SigningKey::generate(&mut rng).to_bytes()),
             agent_secret: hex::encode(SigningKey::generate(&mut rng).to_bytes()),
+            token,
         }
     }
 
@@ -257,7 +261,7 @@ mod tests {
 
     #[test]
     fn agent_key_can_propose_but_not_decide() {
-        let id = Identity::generate("alice", "http://localhost:4200");
+        let id = Identity::generate("alice", "http://localhost:4200", None);
         let profile = id.profile();
         profile.verify().unwrap();
         let now = envelope::now();
@@ -277,7 +281,7 @@ mod tests {
 
     #[test]
     fn tampered_envelope_fails_verification() {
-        let id = Identity::generate("alice", "http://localhost:4200");
+        let id = Identity::generate("alice", "http://localhost:4200", None);
         let mut env = seal(&id, "finding", &id.agent_key());
         env.body = json!({"text": "reworded after signing"});
         assert!(env.verify().is_err());
@@ -285,7 +289,7 @@ mod tests {
 
     #[test]
     fn expired_delegation_is_rejected() {
-        let id = Identity::generate("alice", "http://localhost:4200");
+        let id = Identity::generate("alice", "http://localhost:4200", None);
         let profile = id.profile();
         let past_expiry = profile.delegations[0].exp + 1;
         let env = seal(&id, "note", &id.agent_key());
@@ -294,8 +298,8 @@ mod tests {
 
     #[test]
     fn foreign_key_is_rejected() {
-        let alice = Identity::generate("alice", "http://localhost:4200");
-        let mallory = Identity::generate("mallory", "http://localhost:4200");
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let mallory = Identity::generate("mallory", "http://localhost:4200", None);
         let env = seal(&alice, "note", &mallory.agent_key());
         env.verify().unwrap(); // signature is internally consistent...
         // ...but mallory's key holds no delegation from alice's root.
