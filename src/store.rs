@@ -6,7 +6,7 @@
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
 
 use crate::envelope::Envelope;
@@ -68,89 +68,10 @@ impl SqliteStore {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         conn.execute_batch(SQLITE_SCHEMA)
             .map_err(|e| e.to_string())?;
-        let store = SqliteStore {
+        Ok(SqliteStore {
             conn: Mutex::new(conn),
-        };
-        store.import_jsonl(data)?;
-        Ok(store)
+        })
     }
-
-    /// One-shot migration: replay a pre-SQLite relay's jsonl files into the DB.
-    fn import_jsonl(&self, data: &Path) -> Result<(), String> {
-        let msgs_path = data.join("msgs.jsonl");
-        let profiles_path = data.join("profiles.jsonl");
-        if !msgs_path.exists() && !profiles_path.exists() {
-            return Ok(());
-        }
-        let mut conn = self.conn.lock().unwrap();
-        let empty: bool = conn
-            .query_row(
-                "SELECT NOT EXISTS(SELECT 1 FROM msgs) AND NOT EXISTS(SELECT 1 FROM profiles)",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if !empty {
-            return Ok(());
-        }
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        let mut imported = 0u64;
-        for line in read_lines(&profiles_path) {
-            if let Ok(p) = serde_json::from_str::<Profile>(&line) {
-                let doc = serde_json::to_string(&p).unwrap();
-                tx.execute(
-                    "INSERT INTO profiles(name,root,doc) VALUES(?1,?2,?3)
-                     ON CONFLICT(name) DO UPDATE SET root=excluded.root, doc=excluded.doc",
-                    rusqlite::params![p.name, p.root, doc],
-                )
-                .map_err(|e| e.to_string())?;
-            }
-        }
-        for line in read_lines(&msgs_path) {
-            if let Ok(s) = serde_json::from_str::<Stored>(&line) {
-                let env_json = serde_json::to_string(&s.env).unwrap();
-                tx.execute(
-                    "INSERT OR IGNORE INTO msgs(gseq,id,about,sender,tseq,received_at,env)
-                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                    rusqlite::params![
-                        s.gseq as i64,
-                        s.env.id,
-                        s.env.about,
-                        s.env.from,
-                        s.tseq as i64,
-                        s.received_at as i64,
-                        env_json
-                    ],
-                )
-                .map_err(|e| e.to_string())?;
-                for addr in &s.env.to {
-                    tx.execute(
-                        "INSERT INTO msg_to(gseq,addr) VALUES(?1,?2)",
-                        rusqlite::params![s.gseq as i64, addr],
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
-                imported += 1;
-            }
-        }
-        tx.execute_batch(
-            "INSERT INTO threads(about,last_tseq)
-             SELECT about, MAX(tseq) FROM msgs GROUP BY about
-             ON CONFLICT(about) DO UPDATE SET last_tseq=excluded.last_tseq;",
-        )
-        .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
-        if imported > 0 {
-            eprintln!("imported {imported} messages from jsonl into relay.db");
-        }
-        Ok(())
-    }
-}
-
-fn read_lines(path: &PathBuf) -> Vec<String> {
-    fs::read_to_string(path)
-        .map(|s| s.lines().map(str::to_string).collect())
-        .unwrap_or_default()
 }
 
 fn sq<T>(r: Result<T, rusqlite::Error>) -> Res<T> {
