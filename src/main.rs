@@ -345,7 +345,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             let msgs = client::inbox(&id, start, wait)?;
             let max_gseq = msgs.iter().map(|s| s.gseq).max().unwrap_or(start);
             if json {
-                let result = trusted_json(home, &id, msgs, max_gseq);
+                let result = trusted_json(home, &id, msgs, max_gseq)?;
                 println!("{}", serde_json::to_string(&result).unwrap());
                 if new {
                     save_cursor(home, max_gseq)?;
@@ -398,7 +398,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             let mut msgs = client::thread(&id, &about, 0, 0)?;
             msgs.sort_by_key(|s| s.tseq);
             if json {
-                let result = trusted_json(home, &id, msgs, 0);
+                let result = trusted_json(home, &id, msgs, 0)?;
                 println!("{}", serde_json::to_string(&result.messages).unwrap());
                 return Ok(());
             }
@@ -580,7 +580,27 @@ fn partition(home: &Path, id: &Identity, msgs: Vec<Stored>) -> (Vec<Stored>, Vec
 }
 
 /// Validate relay records again at the trust boundary used by dispatchers.
-fn trusted_json(home: &Path, id: &Identity, msgs: Vec<Stored>, cursor: u64) -> InboxJson {
+fn trusted_json(
+    home: &Path,
+    id: &Identity,
+    msgs: Vec<Stored>,
+    cursor: u64,
+) -> Result<InboxJson, String> {
+    trusted_json_with(home, id, msgs, cursor, |addr| {
+        client::resolve(addr, token_for(id, addr))
+    })
+}
+
+fn trusted_json_with<F>(
+    home: &Path,
+    id: &Identity,
+    msgs: Vec<Stored>,
+    cursor: u64,
+    mut resolve: F,
+) -> Result<InboxJson, String>
+where
+    F: FnMut(&str) -> Result<identity::Profile, String>,
+{
     let contacts = identity::contacts_load(home);
     let me = id.addr();
     let mut messages = Vec::new();
@@ -589,25 +609,14 @@ fn trusted_json(home: &Path, id: &Identity, msgs: Vec<Stored>, cursor: u64) -> I
     let mut profiles = std::collections::HashMap::new();
     for stored in msgs {
         let env = &stored.env;
-        let trust = env.verify().and_then(|_| {
-            if env.from != me && !env.to.iter().any(|to| to == &me) {
-                return Err("recipient does not include this identity".into());
+        let permanent_rejection = env.verify().and_then(|_| {
+            if env.from == me || env.to.iter().any(|to| to == &me) {
+                Ok(())
+            } else {
+                Err("recipient does not include this identity".into())
             }
-            let profile = profiles.entry(env.from.clone()).or_insert_with(|| {
-                if env.from == me {
-                    Ok(id.profile())
-                } else {
-                    client::resolve(&env.from, token_for(id, &env.from))
-                }
-            });
-            let profile = profile.as_ref().map_err(Clone::clone)?;
-            let expected = env.from.split_once('@').map(|v| v.0).unwrap_or_default();
-            if profile.name != expected {
-                return Err("sender profile name does not match address".into());
-            }
-            profile.authorizes(&env.key, &env.kind, stored.received_at)
         });
-        if let Err(reason) = trust {
+        if let Err(reason) = permanent_rejection {
             rejected.push(RejectedSummary {
                 id: env.id.clone(),
                 reason,
@@ -615,7 +624,30 @@ fn trusted_json(home: &Path, id: &Identity, msgs: Vec<Stored>, cursor: u64) -> I
             continue;
         }
         match identity::standing(&contacts, &me, &env.from) {
-            identity::Standing::Trusted => messages.push(stored),
+            identity::Standing::Trusted => {
+                let profile = profiles.entry(env.from.clone()).or_insert_with(|| {
+                    if env.from == me {
+                        Ok(id.profile())
+                    } else {
+                        resolve(&env.from)
+                    }
+                });
+                let profile = profile.as_ref().map_err(Clone::clone)?;
+                let expected = env.from.split_once('@').map(|v| v.0).unwrap_or_default();
+                let authorization = if profile.name != expected {
+                    Err("sender profile name does not match address".into())
+                } else {
+                    profile.authorizes(&env.key, &env.kind, stored.received_at)
+                };
+                if let Err(reason) = authorization {
+                    rejected.push(RejectedSummary {
+                        id: env.id.clone(),
+                        reason,
+                    });
+                } else {
+                    messages.push(stored);
+                }
+            }
             identity::Standing::Unknown => {
                 *held_counts
                     .entry((env.from.clone(), env.kind.clone()))
@@ -632,12 +664,12 @@ fn trusted_json(home: &Path, id: &Identity, msgs: Vec<Stored>, cursor: u64) -> I
             count,
         })
         .collect();
-    InboxJson {
+    Ok(InboxJson {
         cursor: cursor.to_string(),
         messages,
         held,
         rejected,
-    }
+    })
 }
 
 /// A decision is the human ruling on a proposal: signed by the root key, never the agent's.
@@ -753,6 +785,17 @@ fn short(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_home(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ecco-{name}-{}-{}",
+            std::process::id(),
+            TEST_DIR.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
 
     #[test]
     fn inbox_json_has_exact_producer_schema() {
@@ -769,5 +812,76 @@ mod tests {
             ["cursor", "held", "messages", "rejected"]
         );
         assert_eq!(value["cursor"], u64::MAX.to_string());
+    }
+
+    #[test]
+    fn transient_profile_failure_does_not_lose_cursor() {
+        let home = test_home("cursor-retry");
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        identity::contacts_set(&home, &bob.addr(), "approved").unwrap();
+        let env = Envelope::seal(
+            "topic".into(),
+            json!({ "text": "hello" }),
+            bob.addr(),
+            "note".into(),
+            vec![],
+            vec![alice.addr()],
+            envelope::now(),
+            &bob.agent_key(),
+        );
+        let stored = || Stored {
+            gseq: 7,
+            tseq: 1,
+            received_at: env.ts,
+            env: env.clone(),
+        };
+
+        let first = trusted_json_with(&home, &alice, vec![stored()], 7, |_| {
+            Err("temporary profile transport failure".into())
+        });
+        assert!(first.is_err());
+        assert_eq!(load_cursor(&home), 0);
+
+        let second =
+            trusted_json_with(&home, &alice, vec![stored()], 7, |_| Ok(bob.profile())).unwrap();
+        assert_eq!(second.messages.len(), 1);
+        save_cursor(&home, 7).unwrap();
+        let remaining: Vec<_> = vec![stored()]
+            .into_iter()
+            .filter(|message| message.gseq > load_cursor(&home))
+            .collect();
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn unknown_sender_does_not_require_profile_resolution() {
+        let home = test_home("unknown-sender");
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let stranger = Identity::generate("stranger", "http://localhost:4200", None);
+        let env = Envelope::seal(
+            "topic".into(),
+            json!({ "text": "hello" }),
+            stranger.addr(),
+            "note".into(),
+            vec![],
+            vec![alice.addr()],
+            envelope::now(),
+            &stranger.agent_key(),
+        );
+        let result = trusted_json_with(
+            &home,
+            &alice,
+            vec![Stored {
+                gseq: 1,
+                tseq: 1,
+                received_at: env.ts,
+                env,
+            }],
+            1,
+            |_| panic!("unknown senders must not be resolved"),
+        )
+        .unwrap();
+        assert_eq!(result.held.len(), 1);
     }
 }
