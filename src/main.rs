@@ -54,7 +54,7 @@ enum Cmd {
         /// Address authority, e.g. relay.ecco.bot (or set ECCO_RELAY_AUTHORITY). Default: localhost:<port>
         #[arg(long)]
         authority: Option<String>,
-        /// Fail-closed allowedRoots from the limits snapshot (or set ECCO_RELAY_ALLOW_ROOTS). Requires --limits-url
+        /// Fail-closed allowedRoots from the limits snapshot (or set ECCO_RELAY_ALLOW_ROOTS). Requires --limits-url and --signed
         #[arg(long)]
         allow_roots: bool,
         /// Limits snapshot URL for per-sender retention windows (or set ECCO_RELAY_LIMITS_URL)

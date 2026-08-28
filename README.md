@@ -370,9 +370,11 @@ authority.
 
 `--allow-roots` (or `ECCO_RELAY_ALLOW_ROOTS`) is membership, not a hosted
 mode. It fails closed on `allowedRoots` from the same limits snapshot and
-requires `--limits-url`. An explicit empty array locks the relay; a missing
-or malformed list keeps the last good list, or stays pending. Each root is
-`ed25519:` plus 64 lowercase hex digits.
+requires `--limits-url` and `--signed` (otherwise `GET /threads` and
+`GET /inbox` stay public while register and post are member-only). An
+explicit empty array locks the relay; a missing or malformed list keeps
+the last good list, or stays pending. Each root is `ed25519:` plus 64
+lowercase hex digits.
 
 #### Retention and takedown (deployment, not protocol)
 

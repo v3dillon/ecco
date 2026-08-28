@@ -107,6 +107,9 @@ pub fn run(
     if allow_roots && retention.limits_url.as_ref().is_none_or(|u| u.is_empty()) {
         return Err("--allow-roots requires --limits-url or ECCO_RELAY_LIMITS_URL".into());
     }
+    if allow_roots && !signed {
+        return Err("--allow-roots requires --signed or ECCO_RELAY_SIGNED".into());
+    }
     fs::create_dir_all(&data).map_err(|e| e.to_string())?;
     let key_path = data.join("relay_key");
     let key = match fs::read_to_string(&key_path) {
@@ -869,6 +872,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("limits-url") || err.contains("LIMITS_URL"));
+    }
+
+    #[test]
+    fn allow_roots_requires_signed_reads_before_listen() {
+        let dir = std::env::temp_dir().join(format!(
+            "ecco-relay-signed-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let err = super::run(
+            1,
+            dir,
+            None,
+            false,
+            "localhost:1".into(),
+            true,
+            Retention {
+                limits_url: Some("https://example.invalid/limits.json".into()),
+                default_days: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("--signed") || err.contains("ECCO_RELAY_SIGNED"));
     }
 
     #[test]
