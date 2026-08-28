@@ -1,13 +1,23 @@
 //! The relay: a dumb store-and-forward server. Verifies, stores, orders,
 //! serves. Storage is one SQLite file under --data (store::Store).
 
+use axum::{
+    body::Bytes,
+    extract::{ConnectInfo, OriginalUri, State},
+    http::{HeaderMap, Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Router,
+};
 use ed25519_dalek::{Signer, SigningKey, Verifier};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::envelope::{self, encode_key, Envelope};
 use crate::store::{Store, Stored, ThreadAccess};
@@ -15,7 +25,6 @@ use crate::store::{Store, Stored, ThreadAccess};
 const MAX_WAIT_SECS: u64 = 30;
 /// Retention pass cadence: refresh per-sender windows, then expire.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const POLL_STEP: Duration = Duration::from_millis(300);
 /// Abuse floors for a public relay; generous for legitimate agents.
 const MAX_BODY_BYTES: u64 = 64 * 1024;
 const MSGS_PER_MIN_PER_SENDER: u32 = 120;
@@ -72,6 +81,8 @@ pub struct Relay {
     /// never fetched (fail-closed while --allow-roots).
     allowed_roots: Mutex<Option<HashSet<String>>>,
     limiter: Limiter,
+    wakes: Mutex<HashMap<String, Arc<Notify>>>,
+    blocking: Arc<Semaphore>,
 }
 
 /// Envelope expiry. Not protocol: a deployment choice for relays that
@@ -138,8 +149,9 @@ pub fn run(
         limiter: Limiter {
             buckets: Mutex::new(HashMap::new()),
         },
+        wakes: Mutex::new(HashMap::new()),
+        blocking: Arc::new(Semaphore::new(16)),
     });
-    let server = Arc::new(tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| e.to_string())?);
     eprintln!(
         "ecco relay on port {port} · {} · authority {} · signed reads: {} · allow-roots: {} · retention: {} · key {}",
         data.join("relay.db").display(),
@@ -153,23 +165,33 @@ pub fn run(
         let relay = relay.clone();
         std::thread::spawn(move || sweeper(relay, retention));
     }
-    let mut workers = Vec::new();
-    for _ in 0..16 {
-        let server = server.clone();
-        let relay = relay.clone();
-        workers.push(std::thread::spawn(move || {
-            while let Ok(req) = server.recv() {
-                relay.handle(req);
-            }
-        }));
-    }
-    for w in workers {
-        let _ = w.join();
-    }
-    Ok(())
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async move {
+        let app = Router::new()
+            .route("/addr", post(http_handler))
+            .route("/addr/{name}", get(http_handler))
+            .route("/msgs", post(http_handler))
+            .route("/threads", get(http_handler))
+            .route("/inbox", get(http_handler))
+            .fallback(http_handler)
+            .with_state(relay);
+        let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+            .await
+            .map_err(|e| e.to_string())?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
 }
 
 impl Relay {
+    /*
     fn handle(&self, mut req: tiny_http::Request) {
         let url = req.url().to_string();
         let (path, query) = match url.split_once('?') {
@@ -249,6 +271,7 @@ impl Relay {
         let _ = req.respond(response);
     }
 
+    */
     fn post_addr(&self, body: &str, ip: &str) -> Result<String, (u16, String)> {
         if !self
             .limiter
@@ -360,16 +383,12 @@ impl Relay {
     }
 
     /// auth-v0: validate the X-Ecco-* headers and return the authenticated addr.
-    fn verify_read(
-        &self,
-        req: &tiny_http::Request,
-        path_query: &str,
-    ) -> Result<String, (u16, String)> {
+    fn verify_read(&self, headers: &HeaderMap, path_query: &str) -> Result<String, (u16, String)> {
         let header = |name: &str| {
-            req.headers()
-                .iter()
-                .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
-                .map(|h| h.value.as_str().to_string())
+            headers
+                .get(name)
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_string)
         };
         let addr = header("x-ecco-addr").ok_or((401, "missing x-ecco-addr".into()))?;
         let key = header("x-ecco-key").ok_or((401, "missing x-ecco-key".into()))?;
@@ -419,32 +438,189 @@ impl Relay {
         }
     }
 
-    /// Shared read path for /threads (by_thread=true) and /inbox, long-polling.
-    fn poll(&self, q: &HashMap<String, String>, by_thread: bool) -> Result<String, (u16, String)> {
-        let since: u64 = q.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
-        let wait: u64 = q
-            .get("wait")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0)
-            .min(MAX_WAIT_SECS);
-        let deadline = Instant::now() + Duration::from_secs(wait);
-        loop {
-            let found: Vec<Stored> = if by_thread {
-                let about = q.get("about").ok_or((400, "about required".to_string()))?;
-                self.store.thread(about, since)?
-            } else {
-                let addr = q.get("addr").ok_or((400, "addr required".to_string()))?;
-                self.store.inbox(addr, since)?
-            };
-            if !found.is_empty() || Instant::now() >= deadline {
-                return Ok(format!(
-                    "{{\"msgs\":{}}}",
-                    serde_json::to_string(&found).unwrap()
-                ));
-            }
-            std::thread::sleep(POLL_STEP);
+    fn wake(&self, key: &str) -> Arc<Notify> {
+        self.wakes
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+}
+
+type HttpResult = Result<String, (u16, String)>;
+
+async fn blocking<F>(relay: Arc<Relay>, work: F) -> HttpResult
+where
+    F: FnOnce(Arc<Relay>) -> HttpResult + Send + 'static,
+{
+    let permit = relay
+        .blocking
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| (500, "blocking worker pool closed".into()))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work(relay)
+    })
+    .await
+    .map_err(|e| (500, format!("blocking worker failed: {e}")))?
+}
+
+fn response(result: HttpResult) -> Response {
+    match result {
+        Ok(body) => (StatusCode::OK, [("content-type", "application/json")], body).into_response(),
+        Err((code, body)) => (
+            StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            [("content-type", "application/json")],
+            body,
+        )
+            .into_response(),
+    }
+}
+
+async fn poll(relay: Arc<Relay>, query: HashMap<String, String>, thread: bool) -> HttpResult {
+    let since = query.get("since").and_then(|s| s.parse().ok()).unwrap_or(0);
+    let wait = query
+        .get("wait")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+        .min(MAX_WAIT_SECS);
+    let value = if thread {
+        query.get("about").ok_or((400, "about required".into()))?
+    } else {
+        query.get("addr").ok_or((400, "addr required".into()))?
+    };
+    let key = format!("{}:{value}", if thread { "thread" } else { "inbox" });
+    let notify = relay.wake(&key);
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    let value = value.clone();
+    let found = blocking(relay.clone(), move |r| {
+        let rows = if thread {
+            r.store.thread(&value, since)?
+        } else {
+            r.store.inbox(&value, since)?
+        };
+        Ok(serde_json::to_string(&rows).unwrap())
+    })
+    .await?;
+    let rows: Vec<Stored> = serde_json::from_str(&found).unwrap();
+    if !rows.is_empty() || wait == 0 {
+        return Ok(format!("{{\"msgs\":{found}}}"));
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(wait), notified).await;
+    let value = if thread {
+        query["about"].clone()
+    } else {
+        query["addr"].clone()
+    };
+    blocking(relay, move |r| {
+        let rows = if thread {
+            r.store.thread(&value, since)?
+        } else {
+            r.store.inbox(&value, since)?
+        };
+        Ok(format!(
+            "{{\"msgs\":{}}}",
+            serde_json::to_string(&rows).unwrap()
+        ))
+    })
+    .await
+}
+
+async fn http_handler(
+    State(relay): State<Arc<Relay>>,
+    ConnectInfo(remote): ConnectInfo<SocketAddr>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let path = uri.path().to_string();
+    let path_query = uri.path_and_query().map_or(path.as_str(), |v| v.as_str());
+    let method_name = method.as_str();
+    if let Some(expected) = &relay.token {
+        let public = method == Method::GET && path.starts_with("/addr/");
+        let actual = headers.get("authorization").and_then(|h| h.to_str().ok());
+        if !public && actual != Some(format!("Bearer {expected}").as_str()) {
+            return response(Err((401, "missing or bad bearer token".into())));
         }
     }
+    let reader =
+        if relay.signed && method == Method::GET && (path == "/threads" || path == "/inbox") {
+            match blocking(relay.clone(), {
+                let headers = headers.clone();
+                let path_query = path_query.to_string();
+                move |r| {
+                    r.verify_read(&headers, &path_query)
+                        .map(|v| serde_json::to_string(&v).unwrap())
+                }
+            })
+            .await
+            {
+                Ok(v) => serde_json::from_str::<String>(&v).ok(),
+                Err(e) => return response(Err(e)),
+            }
+        } else {
+            None
+        };
+    if body.len() as u64 > MAX_BODY_BYTES {
+        return response(Err((413, "body exceeds 64KB".into())));
+    }
+    let query = parse_query(uri.query().unwrap_or_default());
+    let result = match (method_name, path.as_str()) {
+        ("POST", "/addr") => {
+            let body = String::from_utf8_lossy(&body).into_owned();
+            let ip = remote.ip().to_string();
+            blocking(relay, move |r| r.post_addr(&body, &ip)).await
+        }
+        ("GET", p) if p.starts_with("/addr/") => {
+            let name = p["/addr/".len()..].to_string();
+            blocking(relay, move |r| r.get_addr(&name)).await
+        }
+        ("POST", "/msgs") => {
+            let body = String::from_utf8_lossy(&body).into_owned();
+            let envelope = serde_json::from_str::<Envelope>(&body).ok();
+            let result = blocking(relay.clone(), move |r| r.post_msgs(&body)).await;
+            if result.is_ok() {
+                if let Some(env) = envelope {
+                    relay
+                        .wake(&format!("thread:{}", env.about))
+                        .notify_waiters();
+                    for addr in env.to {
+                        relay.wake(&format!("inbox:{addr}")).notify_waiters();
+                    }
+                }
+            }
+            result
+        }
+        ("GET", "/threads") => {
+            let auth = blocking(relay.clone(), {
+                let query = query.clone();
+                move |r| {
+                    r.authorize_thread(reader.as_deref(), &query)
+                        .map(|_| String::new())
+                }
+            })
+            .await;
+            match auth {
+                Ok(_) => poll(relay, query, true).await,
+                Err(e) => Err(e),
+            }
+        }
+        ("GET", "/inbox") => {
+            if reader.is_some() && query.get("addr") != reader.as_ref() {
+                Err((403, "an inbox is readable only by its own address".into()))
+            } else {
+                poll(relay, query, false).await
+            }
+        }
+        _ => Err((404, "not found".into())),
+    };
+    response(result)
 }
 
 fn describe_retention(r: &Retention) -> String {
@@ -610,6 +786,8 @@ mod tests {
             limiter: Limiter {
                 buckets: Mutex::new(HashMap::new()),
             },
+            wakes: Mutex::new(HashMap::new()),
+            blocking: Arc::new(Semaphore::new(16)),
         }
     }
 
@@ -665,13 +843,29 @@ mod tests {
 
     fn spawn(r: Relay) -> (u16, std::sync::Arc<Relay>) {
         let relay = std::sync::Arc::new(r);
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let port = server.server_addr().to_ip().unwrap().port();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
         let rel = relay.clone();
         std::thread::spawn(move || {
-            while let Ok(req) = server.recv() {
-                rel.handle(req);
-            }
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async move {
+                let app = Router::new()
+                    .route("/addr", axum::routing::post(http_handler))
+                    .route("/addr/{name}", get(http_handler))
+                    .route("/msgs", axum::routing::post(http_handler))
+                    .route("/threads", get(http_handler))
+                    .route("/inbox", get(http_handler))
+                    .fallback(http_handler)
+                    .with_state(rel);
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            });
         });
         (port, relay)
     }
@@ -697,6 +891,48 @@ mod tests {
             Err(ureq::Error::Status(code, _)) => code,
             Err(_) => 0,
         }
+    }
+
+    fn query(key: &str, wait: u64) -> HashMap<String, String> {
+        HashMap::from([
+            ("addr".into(), key.into()),
+            ("since".into(), "0".into()),
+            ("wait".into(), wait.to_string()),
+        ])
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn more_than_sixteen_long_polls_wake_without_starvation() {
+        let relay = Arc::new(relay());
+        let mut tasks = Vec::new();
+        for _ in 0..24 {
+            let relay = relay.clone();
+            tasks.push(tokio::spawn(async move {
+                poll(relay, query("alice@localhost:4200", 2), false).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let start = std::time::Instant::now();
+        relay.wake("inbox:alice@localhost:4200").notify_waiters();
+        for task in tasks {
+            assert_eq!(task.await.unwrap().unwrap(), "{\"msgs\":[]}");
+        }
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn thread_signal_does_not_wake_inbox_waiter() {
+        let relay = Arc::new(relay());
+        let task = tokio::spawn({
+            let relay = relay.clone();
+            async move { poll(relay, query("alice@localhost:4200", 2), false).await }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        relay.wake("thread:topic").notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished());
+        relay.wake("inbox:alice@localhost:4200").notify_waiters();
+        assert_eq!(task.await.unwrap().unwrap(), "{\"msgs\":[]}");
     }
 
     #[test]

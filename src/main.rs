@@ -14,6 +14,27 @@ use client::Stored;
 use envelope::Envelope;
 use identity::Identity;
 
+#[derive(serde::Serialize)]
+struct HeldSummary {
+    sender: String,
+    kind: String,
+    count: usize,
+}
+
+#[derive(serde::Serialize)]
+struct RejectedSummary {
+    id: String,
+    reason: String,
+}
+
+#[derive(serde::Serialize)]
+struct InboxJson {
+    cursor: u64,
+    visible: Vec<Stored>,
+    held: Vec<HeldSummary>,
+    rejected: Vec<RejectedSummary>,
+}
+
 #[derive(Parser)]
 #[command(
     name = "ecco",
@@ -84,6 +105,9 @@ enum Cmd {
         /// Encrypt the body to the recipients' root keys
         #[arg(long, short = 'e')]
         encrypt: bool,
+        /// Envelope id that this message answers
+        #[arg(long)]
+        in_reply_to: Option<String>,
     },
     /// Coordinate exclusive work on a generic thread anchor
     Work {
@@ -97,6 +121,12 @@ enum Cmd {
         /// Only messages since the persisted cursor, then advance it (for agent session starts)
         #[arg(long)]
         new: bool,
+        /// Print one stable machine-readable object
+        #[arg(long)]
+        json: bool,
+        /// Long-poll for at most this many seconds
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
     },
     /// Follow your inbox (long-poll loop; resumes from the persisted cursor)
     Watch {
@@ -105,7 +135,12 @@ enum Cmd {
         since: Option<u64>,
     },
     /// Show a thread — the ledger for one artifact
-    Log { about: String },
+    Log {
+        about: String,
+        /// Print verified visible messages as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Held first-contact messages awaiting your (human) review
     Requests,
     /// Approve a sender — their messages become visible to your agent
@@ -258,10 +293,15 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             about,
             kind,
             encrypt,
+            in_reply_to,
         } => {
             let id = Identity::load(home)?;
             let about = about.unwrap_or_else(|| dm_thread(&id.addr(), &to));
-            let receipt = post(home, &id, about, kind, json!({ "text": text }), to, encrypt)?;
+            let mut body = json!({ "text": text });
+            if let Some(reply) = in_reply_to {
+                body["in_reply_to"] = json!(reply);
+            }
+            let receipt = post(home, &id, about, kind, body, to, encrypt)?;
             println!("{}", serde_json::to_string(&receipt).unwrap());
             Ok(())
         }
@@ -294,11 +334,24 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             println!("{}", serde_json::to_string(&value).unwrap());
             Ok(())
         }
-        Cmd::Inbox { since, new } => {
+        Cmd::Inbox {
+            since,
+            new,
+            json,
+            wait,
+        } => {
             let id = Identity::load(home)?;
             let start = if new { load_cursor(home) } else { since };
-            let msgs = client::inbox(&id, start, 0)?;
+            let msgs = client::inbox(&id, start, wait)?;
             let max_gseq = msgs.iter().map(|s| s.gseq).max().unwrap_or(start);
+            if json {
+                let result = trusted_json(home, &id, msgs, max_gseq);
+                println!("{}", serde_json::to_string(&result).unwrap());
+                if new {
+                    save_cursor(home, max_gseq)?;
+                }
+                return Ok(());
+            }
             let (visible, held) = partition(home, &id, msgs);
             for s in &visible {
                 println!("{}", fmt(&id, s, false));
@@ -340,10 +393,15 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                 }
             }
         }
-        Cmd::Log { about } => {
+        Cmd::Log { about, json } => {
             let id = Identity::load(home)?;
             let mut msgs = client::thread(&id, &about, 0, 0)?;
             msgs.sort_by_key(|s| s.tseq);
+            if json {
+                let result = trusted_json(home, &id, msgs, 0);
+                println!("{}", serde_json::to_string(&result.visible).unwrap());
+                return Ok(());
+            }
             let contacts = identity::contacts_load(home);
             let me = id.addr();
             for s in msgs {
@@ -519,6 +577,59 @@ fn partition(home: &Path, id: &Identity, msgs: Vec<Stored>) -> (Vec<Stored>, Vec
         }
     }
     (visible, held)
+}
+
+/// Validate relay records again at the trust boundary used by dispatchers.
+fn trusted_json(home: &Path, id: &Identity, msgs: Vec<Stored>, cursor: u64) -> InboxJson {
+    let contacts = identity::contacts_load(home);
+    let me = id.addr();
+    let mut visible = Vec::new();
+    let mut held_counts = std::collections::BTreeMap::<(String, String), usize>::new();
+    let mut rejected = Vec::new();
+    for stored in msgs {
+        let env = &stored.env;
+        let trust = env.verify().and_then(|_| {
+            if env.from != me && !env.to.iter().any(|to| to == &me) {
+                return Err("recipient does not include this identity".into());
+            }
+            let profile = client::resolve(&env.from, token_for(id, &env.from))?;
+            let expected = env.from.split_once('@').map(|v| v.0).unwrap_or_default();
+            if profile.name != expected {
+                return Err("sender profile name does not match address".into());
+            }
+            profile.authorizes(&env.key, &env.kind, stored.received_at)
+        });
+        if let Err(reason) = trust {
+            rejected.push(RejectedSummary {
+                id: env.id.clone(),
+                reason,
+            });
+            continue;
+        }
+        match identity::standing(&contacts, &me, &env.from) {
+            identity::Standing::Trusted => visible.push(stored),
+            identity::Standing::Unknown => {
+                *held_counts
+                    .entry((env.from.clone(), env.kind.clone()))
+                    .or_default() += 1;
+            }
+            identity::Standing::Blocked => {}
+        }
+    }
+    let held = held_counts
+        .into_iter()
+        .map(|((sender, kind), count)| HeldSummary {
+            sender,
+            kind,
+            count,
+        })
+        .collect();
+    InboxJson {
+        cursor,
+        visible,
+        held,
+        rejected,
+    }
 }
 
 /// A decision is the human ruling on a proposal: signed by the root key, never the agent's.

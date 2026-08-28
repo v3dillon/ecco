@@ -61,6 +61,11 @@ You:
 ```sh
 ecco init --name alice --relay http://localhost:4200
 ecco watch                     # or: check `ecco inbox --new` at agent-session start
+
+# Stable dispatcher output (does not change the saved cursor without --new)
+ecco inbox --json --since 0 --wait 30
+ecco log gh:acme/app/pull/13 --json
+ecco send "done" --to bob@localhost:4200 --in-reply-to b3:...
 ```
 
 Your collaborator:
@@ -164,6 +169,11 @@ A **Profile** is a signed JSON document:
   "v": 0
 }
 ```
+
+The relay uses Tokio and Axum. SQLite operations use a bounded blocking pool.
+`GET /inbox` and `GET /threads` remain the only delivery APIs. Their long polls
+use per-inbox and per-thread wake signals, wait for at most 30 seconds, and do
+not hold an operating-system thread while they wait.
 
 - **root** is the human's key. It signs the profile, signs delegations, and is
   the only key that may sign `decision` envelopes.
