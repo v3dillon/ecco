@@ -68,6 +68,18 @@ CREATE INDEX IF NOT EXISTS msgs_received ON msgs(received_at);
 CREATE TABLE IF NOT EXISTS msg_to (gseq INTEGER NOT NULL, addr TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS msg_to_addr ON msg_to(addr, gseq);
 CREATE TABLE IF NOT EXISTS retention (sender TEXT PRIMARY KEY, days INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS participants (
+  about TEXT NOT NULL,
+  addr TEXT NOT NULL,
+  PRIMARY KEY (about, addr)
+);
+";
+
+/// Upgrade path for stores that existed before `participants`.
+const SQLITE_BACKFILL_PARTICIPANTS: &str = "
+INSERT OR IGNORE INTO participants(about, addr) SELECT DISTINCT about, sender FROM msgs;
+INSERT OR IGNORE INTO participants(about, addr)
+  SELECT DISTINCT m.about, t.addr FROM msgs m JOIN msg_to t ON t.gseq=m.gseq;
 ";
 
 pub struct Store {
@@ -83,6 +95,8 @@ impl Store {
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.busy_timeout(Duration::from_secs(5));
         conn.execute_batch(SQLITE_SCHEMA)
+            .map_err(|e| e.to_string())?;
+        conn.execute_batch(SQLITE_BACKFILL_PARTICIPANTS)
             .map_err(|e| e.to_string())?;
         Ok(Store {
             conn: Mutex::new(conn),
@@ -189,6 +203,16 @@ impl Store {
                 rusqlite::params![gseq, addr],
             ))?;
         }
+        sq(tx.execute(
+            "INSERT OR IGNORE INTO participants(about,addr) VALUES(?1,?2)",
+            rusqlite::params![env.about, env.from],
+        ))?;
+        for addr in &env.to {
+            sq(tx.execute(
+                "INSERT OR IGNORE INTO participants(about,addr) VALUES(?1,?2)",
+                rusqlite::params![env.about, addr],
+            ))?;
+        }
         sq(tx.commit())?;
         Ok(Stored {
             gseq: gseq as u64,
@@ -225,9 +249,8 @@ impl Store {
     pub fn access(&self, about: &str, addr: &str) -> Res<ThreadAccess> {
         let conn = self.conn.lock().unwrap();
         let (any, participant): (bool, bool) = sq(conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM msgs WHERE about=?1),
-                    EXISTS(SELECT 1 FROM msgs m LEFT JOIN msg_to t ON t.gseq=m.gseq
-                           WHERE m.about=?1 AND (m.sender=?2 OR t.addr=?2))",
+            "SELECT EXISTS(SELECT 1 FROM threads WHERE about=?1),
+                    EXISTS(SELECT 1 FROM participants WHERE about=?1 AND addr=?2)",
             rusqlite::params![about, addr],
             |r| Ok((r.get(0)?, r.get(1)?)),
         ))?;
@@ -317,13 +340,16 @@ mod tests {
 
     static N: AtomicUsize = AtomicUsize::new(0);
 
-    fn fresh() -> Store {
-        let dir: PathBuf = std::env::temp_dir().join(format!(
+    fn fresh_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
             "ecco-store-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::SeqCst)
-        ));
-        Store::open(&dir).unwrap()
+        ))
+    }
+
+    fn fresh() -> Store {
+        Store::open(&fresh_dir()).unwrap()
     }
 
     fn note(from: &Identity, to: &Identity, text: &str, ts: u64) -> Envelope {
@@ -414,6 +440,89 @@ mod tests {
         let left = store.inbox(&bob.addr(), 0).unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].env.body["text"], "fresh");
+    }
+
+    #[test]
+    fn participants_survive_sweep_and_remove() {
+        let store = fresh();
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        let mallory = Identity::generate("mallory", "http://localhost:4200", None);
+        let now = 100 * DAY;
+        let about = "gh:acme/app/pull/1";
+        store
+            .append(note(&alice, &bob, "old", 1), now - 20 * DAY)
+            .unwrap();
+        assert!(matches!(
+            store.access(about, &alice.addr()).unwrap(),
+            ThreadAccess::Participant
+        ));
+        assert!(matches!(
+            store.access(about, &bob.addr()).unwrap(),
+            ThreadAccess::Participant
+        ));
+        assert!(matches!(
+            store.access(about, &mallory.addr()).unwrap(),
+            ThreadAccess::NotParticipant
+        ));
+        assert!(matches!(
+            store.access("gh:never", &alice.addr()).unwrap(),
+            ThreadAccess::Empty
+        ));
+
+        assert_eq!(store.sweep(now, 7).unwrap(), 1);
+        assert!(store.thread(about, 0).unwrap().is_empty());
+        assert!(matches!(
+            store.access(about, &alice.addr()).unwrap(),
+            ThreadAccess::Participant
+        ));
+        assert!(matches!(
+            store.access(about, &bob.addr()).unwrap(),
+            ThreadAccess::Participant
+        ));
+        assert!(matches!(
+            store.access(about, &mallory.addr()).unwrap(),
+            ThreadAccess::NotParticipant
+        ));
+
+        let again = store.append(note(&alice, &bob, "again", 2), now).unwrap();
+        assert_eq!(again.tseq, 2);
+        assert!(store.remove(&again.env.id).unwrap());
+        assert!(matches!(
+            store.access(about, &alice.addr()).unwrap(),
+            ThreadAccess::Participant
+        ));
+        assert!(matches!(
+            store.access(about, &bob.addr()).unwrap(),
+            ThreadAccess::Participant
+        ));
+    }
+
+    #[test]
+    fn open_backfills_participants_from_existing_msgs() {
+        let dir = fresh_dir();
+        let store = Store::open(&dir).unwrap();
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        store.append(note(&alice, &bob, "hello", 1), 10).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("DELETE FROM participants", []).unwrap();
+        }
+        assert!(matches!(
+            store.access("gh:acme/app/pull/1", &alice.addr()).unwrap(),
+            ThreadAccess::NotParticipant
+        ));
+        drop(store);
+        let store = Store::open(&dir).unwrap();
+        assert!(matches!(
+            store.access("gh:acme/app/pull/1", &alice.addr()).unwrap(),
+            ThreadAccess::Participant
+        ));
+        assert!(matches!(
+            store.access("gh:acme/app/pull/1", &bob.addr()).unwrap(),
+            ThreadAccess::Participant
+        ));
     }
 
     #[test]

@@ -51,6 +51,12 @@ enum Cmd {
         /// Require signed reads — for multi-tenant relays (or set ECCO_RELAY_SIGNED)
         #[arg(long)]
         signed: bool,
+        /// Address authority, e.g. relay.ecco.bot (or set ECCO_RELAY_AUTHORITY). Default: localhost:<port>
+        #[arg(long)]
+        authority: Option<String>,
+        /// Fail-closed allowedRoots from the limits snapshot (hosted/private relays; or set ECCO_RELAY_HOSTED)
+        #[arg(long)]
+        hosted: bool,
         /// Limits snapshot URL for per-sender retention windows (or set ECCO_RELAY_LIMITS_URL)
         #[arg(long)]
         limits_url: Option<String>,
@@ -147,15 +153,8 @@ fn main() {
 fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
     match cmd {
         Cmd::Init { name, relay, token } => {
-            if Identity::load(home).is_ok() {
-                return Err(format!(
-                    "identity already exists at {} (use --home for another)",
-                    home.display()
-                ));
-            }
-            let id = Identity::generate(&name, &relay, token);
+            let id = Identity::prepare(home, &name, &relay, token)?;
             client::register(&id)?;
-            id.save(home)?;
             println!("registered {}", id.addr());
             println!(
                 "root key (you):    {}",
@@ -172,12 +171,20 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             data,
             token,
             signed,
+            authority,
+            hosted,
             limits_url,
             retention_days,
         } => {
             let data = data.unwrap_or_else(|| home.join("relay"));
             let token = token.or_else(|| std::env::var("ECCO_RELAY_TOKEN").ok());
             let signed = signed || std::env::var("ECCO_RELAY_SIGNED").is_ok();
+            let authority = authority
+                .or_else(|| std::env::var("ECCO_RELAY_AUTHORITY").ok())
+                .map(|s| identity::authority(&s))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("localhost:{port}"));
+            let hosted = hosted || std::env::var("ECCO_RELAY_HOSTED").is_ok();
             let retention = relay::Retention {
                 limits_url: limits_url.or_else(|| std::env::var("ECCO_RELAY_LIMITS_URL").ok()),
                 default_days: match retention_days {
@@ -190,7 +197,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                     },
                 },
             };
-            relay::run(port, data, token, signed, retention)
+            relay::run(port, data, token, signed, authority, hosted, retention)
         }
         Cmd::Admin { cmd } => match cmd {
             AdminCmd::Remove { id, data } => {
