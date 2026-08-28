@@ -54,9 +54,9 @@ enum Cmd {
         /// Address authority, e.g. relay.ecco.bot (or set ECCO_RELAY_AUTHORITY). Default: localhost:<port>
         #[arg(long)]
         authority: Option<String>,
-        /// Fail-closed allowedRoots from the limits snapshot (hosted/private relays; or set ECCO_RELAY_HOSTED)
+        /// Fail-closed allowedRoots from the limits snapshot (or set ECCO_RELAY_ALLOW_ROOTS). Requires --limits-url
         #[arg(long)]
-        hosted: bool,
+        allow_roots: bool,
         /// Limits snapshot URL for per-sender retention windows (or set ECCO_RELAY_LIMITS_URL)
         #[arg(long)]
         limits_url: Option<String>,
@@ -172,7 +172,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             token,
             signed,
             authority,
-            hosted,
+            allow_roots,
             limits_url,
             retention_days,
         } => {
@@ -184,7 +184,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                 .map(|s| identity::authority(&s))
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| format!("localhost:{port}"));
-            let hosted = hosted || std::env::var("ECCO_RELAY_HOSTED").is_ok();
+            let allow_roots = allow_roots || std::env::var("ECCO_RELAY_ALLOW_ROOTS").is_ok();
             let retention = relay::Retention {
                 limits_url: limits_url.or_else(|| std::env::var("ECCO_RELAY_LIMITS_URL").ok()),
                 default_days: match retention_days {
@@ -197,7 +197,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                     },
                 },
             };
-            relay::run(port, data, token, signed, authority, hosted, retention)
+            relay::run(port, data, token, signed, authority, allow_roots, retention)
         }
         Cmd::Admin { cmd } => match cmd {
             AdminCmd::Remove { id, data } => {

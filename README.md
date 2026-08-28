@@ -360,7 +360,19 @@ A private or single-tenant relay MAY instead require a transport-level HTTP
 bearer token (`Authorization: Bearer …`) on every request. This is deployment
 configuration, not protocol: envelopes, verification, and thread semantics
 are unchanged, and a thread exported from a token-gated relay verifies
-identically anywhere.
+identically anywhere. `GET /addr/{name}` stays public even when a bearer
+token is set.
+
+A relay binds addresses to one authority: `ecco relay --authority
+relay.ecco.bot` (or `ECCO_RELAY_AUTHORITY`). The default is `localhost:<port>`.
+Registered delegations, envelope `from`, and signed-read addrs must use that
+authority.
+
+`--allow-roots` (or `ECCO_RELAY_ALLOW_ROOTS`) is membership, not a hosted
+mode. It fails closed on `allowedRoots` from the same limits snapshot and
+requires `--limits-url`. An explicit empty array locks the relay; a missing
+or malformed list keeps the last good list, or stays pending. Each root is
+`ed25519:` plus 64 lowercase hex digits.
 
 #### Retention and takedown (deployment, not protocol)
 

@@ -67,9 +67,9 @@ pub struct Relay {
     token: Option<String>,
     signed: bool,
     authority: String,
-    hosted: bool,
+    allow_roots: bool,
     /// Last good `allowedRoots` from the limits snapshot. `None` means
-    /// never fetched (fail-closed while hosted).
+    /// never fetched (fail-closed while --allow-roots).
     allowed_roots: Mutex<Option<HashSet<String>>>,
     limiter: Limiter,
 }
@@ -101,9 +101,12 @@ pub fn run(
     token: Option<String>,
     signed: bool,
     authority: String,
-    hosted: bool,
+    allow_roots: bool,
     retention: Retention,
 ) -> Result<(), String> {
+    if allow_roots && retention.limits_url.as_ref().is_none_or(|u| u.is_empty()) {
+        return Err("--allow-roots requires --limits-url or ECCO_RELAY_LIMITS_URL".into());
+    }
     fs::create_dir_all(&data).map_err(|e| e.to_string())?;
     let key_path = data.join("relay_key");
     let key = match fs::read_to_string(&key_path) {
@@ -127,7 +130,7 @@ pub fn run(
         token,
         signed,
         authority,
-        hosted,
+        allow_roots,
         allowed_roots: Mutex::new(None),
         limiter: Limiter {
             buckets: Mutex::new(HashMap::new()),
@@ -135,15 +138,15 @@ pub fn run(
     });
     let server = Arc::new(tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| e.to_string())?);
     eprintln!(
-        "ecco relay on port {port} · {} · authority {} · signed reads: {} · hosted: {} · retention: {} · key {}",
+        "ecco relay on port {port} · {} · authority {} · signed reads: {} · allow-roots: {} · retention: {} · key {}",
         data.join("relay.db").display(),
         relay.authority,
         relay.signed,
-        relay.hosted,
+        relay.allow_roots,
         describe_retention(&retention),
         encode_key(&relay.key.verifying_key())
     );
-    if retention.enabled() || relay.hosted {
+    if retention.enabled() || relay.allow_roots {
         let relay = relay.clone();
         std::thread::spawn(move || sweeper(relay, retention));
     }
@@ -341,9 +344,9 @@ impl Relay {
         Ok(name)
     }
 
-    /// Hosted/private membership from the last-good limits snapshot.
+    /// Membership from the last-good limits snapshot when --allow-roots.
     fn allow_root(&self, root: &str) -> Result<(), (u16, String)> {
-        if !self.hosted {
+        if !self.allow_roots {
             return Ok(());
         }
         match &*self.allowed_roots.lock().unwrap() {
@@ -451,12 +454,33 @@ fn describe_retention(r: &Retention) -> String {
 }
 
 /// Per-sender windows parsed from a limits snapshot. Numbers only: the
-/// relay never learns a plan id for an address. `allowed_roots` is the
-/// hosted membership list from the same snapshot.
+/// relay never learns a plan id for an address. `allowed_roots` is `None`
+/// when the field is missing, not an array, or contains a bad root —
+/// keep last-good / Pending. `Some` (including empty) replaces it.
 struct LimitWindows {
     per_sender: Vec<(String, u32)>,
     guest_days: Option<u32>,
-    allowed_roots: Vec<String>,
+    allowed_roots: Option<Vec<String>>,
+}
+
+fn is_allowed_root(s: &str) -> bool {
+    let Some(hex) = s.strip_prefix("ed25519:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn parse_allowed_roots(v: &serde_json::Value) -> Option<Vec<String>> {
+    let arr = v.get("allowedRoots")?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s = item.as_str()?;
+        if !is_allowed_root(s) {
+            return None;
+        }
+        out.push(s.to_string());
+    }
+    Some(out)
 }
 
 fn parse_limits(v: &serde_json::Value) -> LimitWindows {
@@ -469,18 +493,10 @@ fn parse_limits(v: &serde_json::Value) -> LimitWindows {
                 .collect()
         })
         .unwrap_or_default();
-    let allowed_roots = v["allowedRoots"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
     LimitWindows {
         per_sender,
         guest_days: days(&v["plans"]["guest"]["retentionDays"]),
-        allowed_roots,
+        allowed_roots: parse_allowed_roots(v),
     }
 }
 
@@ -506,9 +522,10 @@ fn retention_pass(relay: &Relay, cfg: &Retention) {
                 if let Err((_, e)) = relay.store.set_retention(&w.per_sender) {
                     eprintln!("relay: retention table update failed: {e}");
                 }
-                if relay.hosted {
-                    *relay.allowed_roots.lock().unwrap() =
-                        Some(w.allowed_roots.into_iter().collect());
+                if relay.allow_roots {
+                    if let Some(roots) = w.allowed_roots {
+                        *relay.allowed_roots.lock().unwrap() = Some(roots.into_iter().collect());
+                    }
                 }
                 if default_days.is_none() {
                     default_days = w.guest_days;
@@ -585,7 +602,7 @@ mod tests {
             token: None,
             signed: true,
             authority: "localhost:4200".into(),
-            hosted: false,
+            allow_roots: false,
             allowed_roots: Mutex::new(None),
             limiter: Limiter {
                 buckets: Mutex::new(HashMap::new()),
@@ -643,16 +660,40 @@ mod tests {
         assert_eq!(r.store.thread(pr, 0).unwrap().len(), 4);
     }
 
-    fn spawn(r: Relay) -> u16 {
+    fn spawn(r: Relay) -> (u16, std::sync::Arc<Relay>) {
         let relay = std::sync::Arc::new(r);
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
+        let rel = relay.clone();
         std::thread::spawn(move || {
             while let Ok(req) = server.recv() {
-                relay.handle(req);
+                rel.handle(req);
             }
         });
-        port
+        (port, relay)
+    }
+
+    fn signed_get(port: u16, path: &str, id: &Identity) -> u16 {
+        use ed25519_dalek::Signer;
+        let ts = envelope::now();
+        let sig = id
+            .agent_key()
+            .sign(&crate::identity::request_signing_bytes("GET", path, ts));
+        match ureq::get(&format!("http://127.0.0.1:{port}{path}"))
+            .timeout(Duration::from_secs(2))
+            .set("x-ecco-addr", &id.addr())
+            .set("x-ecco-key", &encode_key(&id.agent_key().verifying_key()))
+            .set("x-ecco-ts", &ts.to_string())
+            .set(
+                "x-ecco-sig",
+                &format!("ed25519:{}", hex::encode(sig.to_bytes())),
+            )
+            .call()
+        {
+            Ok(resp) => resp.status(),
+            Err(ureq::Error::Status(code, _)) => code,
+            Err(_) => 0,
+        }
     }
 
     #[test]
@@ -701,7 +742,7 @@ mod tests {
         r.signed = false;
         let alice = Identity::generate("alice", "http://localhost:4200", None);
         r.store.register(alice.profile()).unwrap();
-        let port = spawn(r);
+        let (port, _) = spawn(r);
         let base = format!("http://127.0.0.1:{port}");
         let got = ureq::get(&format!("{base}/addr/alice"))
             .timeout(Duration::from_secs(2))
@@ -729,7 +770,7 @@ mod tests {
         post(&r, &alice, "gh:off", &[], "hi").unwrap();
 
         let mut r = relay();
-        r.hosted = true;
+        r.allow_roots = true;
         let (code, _) = r.post_addr(&alice_body, "1.1.1.1").unwrap_err();
         assert_eq!(code, 503);
 
@@ -748,19 +789,102 @@ mod tests {
         assert_eq!(code, 403);
     }
 
+    fn root(n: u8) -> String {
+        format!("ed25519:{:064x}", n)
+    }
+
     #[test]
-    fn parse_limits_reads_allowed_roots_and_defaults_missing_to_empty() {
+    fn parse_limits_distinguishes_missing_malformed_and_empty_allowed_roots() {
+        let good = root(1);
         let w = parse_limits(&json!({
-            "allowedRoots": ["ed25519:aa", "ed25519:bb"],
+            "allowedRoots": [good],
             "addresses": { "alice@x": { "retentionDays": 7 } },
             "plans": { "guest": { "retentionDays": 3 } }
         }));
-        assert_eq!(w.allowed_roots, vec!["ed25519:aa", "ed25519:bb"]);
+        assert_eq!(w.allowed_roots, Some(vec![root(1)]));
         assert_eq!(w.guest_days, Some(3));
         assert_eq!(w.per_sender, vec![("alice@x".into(), 7)]);
-        let empty = parse_limits(&json!({}));
-        assert!(empty.allowed_roots.is_empty());
-        assert!(empty.per_sender.is_empty());
-        assert_eq!(empty.guest_days, None);
+
+        let missing = parse_limits(&json!({
+            "addresses": { "alice@x": { "retentionDays": 7 } }
+        }));
+        assert!(missing.allowed_roots.is_none());
+        assert_eq!(missing.per_sender.len(), 1);
+
+        let not_array = parse_limits(&json!({ "allowedRoots": "ed25519:nope" }));
+        assert!(not_array.allowed_roots.is_none());
+
+        let bad_format = parse_limits(&json!({ "allowedRoots": ["ed25519:AA"] }));
+        assert!(bad_format.allowed_roots.is_none());
+
+        let uppercase = parse_limits(&json!({
+            "allowedRoots": [format!("ed25519:{}", "A".repeat(64))]
+        }));
+        assert!(uppercase.allowed_roots.is_none());
+
+        let mixed = parse_limits(&json!({ "allowedRoots": [root(1), "ed25519:zz"] }));
+        assert!(mixed.allowed_roots.is_none());
+
+        let empty = parse_limits(&json!({ "allowedRoots": [] }));
+        assert_eq!(empty.allowed_roots, Some(vec![]));
+    }
+
+    #[test]
+    fn malformed_allowed_roots_keep_last_good_and_empty_locks() {
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let alice_body = serde_json::to_string(&alice.profile()).unwrap();
+        let mut r = relay();
+        r.allow_roots = true;
+        *r.allowed_roots.lock().unwrap() = Some(HashSet::from([alice.profile().root]));
+        let malformed = parse_limits(&json!({
+            "allowedRoots": ["not-a-root"],
+            "addresses": { "alice@x": { "retentionDays": 7 } }
+        }));
+        assert!(malformed.allowed_roots.is_none());
+        r.post_addr(&alice_body, "1.1.1.1").unwrap();
+
+        let locked = parse_limits(&json!({ "allowedRoots": [] }));
+        if let Some(roots) = locked.allowed_roots {
+            *r.allowed_roots.lock().unwrap() = Some(roots.into_iter().collect());
+        }
+        let (code, _) = r.post_addr(&alice_body, "1.1.1.1").unwrap_err();
+        assert_eq!(code, 403);
+    }
+
+    #[test]
+    fn allow_roots_requires_limits_url_before_listen() {
+        let dir = std::env::temp_dir().join(format!(
+            "ecco-relay-cfg-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let err = super::run(
+            1,
+            dir,
+            None,
+            false,
+            "localhost:1".into(),
+            true,
+            Retention::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("limits-url") || err.contains("LIMITS_URL"));
+    }
+
+    #[test]
+    fn allowlist_removal_blocks_signed_read() {
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let mut r = relay();
+        r.allow_roots = true;
+        *r.allowed_roots.lock().unwrap() = Some(HashSet::from([alice.profile().root.clone()]));
+        r.post_addr(&serde_json::to_string(&alice.profile()).unwrap(), "1.1.1.1")
+            .unwrap();
+        post(&r, &alice, "gh:x", &[], "hi").unwrap();
+        let (port, relay) = spawn(r);
+
+        let path = "/threads?about=gh%3Ax&since=0&wait=0";
+        assert_eq!(signed_get(port, path, &alice), 200);
+        *relay.allowed_roots.lock().unwrap() = Some(HashSet::new());
+        assert_eq!(signed_get(port, path, &alice), 403);
     }
 }

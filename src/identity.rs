@@ -174,19 +174,35 @@ impl Identity {
 
     /// Load this home's identity, or generate and save a new one.
     /// Same-name retry is allowed so a failed registration can run again
-    /// without losing keys. A different name in this home is an error.
+    /// without losing keys. A different name or relay in this home is an
+    /// error. A file that exists but does not parse is not overwritten.
     pub fn prepare(
         home: &Path,
         name: &str,
         relay: &str,
         token: Option<String>,
     ) -> Result<Identity, String> {
-        if let Ok(mut existing) = Self::load(home) {
+        let path = home.join("identity.json");
+        if path.exists() {
+            let mut existing = Self::load(home).map_err(|e| {
+                format!(
+                    "identity at {} is unreadable ({e}); not overwritten",
+                    path.display()
+                )
+            })?;
             if existing.name != name {
                 return Err(format!(
                     "identity already exists at {} as {} (use --home for another)",
                     home.display(),
                     existing.name
+                ));
+            }
+            let relay = relay.trim_end_matches('/');
+            if existing.relay != relay {
+                return Err(format!(
+                    "identity already exists at {} for {} (use --home for another)",
+                    home.display(),
+                    existing.relay
                 ));
             }
             if token.is_some() && existing.token != token {
@@ -549,5 +565,26 @@ mod tests {
         .unwrap();
         assert_eq!(with_token.token.as_deref(), Some("s3cret"));
         assert_eq!(with_token.root_secret, first.root_secret);
+        let err = Identity::prepare(&home, "alice", "http://localhost:9999", None)
+            .err()
+            .expect("different relay must fail");
+        assert!(err.contains("already exists"));
+        assert_eq!(
+            Identity::load(&home).unwrap().root_secret,
+            first.root_secret
+        );
+    }
+
+    #[test]
+    fn prepare_does_not_overwrite_a_corrupt_identity() {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("identity.json");
+        std::fs::write(&path, "{not-json").unwrap();
+        let err = Identity::prepare(&home, "alice", "http://localhost:4200", None)
+            .err()
+            .expect("corrupt identity must fail");
+        assert!(err.contains("not overwritten"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not-json");
     }
 }

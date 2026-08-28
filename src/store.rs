@@ -94,10 +94,21 @@ impl Store {
         let conn = rusqlite::Connection::open(data.join("relay.db")).map_err(|e| e.to_string())?;
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.busy_timeout(Duration::from_secs(5));
+        let backfill = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='participants'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+            .is_none();
         conn.execute_batch(SQLITE_SCHEMA)
             .map_err(|e| e.to_string())?;
-        conn.execute_batch(SQLITE_BACKFILL_PARTICIPANTS)
-            .map_err(|e| e.to_string())?;
+        if backfill {
+            conn.execute_batch(SQLITE_BACKFILL_PARTICIPANTS)
+                .map_err(|e| e.to_string())?;
+        }
         Ok(Store {
             conn: Mutex::new(conn),
         })
@@ -499,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn open_backfills_participants_from_existing_msgs() {
+    fn open_backfills_participants_only_when_the_table_is_new() {
         let dir = fresh_dir();
         let store = Store::open(&dir).unwrap();
         let alice = Identity::generate("alice", "http://localhost:4200", None);
@@ -509,10 +520,16 @@ mod tests {
             let conn = store.conn.lock().unwrap();
             conn.execute("DELETE FROM participants", []).unwrap();
         }
+        drop(store);
+        let store = Store::open(&dir).unwrap();
         assert!(matches!(
             store.access("gh:acme/app/pull/1", &alice.addr()).unwrap(),
             ThreadAccess::NotParticipant
         ));
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("DROP TABLE participants", []).unwrap();
+        }
         drop(store);
         let store = Store::open(&dir).unwrap();
         assert!(matches!(
