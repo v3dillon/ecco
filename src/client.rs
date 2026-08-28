@@ -1,6 +1,6 @@
 //! HTTP client for the relay API. README §5.
 
-use ed25519_dalek::Signer;
+use ed25519_dalek::{Signature, Signer, Verifier};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -13,6 +13,49 @@ pub struct Stored {
     pub tseq: u64,
     pub received_at: u64,
     pub env: Envelope,
+}
+
+/// A relay's signed acknowledgement of one accepted envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Receipt {
+    pub gseq: u64,
+    pub id: String,
+    pub received_at: u64,
+    pub relay: String,
+    pub sig: String,
+    pub tseq: u64,
+}
+
+#[derive(Serialize)]
+struct ReceiptSigningView<'a> {
+    gseq: u64,
+    id: &'a str,
+    received_at: u64,
+    relay: &'a str,
+    tseq: u64,
+}
+
+impl Receipt {
+    /// Verify the self-contained relay signature and bind it to the sent envelope.
+    pub fn verify(&self, env: &Envelope) -> Result<(), String> {
+        if self.id != env.id {
+            return Err("receipt does not identify the sent envelope".into());
+        }
+        let key = envelope::decode_key(&self.relay)?;
+        let sig: [u8; 64] = envelope::decode_prefixed(&self.sig, "ed25519:")?
+            .try_into()
+            .map_err(|_| "bad receipt signature length".to_string())?;
+        let bytes = serde_json::to_vec(&ReceiptSigningView {
+            gseq: self.gseq,
+            id: &self.id,
+            received_at: self.received_at,
+            relay: &self.relay,
+            tseq: self.tseq,
+        })
+        .expect("canonical receipt encoding");
+        key.verify(&bytes, &Signature::from_bytes(&sig))
+            .map_err(|_| "bad receipt signature".to_string())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,9 +95,12 @@ pub fn resolve(addr: &str, token: Option<&str>) -> Result<Profile, String> {
 
 /// Submit to own relay; best-effort dual-post to recipients on other relays
 /// (without a token — their relay is either open or unreachable to us).
-pub fn send(id: &Identity, env: &Envelope) -> Result<String, String> {
+pub fn send(id: &Identity, env: &Envelope) -> Result<Receipt, String> {
     let body = serde_json::to_string(env).unwrap();
-    let receipt = post(&format!("{}/msgs", id.relay), id.token.as_deref(), &body)?;
+    let raw = post(&format!("{}/msgs", id.relay), id.token.as_deref(), &body)?;
+    let receipt: Receipt =
+        serde_json::from_str(&raw).map_err(|e| format!("bad relay receipt: {e}"))?;
+    receipt.verify(env)?;
     for to in &env.to {
         if let Ok(their_relay) = addr_relay_url(to) {
             if their_relay != id.relay {
@@ -145,4 +191,51 @@ pub fn urlencode(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+    use serde_json::json;
+
+    #[test]
+    fn receipt_parses_verifies_and_binds_expected_send() {
+        let relay = SigningKey::generate(&mut OsRng);
+        let sender = SigningKey::generate(&mut OsRng);
+        let env = Envelope::seal(
+            "gh:owner/repo/pull/456".into(),
+            json!({"x":1}),
+            "a@x".into(),
+            "note".into(),
+            vec![],
+            vec![],
+            1,
+            &sender,
+        );
+        let relay_key = encode_key(&relay.verifying_key());
+        let bytes = serde_json::to_vec(&ReceiptSigningView {
+            gseq: 9,
+            id: &env.id,
+            received_at: 20,
+            relay: &relay_key,
+            tseq: 3,
+        })
+        .unwrap();
+        let raw = json!({"gseq":9,"id":env.id,"received_at":20,"relay":relay_key,"sig":format!("ed25519:{}", hex::encode(relay.sign(&bytes).to_bytes())),"tseq":3}).to_string();
+        let receipt: Receipt = serde_json::from_str(&raw).unwrap();
+        receipt.verify(&env).unwrap();
+        let other = Envelope::seal(
+            "gh:owner/repo/pull/456".into(),
+            json!({"x":2}),
+            "a@x".into(),
+            "note".into(),
+            vec![],
+            vec![],
+            1,
+            &sender,
+        );
+        assert!(receipt.verify(&other).is_err());
+    }
 }

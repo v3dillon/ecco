@@ -19,6 +19,9 @@ const TOOLS: &[&str] = &[
     "ecco_pending",
     "ecco_resolve",
     "ecco_whoami",
+    "ecco_work_status",
+    "ecco_work_claim",
+    "ecco_work_release",
 ];
 
 pub fn run(home: &Path) -> Result<(), String> {
@@ -78,11 +81,18 @@ fn tools_call(home: &Path, id: &Value, params: &Value) -> String {
             id,
             json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
         ),
-        Err(e) => ok(
-            id,
-            json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
-        ),
+        Err(e) => {
+            let text = tool_error_text(&e);
+            ok(
+                id,
+                json!({ "content": [{ "type": "text", "text": text }], "isError": true }),
+            )
+        }
     }
+}
+
+fn tool_error_text(error: &str) -> &str {
+    crate::coordination::claim_lost_json(error).unwrap_or(error)
 }
 
 fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
@@ -122,6 +132,7 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             crate::post(home, &id, about, kind, json!({ "text": text }), to, encrypt)
+                .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
         }
         "ecco_inbox" => {
             let new = args.get("new").and_then(Value::as_bool).unwrap_or(false);
@@ -179,6 +190,44 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
             let pending = crate::pending_proposals(home, &id)?;
             let decrypted: Vec<Value> = pending.iter().map(|s| stored_json(&id, s)).collect();
             Ok(pretty(&json!(decrypted)))
+        }
+        "ecco_work_status" => {
+            let about = str_arg("about").ok_or("'about' is required")?;
+            Ok(pretty(
+                &serde_json::to_value(crate::coordination::status(&id, &about)?).unwrap(),
+            ))
+        }
+        "ecco_work_claim" => {
+            let about = str_arg("about").ok_or("'about' is required")?;
+            let to = args
+                .get("to")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let ttl = args
+                .get("ttl_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(crate::coordination::DEFAULT_TTL_SECONDS);
+            let result = crate::coordination::claim(
+                home,
+                &id,
+                &about,
+                to,
+                str_arg("branch"),
+                ttl,
+                str_arg("text"),
+            )?;
+            Ok(pretty(&serde_json::to_value(result).unwrap()))
+        }
+        "ecco_work_release" => {
+            let about = str_arg("about").ok_or("'about' is required")?;
+            let result = crate::coordination::release(home, &id, &about, str_arg("claim"))?;
+            Ok(pretty(&serde_json::to_value(result).unwrap()))
         }
         "ecco_resolve" => {
             let addr = str_arg("addr").ok_or("'addr' is required")?;
@@ -245,6 +294,35 @@ fn tool_defs() -> Value {
             "name": "ecco_whoami",
             "description": "Your own ecco address, relay, and public keys.",
             "inputSchema": no_args
+        },
+        {
+            "name": "ecco_work_status",
+            "description": "Return the deterministic active work claim for one thread anchor.",
+            "inputSchema": { "type": "object", "properties": { "about": { "type": "string" } }, "required": ["about"] }
+        },
+        {
+            "name": "ecco_work_claim",
+            "description": "Claim work, or renew your active claim. The lowest relay thread sequence wins a round.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "about": { "type": "string" },
+                    "to": { "type": "array", "items": { "type": "string" } },
+                    "branch": { "type": "string" },
+                    "ttl_seconds": { "type": "integer", "minimum": 1, "maximum": crate::coordination::MAX_TTL_SECONDS },
+                    "text": { "type": "string" }
+                },
+                "required": ["about"]
+            }
+        },
+        {
+            "name": "ecco_work_release",
+            "description": "Release your active work claim. Another sender cannot release it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "about": { "type": "string" }, "claim": { "type": "string" } },
+                "required": ["about"]
+            }
         }
     ])
 }
@@ -272,4 +350,28 @@ fn ok(id: &Value, result: Value) -> String {
 
 fn err(id: &Value, code: i64, message: &str) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_tools_have_shared_ttl_limit_and_claim_loss_json() {
+        let defs = tool_defs();
+        let claim = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "ecco_work_claim")
+            .unwrap();
+        assert_eq!(
+            claim["inputSchema"]["properties"]["ttl_seconds"]["maximum"],
+            crate::coordination::MAX_TTL_SECONDS
+        );
+        let status = r#"{"about":"gh:o/r/issue/1","active":null,"state":"unclaimed"}"#;
+        let internal = format!("{}{}", crate::coordination::CLAIM_LOST_PREFIX, status);
+        assert_eq!(tool_error_text(&internal), status);
+        assert!(!tool_error_text(&internal).contains(crate::coordination::CLAIM_LOST_PREFIX));
+    }
 }

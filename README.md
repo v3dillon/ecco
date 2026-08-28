@@ -116,7 +116,8 @@ claude mcp add ecco -- ecco mcp
 ```
 
 which exposes `ecco_send`, `ecco_inbox`, `ecco_thread`, `ecco_pending`,
-`ecco_resolve`, and `ecco_whoami`. The MCP surface cannot sign decisions —
+`ecco_resolve`, `ecco_whoami`, `ecco_work_status`, `ecco_work_claim`, and
+`ecco_work_release`. The MCP surface cannot sign decisions —
 `ecco approve` stays a human command in a terminal.
 
 ## Protocol
@@ -266,8 +267,8 @@ above), not a workflow engine:
 | kind | meaning | notes |
 |---|---|---|
 | `note` | plain statement | default |
-| `claim` | "I am working on this" | advisory, not a lock; ties broken by relay seq (§5) |
-| `release` | withdraws a prior claim | body `{"claim": "<id>"}` |
+| `claim` | "I am working on this" | structured work claims have deterministic ownership; raw claims remain plain messages |
+| `release` | withdraws a prior claim | structured body uses `claim_id` |
 | `request` | asks the recipient('s agent) to act | e.g. review request |
 | `finding` | result of work | review comment, bug report |
 | `proposal` | asks for a human decision | agent's stopping point |
@@ -284,6 +285,65 @@ implicitly approved; blocked senders' messages are dropped from view.
 Admitting or blocking a sender is a human action, like signing a `decision`.
 This is client policy, not protocol: the relay stores and serves envelopes
 regardless, and clients may choose stricter or looser policy.
+
+#### Work coordination
+
+The generic work commands operate on any `about` anchor. Canonical examples are
+`gh:owner/repo/issue/123` and `gh:owner/repo/pull/456`; no GitHub code or API is
+part of ecco.
+
+```sh
+ecco work status --about gh:owner/repo/issue/123
+ecco work claim --about gh:owner/repo/pull/456 --to bob@relay.example \
+  --branch fix-456 --ttl-seconds 1800 --text "fixing the parser"
+ecco work release --about gh:owner/repo/pull/456 --claim claim:<hex>
+```
+
+A structured `claim` body has `claim_id` (a generated random identifier),
+`after` (the envelope ID at the start of its coordination round, or `null` for
+an empty thread), `ttl_seconds`, optional `branch` and `text`, and
+`renewal_of`. A structured `release` body has `claim_id`. Other claim and
+release bodies remain generic raw messages, but they do not take part in the
+work algorithm.
+
+`ttl_seconds` must be from 1 through 86,400 (24 hours). Clients ignore raw
+structured claims outside this range, and work commands reject them. A renewal
+must reach the relay before the active claim expires; it cannot revive an
+expired round.
+
+Clients evaluate valid signed messages in increasing relay `tseq`. Claims with
+the same `after` are one round. The lowest `tseq` initial claim is the permanent
+winner of that round. A loser never becomes active when the winner releases or
+expires. A later claim whose `after` points to a later thread head starts a new
+round. Only the winner's sender can release it.
+
+One thread has one relay sequence authority. Every claim message, including a
+renewal, can address only recipients on the claimant's home relay. `--to` on
+any claim message can make a same-relay recipient a thread participant. The
+first claim must address coworkers who need to see the new thread; later claim
+messages can add other same-relay participants.
+
+Expiry is `received_at + ttl_seconds`. The sender envelope timestamp is not
+used. Calling `work claim` while you own the active claim renews it: ecco sends
+the same `claim_id` and `after`, sets `renewal_of` to that claim ID, and computes
+a new expiry from the renewal message's relay `received_at`. No other sender or
+claim ID can renew it.
+
+The three CLI commands write one compact JSON object to standard output. MCP
+returns the same serialized Rust result types. Status uses `state` (`claimed`
+or `unclaimed`) and `active`; claim adds `claim` and its verified `receipt`;
+release uses `released`, `claim_id`, and an optional `receipt`. A lost claim
+returns status JSON and CLI exit status 2.
+
+In protocol v0, the TLS-selected home relay is the thread authority and its
+key signs each receipt. The client verifies the receipt signature and sent
+envelope ID, then matches all receipt fields (`id`, `gseq`, `tseq`, and
+`received_at`) to the fetched stored row before it reports claim or release
+success. There is no separate pinned relay key in the current identity file.
+The home relay already checked the sender delegation when it accepted a
+message. Readers verify stored envelope signatures and thread anchors, but do
+not apply the sender's current rotated, expired, or revoked profile to old
+history.
 
 ### 5. Relay API
 
