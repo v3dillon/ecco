@@ -355,6 +355,12 @@ message. Readers verify stored envelope signatures and thread anchors, but do
 not apply the sender's current rotated, expired, or revoked profile to old
 history.
 
+`ecco inbox --json` checks each remote sender against the sender's current
+profile and fails closed when that profile cannot be resolved or does not
+authorize the message key. Its output is for current authorization. It is not
+stable historical proof. The object has exactly `cursor` (a decimal string),
+`messages`, `held`, and `rejected`.
+
 ### 5. Relay API
 
 A relay is a dumb store-and-forward server. It verifies (§2), stores, orders,

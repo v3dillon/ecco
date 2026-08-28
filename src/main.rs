@@ -29,8 +29,8 @@ struct RejectedSummary {
 
 #[derive(serde::Serialize)]
 struct InboxJson {
-    cursor: u64,
-    visible: Vec<Stored>,
+    cursor: String,
+    messages: Vec<Stored>,
     held: Vec<HeldSummary>,
     rejected: Vec<RejectedSummary>,
 }
@@ -399,7 +399,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             msgs.sort_by_key(|s| s.tseq);
             if json {
                 let result = trusted_json(home, &id, msgs, 0);
-                println!("{}", serde_json::to_string(&result.visible).unwrap());
+                println!("{}", serde_json::to_string(&result.messages).unwrap());
                 return Ok(());
             }
             let contacts = identity::contacts_load(home);
@@ -583,16 +583,24 @@ fn partition(home: &Path, id: &Identity, msgs: Vec<Stored>) -> (Vec<Stored>, Vec
 fn trusted_json(home: &Path, id: &Identity, msgs: Vec<Stored>, cursor: u64) -> InboxJson {
     let contacts = identity::contacts_load(home);
     let me = id.addr();
-    let mut visible = Vec::new();
+    let mut messages = Vec::new();
     let mut held_counts = std::collections::BTreeMap::<(String, String), usize>::new();
     let mut rejected = Vec::new();
+    let mut profiles = std::collections::HashMap::new();
     for stored in msgs {
         let env = &stored.env;
         let trust = env.verify().and_then(|_| {
             if env.from != me && !env.to.iter().any(|to| to == &me) {
                 return Err("recipient does not include this identity".into());
             }
-            let profile = client::resolve(&env.from, token_for(id, &env.from))?;
+            let profile = profiles.entry(env.from.clone()).or_insert_with(|| {
+                if env.from == me {
+                    Ok(id.profile())
+                } else {
+                    client::resolve(&env.from, token_for(id, &env.from))
+                }
+            });
+            let profile = profile.as_ref().map_err(Clone::clone)?;
             let expected = env.from.split_once('@').map(|v| v.0).unwrap_or_default();
             if profile.name != expected {
                 return Err("sender profile name does not match address".into());
@@ -607,7 +615,7 @@ fn trusted_json(home: &Path, id: &Identity, msgs: Vec<Stored>, cursor: u64) -> I
             continue;
         }
         match identity::standing(&contacts, &me, &env.from) {
-            identity::Standing::Trusted => visible.push(stored),
+            identity::Standing::Trusted => messages.push(stored),
             identity::Standing::Unknown => {
                 *held_counts
                     .entry((env.from.clone(), env.kind.clone()))
@@ -625,8 +633,8 @@ fn trusted_json(home: &Path, id: &Identity, msgs: Vec<Stored>, cursor: u64) -> I
         })
         .collect();
     InboxJson {
-        cursor,
-        visible,
+        cursor: cursor.to_string(),
+        messages,
         held,
         rejected,
     }
@@ -740,4 +748,26 @@ fn fmt(id: &Identity, s: &Stored, untrusted: bool) -> String {
 
 fn short(id: &str) -> String {
     id.trim_start_matches("b3:").chars().take(8).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inbox_json_has_exact_producer_schema() {
+        let value = serde_json::to_value(InboxJson {
+            cursor: u64::MAX.to_string(),
+            messages: vec![],
+            held: vec![],
+            rejected: vec![],
+        })
+        .unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["cursor", "held", "messages", "rejected"]
+        );
+        assert_eq!(value["cursor"], u64::MAX.to_string());
+    }
 }

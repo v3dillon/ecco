@@ -3,7 +3,7 @@
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, OriginalUri, State},
+    extract::{ConnectInfo, DefaultBodyLimit, OriginalUri, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
 
@@ -81,7 +81,7 @@ pub struct Relay {
     /// never fetched (fail-closed while --allow-roots).
     allowed_roots: Mutex<Option<HashSet<String>>>,
     limiter: Limiter,
-    wakes: Mutex<HashMap<String, Arc<Notify>>>,
+    wakes: Mutex<HashMap<String, Weak<Notify>>>,
     blocking: Arc<Semaphore>,
 }
 
@@ -170,14 +170,7 @@ pub fn run(
         .build()
         .map_err(|e| e.to_string())?;
     runtime.block_on(async move {
-        let app = Router::new()
-            .route("/addr", post(http_handler))
-            .route("/addr/{name}", get(http_handler))
-            .route("/msgs", post(http_handler))
-            .route("/threads", get(http_handler))
-            .route("/inbox", get(http_handler))
-            .fallback(http_handler)
-            .with_state(relay);
+        let app = router(relay);
         let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
             .await
             .map_err(|e| e.to_string())?;
@@ -190,88 +183,19 @@ pub fn run(
     })
 }
 
+fn router(relay: Arc<Relay>) -> Router {
+    Router::new()
+        .route("/addr", post(http_handler))
+        .route("/addr/{name}", get(http_handler))
+        .route("/msgs", post(http_handler))
+        .route("/threads", get(http_handler))
+        .route("/inbox", get(http_handler))
+        .fallback(http_handler)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES as usize))
+        .with_state(relay)
+}
+
 impl Relay {
-    /*
-    fn handle(&self, mut req: tiny_http::Request) {
-        let url = req.url().to_string();
-        let (path, query) = match url.split_once('?') {
-            Some((p, q)) => (p.to_string(), parse_query(q)),
-            None => (url.clone(), HashMap::new()),
-        };
-        let method = req.method().as_str().to_string();
-        // Transport-level gate (README §5): deployment config, not protocol.
-        // GET /addr/{name} stays public — profile documents are public by design.
-        if let Some(expected) = &self.token {
-            let public_profile = method == "GET" && path.starts_with("/addr/");
-            if !public_profile {
-                let authed = req.headers().iter().any(|h| {
-                    h.field.equiv("authorization")
-                        && h.value.as_str() == format!("Bearer {expected}")
-                });
-                if !authed {
-                    let resp = tiny_http::Response::from_string("missing or bad bearer token")
-                        .with_status_code(401);
-                    let _ = req.respond(resp);
-                    return;
-                }
-            }
-        }
-        let ip = req
-            .remote_addr()
-            .map(|a| a.ip().to_string())
-            .unwrap_or_else(|| "unknown".into());
-
-        // auth-v0 (README §5): on a signed relay, reads must be signed by
-        // a key of a registered identity; writes are already self-certifying.
-        let mut reader: Option<String> = None;
-        if self.signed && method == "GET" && (path == "/threads" || path == "/inbox") {
-            match self.verify_read(&req, &url) {
-                Ok(addr) => reader = Some(addr),
-                Err((code, e)) => {
-                    let _ = req.respond(tiny_http::Response::from_string(e).with_status_code(code));
-                    return;
-                }
-            }
-        }
-
-        let mut body = String::new();
-        let _ = std::io::Read::read_to_string(
-            &mut std::io::Read::take(req.as_reader(), MAX_BODY_BYTES + 1),
-            &mut body,
-        );
-
-        let result = if body.len() as u64 > MAX_BODY_BYTES {
-            Err((413, "body exceeds 64KB".into()))
-        } else {
-            match (method.as_str(), path.as_str()) {
-                ("POST", "/addr") => self.post_addr(&body, &ip),
-                ("GET", p) if p.starts_with("/addr/") => self.get_addr(&p["/addr/".len()..]),
-                ("POST", "/msgs") => self.post_msgs(&body),
-                ("GET", "/threads") => self
-                    .authorize_thread(reader.as_deref(), &query)
-                    .and_then(|_| self.poll(&query, true)),
-                ("GET", "/inbox") => {
-                    if reader.is_some() && query.get("addr") != reader.as_ref() {
-                        Err((403, "an inbox is readable only by its own address".into()))
-                    } else {
-                        self.poll(&query, false)
-                    }
-                }
-                _ => Err((404, "not found".into())),
-            }
-        };
-
-        let response = match result {
-            Ok(json) => tiny_http::Response::from_string(json).with_status_code(200),
-            Err((code, msg)) => tiny_http::Response::from_string(msg).with_status_code(code),
-        }
-        .with_header(
-            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap(),
-        );
-        let _ = req.respond(response);
-    }
-
-    */
     fn post_addr(&self, body: &str, ip: &str) -> Result<String, (u16, String)> {
         if !self
             .limiter
@@ -438,13 +362,44 @@ impl Relay {
         }
     }
 
-    fn wake(&self, key: &str) -> Arc<Notify> {
-        self.wakes
-            .lock()
-            .unwrap()
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(Notify::new()))
-            .clone()
+    fn signal(&self, key: &str) {
+        let notify = self.wakes.lock().unwrap().get(key).and_then(Weak::upgrade);
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
+}
+
+struct Waiter {
+    relay: Arc<Relay>,
+    key: String,
+    notify: Arc<Notify>,
+}
+
+impl Waiter {
+    fn subscribe(relay: Arc<Relay>, key: String) -> Self {
+        let notify = {
+            let mut wakes = relay.wakes.lock().unwrap();
+            wakes.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+                let notify = Arc::new(Notify::new());
+                wakes.insert(key.clone(), Arc::downgrade(&notify));
+                notify
+            })
+        };
+        Self { relay, key, notify }
+    }
+}
+
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        let mut wakes = self.relay.wakes.lock().unwrap();
+        if Arc::strong_count(&self.notify) == 1
+            && wakes
+                .get(&self.key)
+                .is_some_and(|weak| weak.ptr_eq(&Arc::downgrade(&self.notify)))
+        {
+            wakes.remove(&self.key);
+        }
     }
 }
 
@@ -493,8 +448,8 @@ async fn poll(relay: Arc<Relay>, query: HashMap<String, String>, thread: bool) -
         query.get("addr").ok_or((400, "addr required".into()))?
     };
     let key = format!("{}:{value}", if thread { "thread" } else { "inbox" });
-    let notify = relay.wake(&key);
-    let notified = notify.notified();
+    let waiter = Waiter::subscribe(relay.clone(), key);
+    let notified = waiter.notify.notified();
     tokio::pin!(notified);
     notified.as_mut().enable();
     let value = value.clone();
@@ -587,11 +542,9 @@ async fn http_handler(
             let result = blocking(relay.clone(), move |r| r.post_msgs(&body)).await;
             if result.is_ok() {
                 if let Some(env) = envelope {
-                    relay
-                        .wake(&format!("thread:{}", env.about))
-                        .notify_waiters();
+                    relay.signal(&format!("thread:{}", env.about));
                     for addr in env.to {
-                        relay.wake(&format!("inbox:{addr}")).notify_waiters();
+                        relay.signal(&format!("inbox:{addr}"));
                     }
                 }
             }
@@ -850,14 +803,7 @@ mod tests {
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             runtime.block_on(async move {
-                let app = Router::new()
-                    .route("/addr", axum::routing::post(http_handler))
-                    .route("/addr/{name}", get(http_handler))
-                    .route("/msgs", axum::routing::post(http_handler))
-                    .route("/threads", get(http_handler))
-                    .route("/inbox", get(http_handler))
-                    .fallback(http_handler)
-                    .with_state(rel);
+                let app = router(rel);
                 let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                 axum::serve(
                     listener,
@@ -901,23 +847,57 @@ mod tests {
         ])
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn more_than_sixteen_long_polls_wake_without_starvation() {
-        let relay = Arc::new(relay());
-        let mut tasks = Vec::new();
+    #[test]
+    fn more_than_sixteen_http_long_polls_do_not_starve_posts() {
+        let mut relay = relay();
+        relay.signed = false;
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        relay.store.register(alice.profile()).unwrap();
+        relay.store.register(bob.profile()).unwrap();
+        let (port, relay) = spawn(relay);
+        let path = format!("/inbox?addr={}&since=0&wait=2", bob.addr());
+        let mut polls = Vec::new();
         for _ in 0..24 {
-            let relay = relay.clone();
-            tasks.push(tokio::spawn(async move {
-                poll(relay, query("alice@localhost:4200", 2), false).await
+            let path = path.clone();
+            polls.push(std::thread::spawn(move || {
+                ureq::get(&format!("http://127.0.0.1:{port}{path}"))
+                    .timeout(Duration::from_secs(3))
+                    .call()
+                    .unwrap()
+                    .into_string()
+                    .unwrap()
             }));
         }
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        let start = std::time::Instant::now();
-        relay.wake("inbox:alice@localhost:4200").notify_waiters();
-        for task in tasks {
-            assert_eq!(task.await.unwrap().unwrap(), "{\"msgs\":[]}");
+        for _ in 0..100 {
+            if relay.wakes.lock().unwrap().len() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(start.elapsed() < Duration::from_millis(500));
+        assert_eq!(relay.wakes.lock().unwrap().len(), 1);
+        let env = Envelope::seal(
+            "topic".into(),
+            json!({ "text": "hello" }),
+            alice.addr(),
+            "note".into(),
+            vec![],
+            vec![bob.addr()],
+            envelope::now(),
+            &alice.agent_key(),
+        );
+        let start = std::time::Instant::now();
+        let posted = ureq::post(&format!("http://127.0.0.1:{port}/msgs"))
+            .timeout(Duration::from_secs(2))
+            .send_string(&serde_json::to_string(&env).unwrap())
+            .unwrap();
+        assert_eq!(posted.status(), 200);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        for poll in polls {
+            let body = poll.join().unwrap();
+            assert!(body.contains(&env.id));
+        }
+        assert!(relay.wakes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -928,11 +908,21 @@ mod tests {
             async move { poll(relay, query("alice@localhost:4200", 2), false).await }
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
-        relay.wake("thread:topic").notify_waiters();
+        relay.signal("thread:topic");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!task.is_finished());
-        relay.wake("inbox:alice@localhost:4200").notify_waiters();
+        relay.signal("inbox:alice@localhost:4200");
         assert_eq!(task.await.unwrap().unwrap(), "{\"msgs\":[]}");
+        assert!(relay.wakes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_time_poll_releases_its_waiter_key() {
+        let relay = Arc::new(relay());
+        poll(relay.clone(), query("arbitrary@localhost:4200", 0), false)
+            .await
+            .unwrap();
+        assert!(relay.wakes.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -994,6 +984,21 @@ mod tests {
         {
             Err(ureq::Error::Status(401, _)) => {}
             other => panic!("expected 401 without bearer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn http_rejects_body_over_64_kib() {
+        let mut r = relay();
+        r.signed = false;
+        let (port, _) = spawn(r);
+        let body = "x".repeat(MAX_BODY_BYTES as usize + 1);
+        match ureq::post(&format!("http://127.0.0.1:{port}/msgs"))
+            .timeout(Duration::from_secs(2))
+            .send_string(&body)
+        {
+            Err(ureq::Error::Status(413, _)) => {}
+            other => panic!("expected 413 for an oversized body, got {other:?}"),
         }
     }
 
