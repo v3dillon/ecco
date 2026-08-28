@@ -1,4 +1,5 @@
 mod client;
+mod coordination;
 mod envelope;
 mod identity;
 mod mcp;
@@ -51,6 +52,12 @@ enum Cmd {
         /// Require signed reads — for multi-tenant relays (or set ECCO_RELAY_SIGNED)
         #[arg(long)]
         signed: bool,
+        /// Address authority, e.g. relay.ecco.bot (or set ECCO_RELAY_AUTHORITY). Default: localhost:<port>
+        #[arg(long)]
+        authority: Option<String>,
+        /// Fail-closed allowedRoots from the limits snapshot (or set ECCO_RELAY_ALLOW_ROOTS). Requires --limits-url and --signed
+        #[arg(long)]
+        allow_roots: bool,
         /// Limits snapshot URL for per-sender retention windows (or set ECCO_RELAY_LIMITS_URL)
         #[arg(long)]
         limits_url: Option<String>,
@@ -77,6 +84,11 @@ enum Cmd {
         /// Encrypt the body to the recipients' root keys
         #[arg(long, short = 'e')]
         encrypt: bool,
+    },
+    /// Coordinate exclusive work on a generic thread anchor
+    Work {
+        #[command(subcommand)]
+        cmd: WorkCmd,
     },
     /// Show messages addressed to you
     Inbox {
@@ -117,6 +129,32 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum WorkCmd {
+    Status {
+        #[arg(long)]
+        about: String,
+    },
+    Claim {
+        #[arg(long)]
+        about: String,
+        #[arg(long)]
+        to: Vec<String>,
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long, default_value_t = coordination::DEFAULT_TTL_SECONDS)]
+        ttl_seconds: u64,
+        #[arg(long)]
+        text: Option<String>,
+    },
+    Release {
+        #[arg(long)]
+        about: String,
+        #[arg(long)]
+        claim: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum AdminCmd {
     /// Remove one envelope by id (takedown). Peers keep their signed copies
     Remove {
@@ -139,6 +177,10 @@ fn main() {
     let cli = Cli::parse();
     let home = cli.home.clone().unwrap_or_else(identity::default_home);
     if let Err(e) = run(cli.cmd, &home) {
+        if let Some(json) = coordination::claim_lost_json(&e) {
+            println!("{json}");
+            std::process::exit(2);
+        }
         eprintln!("error: {e}");
         std::process::exit(1);
     }
@@ -147,15 +189,8 @@ fn main() {
 fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
     match cmd {
         Cmd::Init { name, relay, token } => {
-            if Identity::load(home).is_ok() {
-                return Err(format!(
-                    "identity already exists at {} (use --home for another)",
-                    home.display()
-                ));
-            }
-            let id = Identity::generate(&name, &relay, token);
+            let id = Identity::prepare(home, &name, &relay, token)?;
             client::register(&id)?;
-            id.save(home)?;
             println!("registered {}", id.addr());
             println!(
                 "root key (you):    {}",
@@ -172,12 +207,20 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             data,
             token,
             signed,
+            authority,
+            allow_roots,
             limits_url,
             retention_days,
         } => {
             let data = data.unwrap_or_else(|| home.join("relay"));
             let token = token.or_else(|| std::env::var("ECCO_RELAY_TOKEN").ok());
             let signed = signed || std::env::var("ECCO_RELAY_SIGNED").is_ok();
+            let authority = authority
+                .or_else(|| std::env::var("ECCO_RELAY_AUTHORITY").ok())
+                .map(|s| identity::authority(&s))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("localhost:{port}"));
+            let allow_roots = allow_roots || std::env::var("ECCO_RELAY_ALLOW_ROOTS").is_ok();
             let retention = relay::Retention {
                 limits_url: limits_url.or_else(|| std::env::var("ECCO_RELAY_LIMITS_URL").ok()),
                 default_days: match retention_days {
@@ -190,7 +233,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                     },
                 },
             };
-            relay::run(port, data, token, signed, retention)
+            relay::run(port, data, token, signed, authority, allow_roots, retention)
         }
         Cmd::Admin { cmd } => match cmd {
             AdminCmd::Remove { id, data } => {
@@ -219,7 +262,36 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             let id = Identity::load(home)?;
             let about = about.unwrap_or_else(|| dm_thread(&id.addr(), &to));
             let receipt = post(home, &id, about, kind, json!({ "text": text }), to, encrypt)?;
-            println!("{receipt}");
+            println!("{}", serde_json::to_string(&receipt).unwrap());
+            Ok(())
+        }
+        Cmd::Work { cmd } => {
+            let id = Identity::load(home)?;
+            let value = match cmd {
+                WorkCmd::Status { about } => {
+                    serde_json::to_value(coordination::status(&id, &about)?).unwrap()
+                }
+                WorkCmd::Claim {
+                    about,
+                    to,
+                    branch,
+                    ttl_seconds,
+                    text,
+                } => serde_json::to_value(coordination::claim(
+                    home,
+                    &id,
+                    &about,
+                    to,
+                    branch,
+                    ttl_seconds,
+                    text,
+                )?)
+                .unwrap(),
+                WorkCmd::Release { about, claim } => {
+                    serde_json::to_value(coordination::release(home, &id, &about, claim)?).unwrap()
+                }
+            };
+            println!("{}", serde_json::to_string(&value).unwrap());
             Ok(())
         }
         Cmd::Inbox { since, new } => {
@@ -372,7 +444,19 @@ fn post(
     body: serde_json::Value,
     to: Vec<String>,
     encrypt: bool,
-) -> Result<String, String> {
+) -> Result<client::Receipt, String> {
+    post_envelope(home, id, about, kind, body, to, encrypt).map(|(_, receipt)| receipt)
+}
+
+fn post_envelope(
+    home: &Path,
+    id: &Identity,
+    about: String,
+    kind: String,
+    body: serde_json::Value,
+    to: Vec<String>,
+    encrypt: bool,
+) -> Result<(Envelope, client::Receipt), String> {
     let contacts = identity::contacts_load(home);
     for addr in &to {
         if identity::standing(&contacts, &id.addr(), addr) == identity::Standing::Unknown {
@@ -418,7 +502,8 @@ fn post(
         envelope::now(),
         &key,
     );
-    client::send(id, &env)
+    let receipt = client::send(id, &env)?;
+    Ok((env, receipt))
 }
 
 /// Split inbox messages by sender standing: (visible, held). Blocked are dropped.
@@ -458,7 +543,7 @@ fn decide(home: &Path, target: &str, verb: &str) -> Result<(), String> {
         vec![proposal.env.from.clone()],
         false,
     )?;
-    println!("{receipt}");
+    println!("{}", serde_json::to_string(&receipt).unwrap());
     Ok(())
 }
 

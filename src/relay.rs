@@ -3,7 +3,7 @@
 
 use ed25519_dalek::{Signer, SigningKey, Verifier};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -66,6 +66,11 @@ pub struct Relay {
     key: SigningKey,
     token: Option<String>,
     signed: bool,
+    authority: String,
+    allow_roots: bool,
+    /// Last good `allowedRoots` from the limits snapshot. `None` means
+    /// never fetched (fail-closed while --allow-roots).
+    allowed_roots: Mutex<Option<HashSet<String>>>,
     limiter: Limiter,
 }
 
@@ -89,13 +94,22 @@ impl Retention {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     port: u16,
     data: PathBuf,
     token: Option<String>,
     signed: bool,
+    authority: String,
+    allow_roots: bool,
     retention: Retention,
 ) -> Result<(), String> {
+    if allow_roots && retention.limits_url.as_ref().is_none_or(|u| u.is_empty()) {
+        return Err("--allow-roots requires --limits-url or ECCO_RELAY_LIMITS_URL".into());
+    }
+    if allow_roots && !signed {
+        return Err("--allow-roots requires --signed or ECCO_RELAY_SIGNED".into());
+    }
     fs::create_dir_all(&data).map_err(|e| e.to_string())?;
     let key_path = data.join("relay_key");
     let key = match fs::read_to_string(&key_path) {
@@ -118,19 +132,24 @@ pub fn run(
         key,
         token,
         signed,
+        authority,
+        allow_roots,
+        allowed_roots: Mutex::new(None),
         limiter: Limiter {
             buckets: Mutex::new(HashMap::new()),
         },
     });
     let server = Arc::new(tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| e.to_string())?);
     eprintln!(
-        "ecco relay on port {port} · {} · signed reads: {} · retention: {} · key {}",
+        "ecco relay on port {port} · {} · authority {} · signed reads: {} · allow-roots: {} · retention: {} · key {}",
         data.join("relay.db").display(),
+        relay.authority,
         relay.signed,
+        relay.allow_roots,
         describe_retention(&retention),
         encode_key(&relay.key.verifying_key())
     );
-    if retention.enabled() {
+    if retention.enabled() || relay.allow_roots {
         let relay = relay.clone();
         std::thread::spawn(move || sweeper(relay, retention));
     }
@@ -152,24 +171,29 @@ pub fn run(
 
 impl Relay {
     fn handle(&self, mut req: tiny_http::Request) {
-        // Transport-level gate (README §5): deployment config, not protocol.
-        if let Some(expected) = &self.token {
-            let authed = req.headers().iter().any(|h| {
-                h.field.equiv("authorization") && h.value.as_str() == format!("Bearer {expected}")
-            });
-            if !authed {
-                let resp = tiny_http::Response::from_string("missing or bad bearer token")
-                    .with_status_code(401);
-                let _ = req.respond(resp);
-                return;
-            }
-        }
         let url = req.url().to_string();
         let (path, query) = match url.split_once('?') {
             Some((p, q)) => (p.to_string(), parse_query(q)),
             None => (url.clone(), HashMap::new()),
         };
         let method = req.method().as_str().to_string();
+        // Transport-level gate (README §5): deployment config, not protocol.
+        // GET /addr/{name} stays public — profile documents are public by design.
+        if let Some(expected) = &self.token {
+            let public_profile = method == "GET" && path.starts_with("/addr/");
+            if !public_profile {
+                let authed = req.headers().iter().any(|h| {
+                    h.field.equiv("authorization")
+                        && h.value.as_str() == format!("Bearer {expected}")
+                });
+                if !authed {
+                    let resp = tiny_http::Response::from_string("missing or bad bearer token")
+                        .with_status_code(401);
+                    let _ = req.respond(resp);
+                    return;
+                }
+            }
+        }
         let ip = req
             .remote_addr()
             .map(|a| a.ip().to_string())
@@ -181,8 +205,8 @@ impl Relay {
         if self.signed && method == "GET" && (path == "/threads" || path == "/inbox") {
             match self.verify_read(&req, &url) {
                 Ok(addr) => reader = Some(addr),
-                Err(e) => {
-                    let _ = req.respond(tiny_http::Response::from_string(e).with_status_code(401));
+                Err((code, e)) => {
+                    let _ = req.respond(tiny_http::Response::from_string(e).with_status_code(code));
                     return;
                 }
             }
@@ -235,6 +259,16 @@ impl Relay {
         let profile: crate::identity::Profile =
             serde_json::from_str(body).map_err(|e| (400, format!("bad profile: {e}")))?;
         profile.verify().map_err(|e| (400, e))?;
+        for d in &profile.delegations {
+            let name = self.name_on_this_relay(&d.addr).map_err(|e| (400, e))?;
+            if name != profile.name {
+                return Err((
+                    400,
+                    format!("delegation addr '{}' does not match profile name", d.addr),
+                ));
+            }
+        }
+        self.allow_root(&profile.root)?;
         self.store.register(profile)?;
         Ok("{\"ok\":true}".into())
     }
@@ -256,11 +290,7 @@ impl Relay {
         {
             return Err((429, "message rate limit".into()));
         }
-        let sender_name = env
-            .from
-            .split_once('@')
-            .ok_or((400, "bad from address".to_string()))?
-            .0;
+        let sender_name = self.name_on_this_relay(&env.from).map_err(|e| (400, e))?;
         let now = envelope::now();
         let profile = self
             .store
@@ -269,6 +299,7 @@ impl Relay {
         profile
             .authorizes(&env.key, &env.kind, now)
             .map_err(|e| (403, e))?;
+        self.allow_root(&profile.root)?;
         // Closed threads: an existing anchor accepts posts from its
         // participants only. Anyone may start an empty anchor, and being
         // addressed is how you join. A stranger reusing your anchor gets
@@ -305,41 +336,69 @@ impl Relay {
         Ok(serde_json::to_string(&receipt).unwrap())
     }
 
+    /// `name` from `name@authority` when the authority is this relay.
+    fn name_on_this_relay<'a>(&self, addr: &'a str) -> Result<&'a str, String> {
+        let (name, auth) = addr
+            .split_once('@')
+            .ok_or_else(|| format!("'{addr}' is not name@authority"))?;
+        if auth != self.authority {
+            return Err(format!("authority '{auth}' is not this relay"));
+        }
+        Ok(name)
+    }
+
+    /// Membership from the last-good limits snapshot when --allow-roots.
+    fn allow_root(&self, root: &str) -> Result<(), (u16, String)> {
+        if !self.allow_roots {
+            return Ok(());
+        }
+        match &*self.allowed_roots.lock().unwrap() {
+            None => Err((503, "allowlist not ready".into())),
+            Some(set) if set.contains(root) => Ok(()),
+            Some(_) => Err((403, "root is not a member of this relay".into())),
+        }
+    }
+
     /// auth-v0: validate the X-Ecco-* headers and return the authenticated addr.
-    fn verify_read(&self, req: &tiny_http::Request, path_query: &str) -> Result<String, String> {
+    fn verify_read(
+        &self,
+        req: &tiny_http::Request,
+        path_query: &str,
+    ) -> Result<String, (u16, String)> {
         let header = |name: &str| {
             req.headers()
                 .iter()
                 .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
                 .map(|h| h.value.as_str().to_string())
         };
-        let addr = header("x-ecco-addr").ok_or("missing x-ecco-addr")?;
-        let key = header("x-ecco-key").ok_or("missing x-ecco-key")?;
-        let sig = header("x-ecco-sig").ok_or("missing x-ecco-sig")?;
+        let addr = header("x-ecco-addr").ok_or((401, "missing x-ecco-addr".into()))?;
+        let key = header("x-ecco-key").ok_or((401, "missing x-ecco-key".into()))?;
+        let sig = header("x-ecco-sig").ok_or((401, "missing x-ecco-sig".into()))?;
         let ts: u64 = header("x-ecco-ts")
-            .ok_or("missing x-ecco-ts")?
+            .ok_or((401, "missing x-ecco-ts".into()))?
             .parse()
-            .map_err(|_| "bad x-ecco-ts")?;
+            .map_err(|_| (401, "bad x-ecco-ts".into()))?;
         let now = envelope::now();
         if now.abs_diff(ts) > 300 {
-            return Err("request timestamp outside the 300s window".into());
+            return Err((401, "request timestamp outside the 300s window".into()));
         }
-        let name = addr.split_once('@').ok_or("bad x-ecco-addr")?.0;
+        let name = self.name_on_this_relay(&addr).map_err(|e| (401, e))?;
         let profile = self
             .store
-            .profile(name)
-            .map_err(|(_, e)| e)?
-            .ok_or(format!("unknown identity '{addr}'"))?;
-        profile.authorizes_read(&key, now)?;
-        let vk = envelope::decode_key(&key)?;
-        let sig_bytes: [u8; 64] = envelope::decode_prefixed(&sig, "ed25519:")?
+            .profile(name)?
+            .ok_or((401, format!("unknown identity '{addr}'")))?;
+        profile.authorizes_read(&key, now).map_err(|e| (401, e))?;
+        self.allow_root(&profile.root)?;
+        let vk = envelope::decode_key(&key).map_err(|e| (401, e))?;
+        let sig_bytes: [u8; 64] = envelope::decode_prefixed(&sig, "ed25519:")
+            .map_err(|e| (401, e))?
             .try_into()
-            .map_err(|_| "bad signature length".to_string())?;
+            .map_err(|_| (401, "bad signature length".into()))?;
         vk.verify(
             &crate::identity::request_signing_bytes("GET", path_query, ts),
             &ed25519_dalek::Signature::from_bytes(&sig_bytes),
         )
-        .map_err(|_| "bad request signature".to_string())?;
+        .map_err(|_| (401, "bad request signature".into()))?;
         Ok(addr)
     }
 
@@ -398,10 +457,50 @@ fn describe_retention(r: &Retention) -> String {
 }
 
 /// Per-sender windows parsed from a limits snapshot. Numbers only: the
-/// relay never learns a plan id for an address.
+/// relay never learns a plan id for an address. `allowed_roots` is `None`
+/// when the field is missing, not an array, or contains a bad root —
+/// keep last-good / Pending. `Some` (including empty) replaces it.
 struct LimitWindows {
     per_sender: Vec<(String, u32)>,
     guest_days: Option<u32>,
+    allowed_roots: Option<Vec<String>>,
+}
+
+fn is_allowed_root(s: &str) -> bool {
+    let Some(hex) = s.strip_prefix("ed25519:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn parse_allowed_roots(v: &serde_json::Value) -> Option<Vec<String>> {
+    let arr = v.get("allowedRoots")?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let s = item.as_str()?;
+        if !is_allowed_root(s) {
+            return None;
+        }
+        out.push(s.to_string());
+    }
+    Some(out)
+}
+
+fn parse_limits(v: &serde_json::Value) -> LimitWindows {
+    let days = |v: &serde_json::Value| v.as_u64().and_then(|d| u32::try_from(d).ok());
+    let per_sender = v["addresses"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(addr, caps)| days(&caps["retentionDays"]).map(|d| (addr.clone(), d)))
+                .collect()
+        })
+        .unwrap_or_default();
+    LimitWindows {
+        per_sender,
+        guest_days: days(&v["plans"]["guest"]["retentionDays"]),
+        allowed_roots: parse_allowed_roots(v),
+    }
 }
 
 fn fetch_limits(url: &str) -> Result<LimitWindows, String> {
@@ -412,19 +511,7 @@ fn fetch_limits(url: &str) -> Result<LimitWindows, String> {
         .into_string()
         .map_err(|e| e.to_string())?;
     let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    let days = |v: &serde_json::Value| v.as_u64().and_then(|d| u32::try_from(d).ok());
-    let per_sender = v["addresses"]
-        .as_object()
-        .map(|m| {
-            m.iter()
-                .filter_map(|(addr, caps)| days(&caps["retentionDays"]).map(|d| (addr.clone(), d)))
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(LimitWindows {
-        per_sender,
-        guest_days: days(&v["plans"]["guest"]["retentionDays"]),
-    })
+    Ok(parse_limits(&v))
 }
 
 /// One pass: refresh the per-sender table from the snapshot (when
@@ -437,6 +524,11 @@ fn retention_pass(relay: &Relay, cfg: &Retention) {
             Ok(w) => {
                 if let Err((_, e)) = relay.store.set_retention(&w.per_sender) {
                     eprintln!("relay: retention table update failed: {e}");
+                }
+                if relay.allow_roots {
+                    if let Some(roots) = w.allowed_roots {
+                        *relay.allowed_roots.lock().unwrap() = Some(roots.into_iter().collect());
+                    }
                 }
                 if default_days.is_none() {
                     default_days = w.guest_days;
@@ -512,6 +604,9 @@ mod tests {
             key: SigningKey::generate(&mut rand::rngs::OsRng),
             token: None,
             signed: true,
+            authority: "localhost:4200".into(),
+            allow_roots: false,
+            allowed_roots: Mutex::new(None),
             limiter: Limiter {
                 buckets: Mutex::new(HashMap::new()),
             },
@@ -566,5 +661,256 @@ mod tests {
         post(&r, &alice, pr, &[&mallory], "join us").unwrap();
         post(&r, &mallory, pr, &[&alice], "thanks").unwrap();
         assert_eq!(r.store.thread(pr, 0).unwrap().len(), 4);
+    }
+
+    fn spawn(r: Relay) -> (u16, std::sync::Arc<Relay>) {
+        let relay = std::sync::Arc::new(r);
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let rel = relay.clone();
+        std::thread::spawn(move || {
+            while let Ok(req) = server.recv() {
+                rel.handle(req);
+            }
+        });
+        (port, relay)
+    }
+
+    fn signed_get(port: u16, path: &str, id: &Identity) -> u16 {
+        use ed25519_dalek::Signer;
+        let ts = envelope::now();
+        let sig = id
+            .agent_key()
+            .sign(&crate::identity::request_signing_bytes("GET", path, ts));
+        match ureq::get(&format!("http://127.0.0.1:{port}{path}"))
+            .timeout(Duration::from_secs(2))
+            .set("x-ecco-addr", &id.addr())
+            .set("x-ecco-key", &encode_key(&id.agent_key().verifying_key()))
+            .set("x-ecco-ts", &ts.to_string())
+            .set(
+                "x-ecco-sig",
+                &format!("ed25519:{}", hex::encode(sig.to_bytes())),
+            )
+            .call()
+        {
+            Ok(resp) => resp.status(),
+            Err(ureq::Error::Status(code, _)) => code,
+            Err(_) => 0,
+        }
+    }
+
+    #[test]
+    fn authority_mismatch_is_rejected() {
+        let r = relay();
+        assert_eq!(
+            r.name_on_this_relay("alice@localhost:4200").unwrap(),
+            "alice"
+        );
+        assert!(r.name_on_this_relay("alice@evil.example").is_err());
+        assert!(r.name_on_this_relay("alice").is_err());
+
+        let foreign = Identity::generate("alice", "http://evil.example", None);
+        let (code, msg) = r
+            .post_addr(
+                &serde_json::to_string(&foreign.profile()).unwrap(),
+                "1.1.1.1",
+            )
+            .unwrap_err();
+        assert_eq!(code, 400);
+        assert!(msg.contains("authority"));
+
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        r.store.register(alice.profile()).unwrap();
+        let env = Envelope::seal(
+            "gh:x".into(),
+            json!({ "text": "x" }),
+            "alice@evil.example".into(),
+            "note".into(),
+            vec![],
+            vec![],
+            envelope::now(),
+            &alice.agent_key(),
+        );
+        let (code, msg) = r
+            .post_msgs(&serde_json::to_string(&env).unwrap())
+            .unwrap_err();
+        assert_eq!(code, 400);
+        assert!(msg.contains("authority"));
+    }
+
+    #[test]
+    fn get_addr_is_public_when_bearer_is_set() {
+        let mut r = relay();
+        r.token = Some("s3cret".into());
+        r.signed = false;
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        r.store.register(alice.profile()).unwrap();
+        let (port, _) = spawn(r);
+        let base = format!("http://127.0.0.1:{port}");
+        let got = ureq::get(&format!("{base}/addr/alice"))
+            .timeout(Duration::from_secs(2))
+            .call()
+            .unwrap();
+        assert_eq!(got.status(), 200);
+        match ureq::post(&format!("{base}/msgs"))
+            .timeout(Duration::from_secs(2))
+            .send_string("{}")
+        {
+            Err(ureq::Error::Status(401, _)) => {}
+            other => panic!("expected 401 without bearer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_off_pending_empty_listed_kick() {
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        let alice_body = serde_json::to_string(&alice.profile()).unwrap();
+        let bob_body = serde_json::to_string(&bob.profile()).unwrap();
+
+        let r = relay();
+        r.post_addr(&alice_body, "1.1.1.1").unwrap();
+        post(&r, &alice, "gh:off", &[], "hi").unwrap();
+
+        let mut r = relay();
+        r.allow_roots = true;
+        let (code, _) = r.post_addr(&alice_body, "1.1.1.1").unwrap_err();
+        assert_eq!(code, 503);
+
+        *r.allowed_roots.lock().unwrap() = Some(HashSet::new());
+        let (code, _) = r.post_addr(&alice_body, "1.1.1.1").unwrap_err();
+        assert_eq!(code, 403);
+
+        *r.allowed_roots.lock().unwrap() = Some(HashSet::from([alice.profile().root]));
+        r.post_addr(&alice_body, "1.1.1.1").unwrap();
+        post(&r, &alice, "gh:listed", &[], "hi").unwrap();
+        let (code, _) = r.post_addr(&bob_body, "1.1.1.1").unwrap_err();
+        assert_eq!(code, 403);
+
+        *r.allowed_roots.lock().unwrap() = Some(HashSet::new());
+        let (code, _) = post(&r, &alice, "gh:listed", &[], "again").unwrap_err();
+        assert_eq!(code, 403);
+    }
+
+    fn root(n: u8) -> String {
+        format!("ed25519:{:064x}", n)
+    }
+
+    #[test]
+    fn parse_limits_distinguishes_missing_malformed_and_empty_allowed_roots() {
+        let good = root(1);
+        let w = parse_limits(&json!({
+            "allowedRoots": [good],
+            "addresses": { "alice@x": { "retentionDays": 7 } },
+            "plans": { "guest": { "retentionDays": 3 } }
+        }));
+        assert_eq!(w.allowed_roots, Some(vec![root(1)]));
+        assert_eq!(w.guest_days, Some(3));
+        assert_eq!(w.per_sender, vec![("alice@x".into(), 7)]);
+
+        let missing = parse_limits(&json!({
+            "addresses": { "alice@x": { "retentionDays": 7 } }
+        }));
+        assert!(missing.allowed_roots.is_none());
+        assert_eq!(missing.per_sender.len(), 1);
+
+        let not_array = parse_limits(&json!({ "allowedRoots": "ed25519:nope" }));
+        assert!(not_array.allowed_roots.is_none());
+
+        let bad_format = parse_limits(&json!({ "allowedRoots": ["ed25519:AA"] }));
+        assert!(bad_format.allowed_roots.is_none());
+
+        let uppercase = parse_limits(&json!({
+            "allowedRoots": [format!("ed25519:{}", "A".repeat(64))]
+        }));
+        assert!(uppercase.allowed_roots.is_none());
+
+        let mixed = parse_limits(&json!({ "allowedRoots": [root(1), "ed25519:zz"] }));
+        assert!(mixed.allowed_roots.is_none());
+
+        let empty = parse_limits(&json!({ "allowedRoots": [] }));
+        assert_eq!(empty.allowed_roots, Some(vec![]));
+    }
+
+    #[test]
+    fn malformed_allowed_roots_keep_last_good_and_empty_locks() {
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let alice_body = serde_json::to_string(&alice.profile()).unwrap();
+        let mut r = relay();
+        r.allow_roots = true;
+        *r.allowed_roots.lock().unwrap() = Some(HashSet::from([alice.profile().root]));
+        let malformed = parse_limits(&json!({
+            "allowedRoots": ["not-a-root"],
+            "addresses": { "alice@x": { "retentionDays": 7 } }
+        }));
+        assert!(malformed.allowed_roots.is_none());
+        r.post_addr(&alice_body, "1.1.1.1").unwrap();
+
+        let locked = parse_limits(&json!({ "allowedRoots": [] }));
+        if let Some(roots) = locked.allowed_roots {
+            *r.allowed_roots.lock().unwrap() = Some(roots.into_iter().collect());
+        }
+        let (code, _) = r.post_addr(&alice_body, "1.1.1.1").unwrap_err();
+        assert_eq!(code, 403);
+    }
+
+    #[test]
+    fn allow_roots_requires_limits_url_before_listen() {
+        let dir = std::env::temp_dir().join(format!(
+            "ecco-relay-cfg-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let err = super::run(
+            1,
+            dir,
+            None,
+            false,
+            "localhost:1".into(),
+            true,
+            Retention::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("limits-url") || err.contains("LIMITS_URL"));
+    }
+
+    #[test]
+    fn allow_roots_requires_signed_reads_before_listen() {
+        let dir = std::env::temp_dir().join(format!(
+            "ecco-relay-signed-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let err = super::run(
+            1,
+            dir,
+            None,
+            false,
+            "localhost:1".into(),
+            true,
+            Retention {
+                limits_url: Some("https://example.invalid/limits.json".into()),
+                default_days: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("--signed") || err.contains("ECCO_RELAY_SIGNED"));
+    }
+
+    #[test]
+    fn allowlist_removal_blocks_signed_read() {
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let mut r = relay();
+        r.allow_roots = true;
+        *r.allowed_roots.lock().unwrap() = Some(HashSet::from([alice.profile().root.clone()]));
+        r.post_addr(&serde_json::to_string(&alice.profile()).unwrap(), "1.1.1.1")
+            .unwrap();
+        post(&r, &alice, "gh:x", &[], "hi").unwrap();
+        let (port, relay) = spawn(r);
+
+        let path = "/threads?about=gh%3Ax&since=0&wait=0";
+        assert_eq!(signed_get(port, path, &alice), 200);
+        *relay.allowed_roots.lock().unwrap() = Some(HashSet::new());
+        assert_eq!(signed_get(port, path, &alice), 403);
     }
 }

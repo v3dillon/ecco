@@ -172,6 +172,50 @@ impl Identity {
         }
     }
 
+    /// Load this home's identity, or generate and save a new one.
+    /// Same-name retry is allowed so a failed registration can run again
+    /// without losing keys. A different name or relay in this home is an
+    /// error. A file that exists but does not parse is not overwritten.
+    pub fn prepare(
+        home: &Path,
+        name: &str,
+        relay: &str,
+        token: Option<String>,
+    ) -> Result<Identity, String> {
+        let path = home.join("identity.json");
+        if path.exists() {
+            let mut existing = Self::load(home).map_err(|e| {
+                format!(
+                    "identity at {} is unreadable ({e}); not overwritten",
+                    path.display()
+                )
+            })?;
+            if existing.name != name {
+                return Err(format!(
+                    "identity already exists at {} as {} (use --home for another)",
+                    home.display(),
+                    existing.name
+                ));
+            }
+            let relay = relay.trim_end_matches('/');
+            if existing.relay != relay {
+                return Err(format!(
+                    "identity already exists at {} for {} (use --home for another)",
+                    home.display(),
+                    existing.relay
+                ));
+            }
+            if token.is_some() && existing.token != token {
+                existing.token = token;
+                existing.save(home)?;
+            }
+            return Ok(existing);
+        }
+        let id = Self::generate(name, relay, token);
+        id.save(home)?;
+        Ok(id)
+    }
+
     /// Build the signed profile: one delegation for the agent key, one relay endpoint.
     pub fn profile(&self) -> Profile {
         self.sign_profile(
@@ -328,6 +372,17 @@ mod tests {
     use super::*;
     use crate::envelope::Envelope;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static N: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_home() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "ecco-id-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
 
     fn seal(id: &Identity, kind: &str, key: &SigningKey) -> Envelope {
         Envelope::seal(
@@ -487,5 +542,49 @@ mod tests {
             .profile()
             .authorizes(&env.key, "note", envelope::now())
             .is_err());
+    }
+
+    #[test]
+    fn prepare_saves_keys_before_register_and_retries_the_same_name() {
+        let home = temp_home();
+        let first = Identity::prepare(&home, "alice", "http://localhost:4200", None).unwrap();
+        assert!(home.join("identity.json").exists());
+        let again = Identity::prepare(&home, "alice", "http://localhost:4200", None).unwrap();
+        assert_eq!(first.root_secret, again.root_secret);
+        assert_eq!(first.agent_secret, again.agent_secret);
+        let err = Identity::prepare(&home, "bob", "http://localhost:4200", None)
+            .err()
+            .expect("different name must fail");
+        assert!(err.contains("already exists"));
+        let with_token = Identity::prepare(
+            &home,
+            "alice",
+            "http://localhost:4200",
+            Some("s3cret".into()),
+        )
+        .unwrap();
+        assert_eq!(with_token.token.as_deref(), Some("s3cret"));
+        assert_eq!(with_token.root_secret, first.root_secret);
+        let err = Identity::prepare(&home, "alice", "http://localhost:9999", None)
+            .err()
+            .expect("different relay must fail");
+        assert!(err.contains("already exists"));
+        assert_eq!(
+            Identity::load(&home).unwrap().root_secret,
+            first.root_secret
+        );
+    }
+
+    #[test]
+    fn prepare_does_not_overwrite_a_corrupt_identity() {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("identity.json");
+        std::fs::write(&path, "{not-json").unwrap();
+        let err = Identity::prepare(&home, "alice", "http://localhost:4200", None)
+            .err()
+            .expect("corrupt identity must fail");
+        assert!(err.contains("not overwritten"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not-json");
     }
 }
