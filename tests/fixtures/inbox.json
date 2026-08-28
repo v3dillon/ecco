@@ -1,0 +1,47 @@
+{
+  "cursor": "18446744073709551615",
+  "messages": [
+    {
+      "gseq": 18446744073709551615,
+      "tseq": 42,
+      "received_at": 1725000456,
+      "env": {
+        "id": "b3:efc2d8e5f55c1f9d040cf1f7006e024af9feecf3347e575d61b093355a4c7c37",
+        "about": "gh:acme/widgets/pull/42",
+        "body": {
+          "details": {
+            "approved": true,
+            "score": 17
+          },
+          "text": "Deterministic fixture message"
+        },
+        "from": "alice@example.test",
+        "key": "ed25519:ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+        "kind": "finding",
+        "prev": [
+          "b3:previous-message"
+        ],
+        "sig": "ed25519:c32b1067b915edf54ebcf5845bc6d0fec5b8b1e411942d90844ff45560340858dfff9c03dba8c73bf5b6eaeb01a2139e95e0a97186c9e6aa47e83ed56a98610b",
+        "to": [
+          "bob@example.test",
+          "carol@example.test"
+        ],
+        "ts": 1725000123,
+        "v": 0
+      }
+    }
+  ],
+  "held": [
+    {
+      "sender": "mallory@example.test",
+      "kind": "request",
+      "count": 3
+    }
+  ],
+  "rejected": [
+    {
+      "id": "b3:rejected-message",
+      "reason": "profile key is not approved"
+    }
+  ]
+}

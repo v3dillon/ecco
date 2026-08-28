@@ -785,6 +785,7 @@ fn short(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_DIR: AtomicUsize = AtomicUsize::new(0);
@@ -798,14 +799,46 @@ mod tests {
     }
 
     #[test]
-    fn inbox_json_has_exact_producer_schema() {
+    fn inbox_json_matches_canonical_fixture() {
+        let signing_key = SigningKey::from_bytes(&[7; 32]);
+        let envelope = Envelope::seal(
+            "gh:acme/widgets/pull/42".into(),
+            json!({
+                "details": { "approved": true, "score": 17 },
+                "text": "Deterministic fixture message"
+            }),
+            "alice@example.test".into(),
+            "finding".into(),
+            vec!["b3:previous-message".into()],
+            vec!["bob@example.test".into(), "carol@example.test".into()],
+            1_725_000_123,
+            &signing_key,
+        );
+        envelope.verify().unwrap();
+
         let value = serde_json::to_value(InboxJson {
             cursor: u64::MAX.to_string(),
-            messages: vec![],
-            held: vec![],
-            rejected: vec![],
+            messages: vec![Stored {
+                gseq: u64::MAX,
+                tseq: 42,
+                received_at: 1_725_000_456,
+                env: envelope,
+            }],
+            held: vec![HeldSummary {
+                sender: "mallory@example.test".into(),
+                kind: "request".into(),
+                count: 3,
+            }],
+            rejected: vec![RejectedSummary {
+                id: "b3:rejected-message".into(),
+                reason: "profile key is not approved".into(),
+            }],
         })
         .unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/inbox.json")).unwrap();
+
+        assert_eq!(value, fixture);
         let object = value.as_object().unwrap();
         assert_eq!(
             object.keys().map(String::as_str).collect::<Vec<_>>(),
