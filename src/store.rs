@@ -68,15 +68,17 @@ CREATE INDEX IF NOT EXISTS msgs_received ON msgs(received_at);
 CREATE TABLE IF NOT EXISTS msg_to (gseq INTEGER NOT NULL, addr TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS msg_to_addr ON msg_to(addr, gseq);
 CREATE TABLE IF NOT EXISTS retention (sender TEXT PRIMARY KEY, days INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS participants (
+";
+
+/// First-time `participants` table: CREATE plus backfill in one
+/// transaction so a crash leaves no committed table. Threads whose
+/// msgs were already gone stay reserved with no reconstructed members.
+const SQLITE_INIT_PARTICIPANTS: &str = "
+CREATE TABLE participants (
   about TEXT NOT NULL,
   addr TEXT NOT NULL,
   PRIMARY KEY (about, addr)
 );
-";
-
-/// Upgrade path for stores that existed before `participants`.
-const SQLITE_BACKFILL_PARTICIPANTS: &str = "
 INSERT OR IGNORE INTO participants(about, addr) SELECT DISTINCT about, sender FROM msgs;
 INSERT OR IGNORE INTO participants(about, addr)
   SELECT DISTINCT m.about, t.addr FROM msgs m JOIN msg_to t ON t.gseq=m.gseq;
@@ -91,23 +93,28 @@ impl Store {
     /// `ecco admin` share the file with a running relay.
     pub fn open(data: &Path) -> Result<Store, String> {
         fs::create_dir_all(data).map_err(|e| e.to_string())?;
-        let conn = rusqlite::Connection::open(data.join("relay.db")).map_err(|e| e.to_string())?;
+        let mut conn =
+            rusqlite::Connection::open(data.join("relay.db")).map_err(|e| e.to_string())?;
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         let _ = conn.busy_timeout(Duration::from_secs(5));
-        let backfill = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='participants'",
-                [],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(|e| e.to_string())?
-            .is_none();
         conn.execute_batch(SQLITE_SCHEMA)
             .map_err(|e| e.to_string())?;
-        if backfill {
-            conn.execute_batch(SQLITE_BACKFILL_PARTICIPANTS)
-                .map_err(|e| e.to_string())?;
+        {
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let missing = tx
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='participants'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?
+                .is_none();
+            if missing {
+                tx.execute_batch(SQLITE_INIT_PARTICIPANTS)
+                    .map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
         }
         Ok(Store {
             conn: Mutex::new(conn),
@@ -539,6 +546,39 @@ mod tests {
         assert!(matches!(
             store.access("gh:acme/app/pull/1", &bob.addr()).unwrap(),
             ThreadAccess::Participant
+        ));
+    }
+
+    #[test]
+    fn swept_legacy_thread_stays_closed_without_invented_members() {
+        let dir = fresh_dir();
+        let store = Store::open(&dir).unwrap();
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        let now = 100 * DAY;
+        let about = "gh:acme/app/pull/1";
+        store
+            .append(note(&alice, &bob, "old", 1), now - 20 * DAY)
+            .unwrap();
+        assert_eq!(store.sweep(now, 7).unwrap(), 1);
+        assert!(store.thread(about, 0).unwrap().is_empty());
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("DROP TABLE participants", []).unwrap();
+        }
+        drop(store);
+        let store = Store::open(&dir).unwrap();
+        assert!(matches!(
+            store.access(about, &alice.addr()).unwrap(),
+            ThreadAccess::NotParticipant
+        ));
+        assert!(matches!(
+            store.access(about, &bob.addr()).unwrap(),
+            ThreadAccess::NotParticipant
+        ));
+        assert!(matches!(
+            store.access("gh:never", &alice.addr()).unwrap(),
+            ThreadAccess::Empty
         ));
     }
 

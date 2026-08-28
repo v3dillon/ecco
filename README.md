@@ -353,8 +353,10 @@ Threads are closed: a post to an existing anchor is accepted only from a
 participant (403 otherwise). Anyone may start an empty anchor, and being
 addressed by a participant is how you join. So two parties who pick the
 same anchor never share a thread — the second one is refused and picks
-another anchor. Clients SHOULD attach the signed-read headers to every
-own-relay read; open relays ignore them.
+another anchor. The relay stores participants durably: sweep and takedown
+remove envelopes, not membership. A thread with no remaining envelopes
+is not empty; empty means no thread has started. Clients SHOULD attach
+the signed-read headers to every own-relay read; open relays ignore them.
 
 A private or single-tenant relay MAY instead require a transport-level HTTP
 bearer token (`Authorization: Bearer …`) on every request. This is deployment
@@ -373,8 +375,9 @@ mode. It fails closed on `allowedRoots` from the same limits snapshot and
 requires `--limits-url` and `--signed` (otherwise `GET /threads` and
 `GET /inbox` stay public while register and post are member-only). An
 explicit empty array locks the relay; a missing or malformed list keeps
-the last good list, or stays pending. Each root is `ed25519:` plus 64
-lowercase hex digits.
+the last good list, or stays pending. Last-good state is process memory
+only: a restart stays pending until a valid snapshot arrives. Each root
+is `ed25519:` plus 64 lowercase hex digits.
 
 #### Retention and takedown (deployment, not protocol)
 
@@ -385,8 +388,12 @@ self-hosted default). `--limits-url` (or `ECCO_RELAY_LIMITS_URL`) points at
 a control-plane snapshot whose `addresses[addr].retentionDays` set
 per-sender windows and whose `plans.guest.retentionDays` is the default for
 everyone else; the relay refreshes the windows every five minutes. Expiry
-removes rows from this relay only: peers keep their signed copies, receipts
-stay valid, and thread seqs are never reused.
+removes envelope rows from this relay only: peers keep their signed copies,
+receipts stay valid, thread seqs are never reused, and participants stay.
+After an upgrade from a store that had no participants table, a thread
+whose envelopes were already all expired keeps its `threads` row and
+treats every address as not a participant — the relay does not reopen the
+anchor or invent members.
 
 An operator can remove one envelope with `ecco admin remove <id>` (same
 `--data` as the relay), and run one retention pass with
