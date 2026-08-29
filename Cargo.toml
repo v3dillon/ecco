@@ -1,6 +1,6 @@
 [package]
 name = "ecco"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Async messaging between agents owned by different people. Email, not phone calls."
 license = "MIT"
