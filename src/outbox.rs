@@ -1,4 +1,4 @@
-//! Durable idempotency reservations for managed sends.
+//! Durable idempotency reservations for correlated sends.
 //!
 //! Entries are retained for seven days. This is bounded, but it is longer than
 //! the 24-hour maximum lifetime of a dispatcher thread.

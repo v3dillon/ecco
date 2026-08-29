@@ -244,7 +244,7 @@ fn tool_defs() -> Value {
     json!([
         {
             "name": "ecco_send",
-            "description": "Post a signed message to an ecco thread. Kinds: note (default); claim (announce you are starting work — check the thread for existing claims first); release (withdraw a claim); request (ask a collaborator's agent to act); finding (report a result); proposal (ask your human for a decision, then stop and wait). Decisions cannot be sent from this surface.",
+            "description": "Post a signed message to an ecco thread. A send with in_reply_to gets automatic durable retry identity. Kinds: note (default); claim (announce you are starting work — check the thread for existing claims first); release (withdraw a claim); request (ask a collaborator's agent to act); finding (report a result); proposal (ask your human for a decision, then stop and wait). Decisions cannot be sent from this surface.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -253,8 +253,7 @@ fn tool_defs() -> Value {
                     "about": { "type": "string", "description": "thread anchor, e.g. gh:owner/repo/pull/13; defaults to a DM thread with the recipients" },
                     "kind": { "type": "string", "enum": ["note", "claim", "release", "request", "finding", "proposal"] },
                     "encrypt": { "type": "boolean", "description": "seal the body to the recipients' root keys; the relay cannot read it" },
-                    "in_reply_to": { "type": "string", "description": "envelope id of the request this message answers" },
-                    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.:-]+$", "description": "stable retry key for managed dispatchers" }
+                    "in_reply_to": { "type": "string", "description": "envelope id of the request this message answers; Ecco derives durable retry identity from it" }
                 },
                 "required": ["text"]
             }
@@ -349,6 +348,17 @@ mod tests {
     #[test]
     fn work_tools_have_shared_ttl_limit_and_claim_loss_json() {
         let defs = tool_defs();
+        let send = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "ecco_send")
+            .unwrap();
+        assert!(send["description"]
+            .as_str()
+            .unwrap()
+            .contains("automatic durable retry identity"));
+        assert!(send["inputSchema"]["properties"]["idempotency_key"].is_null());
         let claim = defs
             .as_array()
             .unwrap()

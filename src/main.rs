@@ -17,6 +17,9 @@ use client::Stored;
 use envelope::Envelope;
 use identity::Identity;
 
+const DURABLE_CORRELATED_SEND_CAPABILITY: &str = "durable-correlated-send-v1";
+const CAPABILITIES: &[&str] = &[DURABLE_CORRELATED_SEND_CAPABILITY];
+
 #[derive(Parser)]
 #[command(
     name = "ecco",
@@ -90,8 +93,8 @@ enum Cmd {
         /// Envelope id of the request this message answers
         #[arg(long)]
         in_reply_to: Option<String>,
-        /// Stable retry key for managed dispatchers (1-128 safe ASCII bytes)
-        #[arg(long, value_parser = outbox::parse_key)]
+        /// Legacy explicit retry key. Correlated sends derive this automatically
+        #[arg(long, hide = true, value_parser = outbox::parse_key)]
         idempotency_key: Option<String>,
     },
     /// Coordinate exclusive work on a generic thread anchor
@@ -541,17 +544,43 @@ fn post_idempotent(
     input: SendInput,
     idempotency_key: Option<&str>,
 ) -> Result<client::Receipt, String> {
-    if let Some(key) = idempotency_key {
-        let logical = serde_json::to_vec(&json!({
-            "from": id.addr(), "send": input
-        }))
-        .expect("logical send input is serializable");
-        let input_hash = blake3::hash(&logical).to_hex().to_string();
-        let env = outbox::reserve(home, key, &input_hash, || build_envelope(home, id, input))?;
-        return client::send(id, &env);
-    }
-    let env = build_envelope(home, id, input)?;
+    let env = prepare_envelope(home, id, input, idempotency_key)?;
     client::send(id, &env)
+}
+
+fn prepare_envelope(
+    home: &Path,
+    id: &Identity,
+    input: SendInput,
+    idempotency_key: Option<&str>,
+) -> Result<Envelope, String> {
+    let key = idempotency_key
+        .map(str::to_owned)
+        .or_else(|| automatic_idempotency_key(id, &input));
+    if let Some(key) = key {
+        let logical = serde_json::to_vec(&json!({ "from": id.addr(), "send": &input }))
+            .expect("logical send input is serializable");
+        let input_hash = blake3::hash(&logical).to_hex().to_string();
+        let env = outbox::reserve(home, &key, &input_hash, || build_envelope(home, id, input))?;
+        return Ok(env);
+    }
+    build_envelope(home, id, input)
+}
+
+/// A request envelope ID is the durable operation boundary. One sender can
+/// produce one message of each kind in reply to that request. The full input
+/// hash remains in the outbox, so a changed retry with the same operation key
+/// fails instead of creating a second envelope.
+fn automatic_idempotency_key(id: &Identity, input: &SendInput) -> Option<String> {
+    let in_reply_to = input.body.get("in_reply_to")?.as_str()?;
+    let operation = serde_json::to_vec(&json!({
+        "schema": DURABLE_CORRELATED_SEND_CAPABILITY,
+        "from": id.addr(),
+        "kind": &input.kind,
+        "in_reply_to": in_reply_to,
+    }))
+    .expect("automatic send operation is serializable");
+    Some(format!("auto:{}", blake3::hash(&operation).to_hex()))
 }
 
 fn post_envelope(
@@ -644,6 +673,7 @@ fn message_body(text: String, in_reply_to: Option<String>) -> Value {
 #[derive(Serialize)]
 struct LocalStatus {
     schema: &'static str,
+    capabilities: &'static [&'static str],
     ready: bool,
     identity: LocalIdentityStatus,
 }
@@ -679,6 +709,7 @@ fn local_status(home: &Path) -> LocalStatus {
     };
     LocalStatus {
         schema: "ecco-status-v1",
+        capabilities: CAPABILITIES,
         ready: identity.state == "ready",
         identity,
     }
@@ -845,6 +876,10 @@ mod tests {
         let home = temp_home();
         let missing = serde_json::to_value(local_status(&home)).unwrap();
         assert_eq!(missing["schema"], "ecco-status-v1");
+        assert_eq!(
+            missing["capabilities"],
+            json!([DURABLE_CORRELATED_SEND_CAPABILITY])
+        );
         assert_eq!(missing["ready"], false);
         assert_eq!(missing["identity"]["state"], "missing");
 
@@ -875,5 +910,56 @@ mod tests {
             json!({"text":"done","in_reply_to":"b3:req"})
         );
         assert_eq!(message_body("done".into(), None), json!({"text":"done"}));
+    }
+
+    #[test]
+    fn correlated_sends_derive_stable_private_retry_keys() {
+        let id = Identity::generate("alice", "https://relay.example", None);
+        let input = |kind: &str, text: &str| SendInput {
+            about: "topic".into(),
+            kind: kind.into(),
+            body: message_body(text.into(), Some("b3:request".into())),
+            to: vec!["bob@relay.example".into()],
+            encrypt: false,
+        };
+        let first = automatic_idempotency_key(&id, &input("finding", "done")).unwrap();
+        let retry = automatic_idempotency_key(&id, &input("finding", "done")).unwrap();
+        let changed_text = automatic_idempotency_key(&id, &input("finding", "changed")).unwrap();
+        let follow_up = automatic_idempotency_key(&id, &input("request", "next")).unwrap();
+        assert_eq!(first, retry);
+        assert_eq!(first, changed_text);
+        assert_ne!(first, follow_up);
+        assert!(automatic_idempotency_key(
+            &id,
+            &SendInput {
+                about: "topic".into(),
+                kind: "note".into(),
+                body: message_body("ordinary".into(), None),
+                to: vec![],
+                encrypt: false,
+            }
+        )
+        .is_none());
+        outbox::validate_key(&first).unwrap();
+    }
+
+    #[test]
+    fn correlated_sends_reserve_one_exact_envelope_automatically() {
+        let home = temp_home();
+        let id = Identity::generate("alice", "http://127.0.0.1:1", None);
+        let input = |text: &str| SendInput {
+            about: "topic".into(),
+            kind: "finding".into(),
+            body: message_body(text.into(), Some("b3:request".into())),
+            to: vec![],
+            encrypt: false,
+        };
+        let first = prepare_envelope(&home, &id, input("done"), None).unwrap();
+        let retry = prepare_envelope(&home, &id, input("done"), None).unwrap();
+        assert_eq!(first.id, retry.id);
+        assert!(prepare_envelope(&home, &id, input("changed"), None)
+            .unwrap_err()
+            .contains("different send input"));
+        let _ = std::fs::remove_dir_all(home);
     }
 }
