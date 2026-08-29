@@ -131,7 +131,8 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
                 .get("encrypt")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            crate::post(home, &id, about, kind, json!({ "text": text }), to, encrypt)
+            let body = crate::message_body(text, str_arg("in_reply_to"));
+            crate::post(home, &id, about, kind, body, to, encrypt)
                 .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
         }
         "ecco_inbox" => {
@@ -147,9 +148,10 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
                     crate::save_cursor(home, max)?;
                 }
             }
-            let (visible, held) = crate::partition(home, &id, msgs);
+            let (visible, held, _) = crate::partition(home, &id, msgs);
             let mut out = serde_json::Map::new();
-            let decrypted: Vec<Value> = visible.iter().map(|s| stored_json(&id, s)).collect();
+            let decrypted: Vec<Value> =
+                visible.iter().map(|s| crate::stored_json(&id, s)).collect();
             out.insert("msgs".into(), json!(decrypted));
             if !held.is_empty() {
                 // Sender + kind only — held content never reaches the agent surface.
@@ -176,7 +178,7 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
                 .filter_map(|s| match identity::standing(&contacts, &me, &s.env.from) {
                     identity::Standing::Blocked => None,
                     st => {
-                        let mut v = stored_json(&id, s);
+                        let mut v = crate::stored_json(&id, s);
                         if st == identity::Standing::Unknown {
                             v["untrusted_sender"] = json!(true);
                         }
@@ -188,7 +190,8 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
         }
         "ecco_pending" => {
             let pending = crate::pending_proposals(home, &id)?;
-            let decrypted: Vec<Value> = pending.iter().map(|s| stored_json(&id, s)).collect();
+            let decrypted: Vec<Value> =
+                pending.iter().map(|s| crate::stored_json(&id, s)).collect();
             Ok(pretty(&json!(decrypted)))
         }
         "ecco_work_status" => {
@@ -251,7 +254,8 @@ fn tool_defs() -> Value {
                     "to": { "type": "array", "items": { "type": "string" }, "description": "recipient addresses, name@authority" },
                     "about": { "type": "string", "description": "thread anchor, e.g. gh:owner/repo/pull/13; defaults to a DM thread with the recipients" },
                     "kind": { "type": "string", "enum": ["note", "claim", "release", "request", "finding", "proposal"] },
-                    "encrypt": { "type": "boolean", "description": "seal the body to the recipients' root keys; the relay cannot read it" }
+                    "encrypt": { "type": "boolean", "description": "seal the body to the recipients' root keys; the relay cannot read it" },
+                    "in_reply_to": { "type": "string", "description": "envelope id of the request this message answers" }
                 },
                 "required": ["text"]
             }
@@ -325,19 +329,6 @@ fn tool_defs() -> Value {
             }
         }
     ])
-}
-
-/// Serialize a stored message, decrypting sealed bodies for the agent surface.
-/// A decrypted body is marked "encrypted": true — the signature in the raw
-/// envelope covers the ciphertext, not this client-side plaintext view.
-fn stored_json(id: &Identity, s: &client::Stored) -> Value {
-    let mut v = serde_json::to_value(s).unwrap();
-    let (body, encrypted) = crate::resolved_body(id, &s.env);
-    if encrypted {
-        v["env"]["body"] = body;
-        v["env"]["encrypted"] = json!(true);
-    }
-    v
 }
 
 fn pretty(v: &Value) -> String {

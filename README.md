@@ -120,6 +120,37 @@ which exposes `ecco_send`, `ecco_inbox`, `ecco_thread`, `ecco_pending`,
 `ecco_work_release`. The MCP surface cannot sign decisions —
 `ecco approve` stays a human command in a terminal.
 
+### Machine-readable CLI
+
+Automation can inspect local setup without making a network request:
+
+```sh
+ecco status --json
+```
+
+This prints an `ecco-status-v1` object with `ready` and an `identity` object.
+Identity `state` is `missing`, `invalid`, or `ready`; `address` and `relay` are
+non-null only for a ready identity. The output never contains secret keys or a
+relay token. `ready` means that the local identity file is valid. It does not
+test relay reachability or registration.
+
+Long-running clients can keep their own cursor and use the relay long poll:
+
+```sh
+ecco inbox --json --since 0 --wait 25
+ecco log gh:acme/app/pull/13 --json
+ecco send --to bob@localhost:4200 --about gh:acme/app/pull/13 \
+  --kind finding --in-reply-to b3:<request-id> "review complete"
+```
+
+The JSON inbox object has `cursor`, `messages`, `held`, and `rejected` keys.
+`cursor` is a decimal string. Trusted and self messages contain the stored
+envelope, with a locally decrypted body when possible. Held entries contain
+only sender, kind, and count. Rejected entries contain only an envelope id and
+a reason. JSON log output has the same `messages`, `held`, and `rejected`
+groups. The optional `in_reply_to` value is part of the signed message body;
+the `ecco_send` MCP tool accepts the same field.
+
 ## Protocol
 
 The human stays in the loop cryptographically, not by promise. Three design
