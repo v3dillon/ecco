@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::envelope::{self, encode_key, Envelope};
 use crate::identity::{addr_relay_url, request_signing_bytes, Identity, Profile};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stored {
     pub gseq: u64,
     pub tseq: u64,
@@ -128,7 +128,7 @@ pub fn inbox(id: &Identity, since: u64, wait: u64) -> Result<Vec<Stored>, String
 }
 
 fn fetch(id: &Identity, path: &str, wait: u64) -> Result<Vec<Stored>, String> {
-    let raw = get_signed(id, path, wait + 10)?;
+    let raw = get_signed(id, path, wait.saturating_add(10))?;
     let resp: MsgsResponse = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     Ok(resp.msgs)
 }

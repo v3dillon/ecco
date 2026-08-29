@@ -1,3 +1,4 @@
+mod agent_surface;
 mod client;
 mod coordination;
 mod envelope;
@@ -7,7 +8,8 @@ mod relay;
 mod store;
 
 use clap::{Parser, Subcommand};
-use serde_json::json;
+use serde::Serialize;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 use client::Stored;
@@ -84,6 +86,9 @@ enum Cmd {
         /// Encrypt the body to the recipients' root keys
         #[arg(long, short = 'e')]
         encrypt: bool,
+        /// Envelope id of the request this message answers
+        #[arg(long)]
+        in_reply_to: Option<String>,
     },
     /// Coordinate exclusive work on a generic thread anchor
     Work {
@@ -97,6 +102,12 @@ enum Cmd {
         /// Only messages since the persisted cursor, then advance it (for agent session starts)
         #[arg(long)]
         new: bool,
+        /// Return a stable machine-readable batch
+        #[arg(long)]
+        json: bool,
+        /// Long-poll timeout in seconds
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
     },
     /// Follow your inbox (long-poll loop; resumes from the persisted cursor)
     Watch {
@@ -105,7 +116,12 @@ enum Cmd {
         since: Option<u64>,
     },
     /// Show a thread — the ledger for one artifact
-    Log { about: String },
+    Log {
+        about: String,
+        /// Return a stable machine-readable batch
+        #[arg(long)]
+        json: bool,
+    },
     /// Held first-contact messages awaiting your (human) review
     Requests,
     /// Approve a sender — their messages become visible to your agent
@@ -124,6 +140,12 @@ enum Cmd {
     Resolve { addr: String },
     /// Show your identity
     Whoami,
+    /// Inspect local identity readiness without contacting the relay
+    Status {
+        /// Return the ecco-status-v1 object
+        #[arg(long)]
+        json: bool,
+    },
     /// Revoke the agent key: publish a profile with no delegations. The name stays yours (root key)
     Deactivate,
 }
@@ -258,10 +280,12 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             about,
             kind,
             encrypt,
+            in_reply_to,
         } => {
             let id = Identity::load(home)?;
             let about = about.unwrap_or_else(|| dm_thread(&id.addr(), &to));
-            let receipt = post(home, &id, about, kind, json!({ "text": text }), to, encrypt)?;
+            let body = message_body(text, in_reply_to);
+            let receipt = post(home, &id, about, kind, body, to, encrypt)?;
             println!("{}", serde_json::to_string(&receipt).unwrap());
             Ok(())
         }
@@ -294,20 +318,33 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             println!("{}", serde_json::to_string(&value).unwrap());
             Ok(())
         }
-        Cmd::Inbox { since, new } => {
+        Cmd::Inbox {
+            since,
+            new,
+            json: as_json,
+            wait,
+        } => {
             let id = Identity::load(home)?;
             let start = if new { load_cursor(home) } else { since };
-            let msgs = client::inbox(&id, start, 0)?;
-            let max_gseq = msgs.iter().map(|s| s.gseq).max().unwrap_or(start);
-            let (visible, held) = partition(home, &id, msgs);
-            for s in &visible {
-                println!("{}", fmt(&id, s, false));
-            }
-            if !held.is_empty() {
-                eprintln!(
-                    "({} held from unknown senders — review with `ecco requests`)",
-                    held.len()
+            let msgs = client::inbox(&id, start, wait)?;
+            let max_gseq = agent_surface::next_cursor(start, &msgs);
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&agent_surface::inbox_json(home, &id, max_gseq, msgs))
+                        .unwrap()
                 );
+            } else {
+                let (visible, held, _) = agent_surface::partition(home, &id, msgs);
+                for s in &visible {
+                    println!("{}", fmt(&id, s, false));
+                }
+                if !held.is_empty() {
+                    eprintln!(
+                        "({} held from unknown senders — review with `ecco requests`)",
+                        held.len()
+                    );
+                }
             }
             if new {
                 save_cursor(home, max_gseq)?;
@@ -324,7 +361,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             loop {
                 let batch = client::inbox(&id, cursor, 25)?;
                 let max_gseq = batch.iter().map(|s| s.gseq).max();
-                let (visible, held) = partition(home, &id, batch);
+                let (visible, held, _) = agent_surface::partition(home, &id, batch);
                 for s in &visible {
                     println!("{}", fmt(&id, s, false));
                 }
@@ -340,16 +377,26 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                 }
             }
         }
-        Cmd::Log { about } => {
+        Cmd::Log {
+            about,
+            json: as_json,
+        } => {
             let id = Identity::load(home)?;
             let mut msgs = client::thread(&id, &about, 0, 0)?;
             msgs.sort_by_key(|s| s.tseq);
-            let contacts = identity::contacts_load(home);
-            let me = id.addr();
-            for s in msgs {
-                match identity::standing(&contacts, &me, &s.env.from) {
-                    identity::Standing::Blocked => {}
-                    st => println!("{}", fmt(&id, &s, st == identity::Standing::Unknown)),
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&agent_surface::log_json(home, &id, msgs)).unwrap()
+                );
+            } else {
+                let contacts = identity::contacts_load(home);
+                let me = id.addr();
+                for s in msgs {
+                    match identity::standing(&contacts, &me, &s.env.from) {
+                        identity::Standing::Blocked => {}
+                        st => println!("{}", fmt(&id, &s, st == identity::Standing::Unknown)),
+                    }
                 }
             }
             Ok(())
@@ -357,7 +404,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
         Cmd::Requests => {
             let id = Identity::load(home)?;
             let msgs = client::inbox(&id, 0, 0)?;
-            let (_, held) = partition(home, &id, msgs);
+            let (_, held, _) = agent_surface::partition(home, &id, msgs);
             if held.is_empty() {
                 println!("no pending contact requests");
                 return Ok(());
@@ -416,6 +463,10 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                 "agent: {}",
                 envelope::encode_key(&id.agent_key().verifying_key())
             );
+            Ok(())
+        }
+        Cmd::Status { json: _ } => {
+            println!("{}", serde_json::to_string(&local_status(home)).unwrap());
             Ok(())
         }
         Cmd::Deactivate => {
@@ -506,19 +557,54 @@ fn post_envelope(
     Ok((env, receipt))
 }
 
-/// Split inbox messages by sender standing: (visible, held). Blocked are dropped.
-fn partition(home: &Path, id: &Identity, msgs: Vec<Stored>) -> (Vec<Stored>, Vec<Stored>) {
-    let contacts = identity::contacts_load(home);
-    let me = id.addr();
-    let (mut visible, mut held) = (Vec::new(), Vec::new());
-    for s in msgs {
-        match identity::standing(&contacts, &me, &s.env.from) {
-            identity::Standing::Trusted => visible.push(s),
-            identity::Standing::Unknown => held.push(s),
-            identity::Standing::Blocked => {}
-        }
+fn message_body(text: String, in_reply_to: Option<String>) -> Value {
+    match in_reply_to {
+        Some(id) => json!({ "text": text, "in_reply_to": id }),
+        None => json!({ "text": text }),
     }
-    (visible, held)
+}
+
+#[derive(Serialize)]
+struct LocalStatus {
+    schema: &'static str,
+    ready: bool,
+    identity: LocalIdentityStatus,
+}
+
+#[derive(Serialize)]
+struct LocalIdentityStatus {
+    state: &'static str,
+    address: Option<String>,
+    relay: Option<String>,
+}
+
+fn local_status(home: &Path) -> LocalStatus {
+    let path = home.join("identity.json");
+    let identity = if !path.exists() {
+        LocalIdentityStatus {
+            state: "missing",
+            address: None,
+            relay: None,
+        }
+    } else {
+        match Identity::load(home) {
+            Ok(id) => LocalIdentityStatus {
+                state: "ready",
+                address: Some(id.addr()),
+                relay: Some(id.relay),
+            },
+            Err(_) => LocalIdentityStatus {
+                state: "invalid",
+                address: None,
+                relay: None,
+            },
+        }
+    };
+    LocalStatus {
+        schema: "ecco-status-v1",
+        ready: identity.state == "ready",
+        identity,
+    }
 }
 
 /// A decision is the human ruling on a proposal: signed by the root key, never the agent's.
@@ -550,7 +636,7 @@ fn decide(home: &Path, target: &str, verb: &str) -> Result<(), String> {
 /// Proposals from trusted senders whose thread does not yet contain a decision.
 fn pending_proposals(home: &Path, id: &Identity) -> Result<Vec<Stored>, String> {
     let msgs = client::inbox(id, 0, 0)?;
-    let (visible, _) = partition(home, id, msgs);
+    let (visible, _, _) = agent_surface::partition(home, id, msgs);
     let mut pending = Vec::new();
     for s in visible.into_iter().filter(|s| s.env.kind == "proposal") {
         let decided = client::thread(id, &s.env.about, 0, 0)?.iter().any(|t| {
@@ -598,20 +684,8 @@ fn token_for<'a>(id: &'a Identity, addr: &str) -> Option<&'a str> {
         .and(id.token.as_deref())
 }
 
-/// Decrypt a sealed body for display; (body, was_encrypted).
-fn resolved_body(id: &Identity, env: &Envelope) -> (serde_json::Value, bool) {
-    if envelope::is_encrypted(&env.body) {
-        match envelope::open_body(&env.body, &id.addr(), &id.root_key()) {
-            Some(v) => (v, true),
-            None => (json!({ "text": "<encrypted: not sealed to you>" }), true),
-        }
-    } else {
-        (env.body.clone(), false)
-    }
-}
-
 fn fmt(id: &Identity, s: &Stored, untrusted: bool) -> String {
-    let (body, encrypted) = resolved_body(id, &s.env);
+    let (body, encrypted) = agent_surface::resolved_body(id, s);
     let text = body.get("text").and_then(|t| t.as_str()).unwrap_or("");
     let tag = if untrusted { "[untrusted] " } else { "" };
     let lock = if encrypted { "[enc] " } else { "" };
@@ -629,4 +703,91 @@ fn fmt(id: &Identity, s: &Stored, untrusted: bool) -> String {
 
 fn short(id: &str) -> String {
     id.trim_start_matches("b3:").chars().take(8).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_home() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ecco-main-test-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn cli_accepts_machine_message_contract_flags() {
+        let cli = Cli::try_parse_from(["ecco", "inbox", "--json", "--since", "9", "--wait", "25"])
+            .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Inbox {
+                since: 9,
+                new: false,
+                json: true,
+                wait: 25
+            }
+        ));
+        let cli =
+            Cli::try_parse_from(["ecco", "send", "done", "--in-reply-to", "b3:request"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Send {
+                in_reply_to: Some(ref id),
+                ..
+            } if id == "b3:request"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ecco", "log", "topic", "--json"])
+                .unwrap()
+                .cmd,
+            Cmd::Log { json: true, .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ecco", "status", "--json"])
+                .unwrap()
+                .cmd,
+            Cmd::Status { json: true }
+        ));
+    }
+
+    #[test]
+    fn status_is_local_stable_and_redacted() {
+        let home = temp_home();
+        let missing = serde_json::to_value(local_status(&home)).unwrap();
+        assert_eq!(missing["schema"], "ecco-status-v1");
+        assert_eq!(missing["ready"], false);
+        assert_eq!(missing["identity"]["state"], "missing");
+
+        let id = Identity::generate(
+            "alice",
+            "https://relay.example",
+            Some("do-not-print".into()),
+        );
+        id.save(&home).unwrap();
+        let ready = serde_json::to_value(local_status(&home)).unwrap();
+        assert_eq!(ready["ready"], true);
+        assert_eq!(ready["identity"]["address"], "alice@relay.example");
+        let output = ready.to_string();
+        assert!(!output.contains("do-not-print"));
+        assert!(!output.contains(&id.root_secret));
+        assert!(!output.contains(&id.agent_secret));
+
+        std::fs::write(home.join("identity.json"), "{bad").unwrap();
+        let invalid = serde_json::to_value(local_status(&home)).unwrap();
+        assert_eq!(invalid["identity"]["state"], "invalid");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn reply_field_is_optional() {
+        assert_eq!(
+            message_body("done".into(), Some("b3:req".into())),
+            json!({"text":"done","in_reply_to":"b3:req"})
+        );
+        assert_eq!(message_body("done".into(), None), json!({"text":"done"}));
+    }
 }

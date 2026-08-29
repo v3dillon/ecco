@@ -285,8 +285,19 @@ impl Identity {
     pub fn load(home: &Path) -> Result<Identity, String> {
         let raw = fs::read_to_string(home.join("identity.json"))
             .map_err(|_| format!("no identity at {} — run `ecco init` first", home.display()))?;
-        serde_json::from_str(&raw).map_err(|e| e.to_string())
+        let identity: Identity = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        validate_secret("root_secret", &identity.root_secret)?;
+        validate_secret("agent_secret", &identity.agent_secret)?;
+        Ok(identity)
     }
+}
+
+fn validate_secret(field: &str, secret: &str) -> Result<(), String> {
+    let bytes = hex::decode(secret).map_err(|_| format!("{field} is not valid hex"))?;
+    if bytes.len() != 32 {
+        return Err(format!("{field} must be a 32-byte secret"));
+    }
+    Ok(())
 }
 
 fn signing_key(secret_hex: &str) -> SigningKey {
@@ -586,5 +597,21 @@ mod tests {
             .expect("corrupt identity must fail");
         assert!(err.contains("not overwritten"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{not-json");
+    }
+
+    #[test]
+    fn load_rejects_malformed_secrets_before_key_use() {
+        let home = temp_home();
+        let mut id = Identity::generate("alice", "http://localhost:4200", None);
+        id.root_secret = "not-hex".into();
+        id.save(&home).unwrap();
+        assert!(Identity::load(&home).err().unwrap().contains("root_secret"));
+
+        id.root_secret = "00".repeat(31);
+        id.save(&home).unwrap();
+        assert!(Identity::load(&home)
+            .err()
+            .unwrap()
+            .contains("32-byte secret"));
     }
 }
