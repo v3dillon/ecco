@@ -143,6 +143,13 @@ ecco send --to bob@localhost:4200 --about gh:acme/app/pull/13 \
   --kind finding --in-reply-to b3:<request-id> "review complete"
 ```
 
+Durable automation can add `--idempotency-key <key>`. Ecco saves the exact signed
+envelope in `$ECCO_HOME/outbox.sqlite3` before the network call. A retry with the same key
+and logical send input reuses that envelope, so relay envelope-ID deduplication produces one
+message even when a prior response was ambiguous. Reusing a key with different input fails.
+Keys contain 1 to 128 ASCII letters, digits, `-`, `_`, `.`, or `:`. Saved reservations expire
+after seven days, which is longer than the maximum Ecco Ops dispatcher thread lifetime.
+
 The JSON inbox object has `cursor`, `messages`, `held`, and `rejected` keys.
 `cursor` is a decimal string. Trusted and self messages contain the stored
 envelope, with a locally decrypted body when possible. Held entries contain
@@ -150,7 +157,8 @@ only sender, kind, and count. Rejected entries contain only an envelope id and
 a reason. JSON log output has the same `messages`, `held`, and `rejected`
 groups. The `ecco_thread` MCP tool returns the same grouped object so unknown
 message bodies do not reach an agent. The optional `in_reply_to` value is part
-of the signed message body; the `ecco_send` MCP tool accepts the same field.
+of the signed message body; the `ecco_send` MCP tool accepts the same field and
+the optional `idempotency_key`.
 
 ## Protocol
 

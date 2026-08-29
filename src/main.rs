@@ -4,6 +4,7 @@ mod coordination;
 mod envelope;
 mod identity;
 mod mcp;
+mod outbox;
 mod relay;
 mod store;
 
@@ -89,6 +90,9 @@ enum Cmd {
         /// Envelope id of the request this message answers
         #[arg(long)]
         in_reply_to: Option<String>,
+        /// Stable retry key for managed dispatchers (1-128 safe ASCII bytes)
+        #[arg(long, value_parser = outbox::parse_key)]
+        idempotency_key: Option<String>,
     },
     /// Coordinate exclusive work on a generic thread anchor
     Work {
@@ -281,11 +285,23 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             kind,
             encrypt,
             in_reply_to,
+            idempotency_key,
         } => {
             let id = Identity::load(home)?;
             let about = about.unwrap_or_else(|| dm_thread(&id.addr(), &to));
             let body = message_body(text, in_reply_to);
-            let receipt = post(home, &id, about, kind, body, to, encrypt)?;
+            let receipt = post_idempotent(
+                home,
+                &id,
+                SendInput {
+                    about,
+                    kind,
+                    body,
+                    to,
+                    encrypt,
+                },
+                idempotency_key.as_deref(),
+            )?;
             println!("{}", serde_json::to_string(&receipt).unwrap());
             Ok(())
         }
@@ -496,7 +512,46 @@ fn post(
     to: Vec<String>,
     encrypt: bool,
 ) -> Result<client::Receipt, String> {
-    post_envelope(home, id, about, kind, body, to, encrypt).map(|(_, receipt)| receipt)
+    post_idempotent(
+        home,
+        id,
+        SendInput {
+            about,
+            kind,
+            body,
+            to,
+            encrypt,
+        },
+        None,
+    )
+}
+
+#[derive(Serialize)]
+struct SendInput {
+    about: String,
+    kind: String,
+    body: Value,
+    to: Vec<String>,
+    encrypt: bool,
+}
+
+fn post_idempotent(
+    home: &Path,
+    id: &Identity,
+    input: SendInput,
+    idempotency_key: Option<&str>,
+) -> Result<client::Receipt, String> {
+    if let Some(key) = idempotency_key {
+        let logical = serde_json::to_vec(&json!({
+            "from": id.addr(), "send": input
+        }))
+        .expect("logical send input is serializable");
+        let input_hash = blake3::hash(&logical).to_hex().to_string();
+        let env = outbox::reserve(home, key, &input_hash, || build_envelope(home, id, input))?;
+        return client::send(id, &env);
+    }
+    let env = build_envelope(home, id, input)?;
+    client::send(id, &env)
 }
 
 fn post_envelope(
@@ -508,6 +563,29 @@ fn post_envelope(
     to: Vec<String>,
     encrypt: bool,
 ) -> Result<(Envelope, client::Receipt), String> {
+    let env = build_envelope(
+        home,
+        id,
+        SendInput {
+            about,
+            kind,
+            body,
+            to,
+            encrypt,
+        },
+    )?;
+    let receipt = client::send(id, &env)?;
+    Ok((env, receipt))
+}
+
+fn build_envelope(home: &Path, id: &Identity, input: SendInput) -> Result<Envelope, String> {
+    let SendInput {
+        about,
+        kind,
+        body,
+        to,
+        encrypt,
+    } = input;
     let contacts = identity::contacts_load(home);
     for addr in &to {
         if identity::standing(&contacts, &id.addr(), addr) == identity::Standing::Unknown {
@@ -553,8 +631,7 @@ fn post_envelope(
         envelope::now(),
         &key,
     );
-    let receipt = client::send(id, &env)?;
-    Ok((env, receipt))
+    Ok(env)
 }
 
 fn message_body(text: String, in_reply_to: Option<String>) -> Value {
@@ -740,6 +817,15 @@ mod tests {
                 ..
             } if id == "b3:request"
         ));
+        let cli = Cli::try_parse_from(["ecco", "send", "done", "--idempotency-key", "dispatch:42"])
+            .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Send { idempotency_key: Some(ref key), .. } if key == "dispatch:42"
+        ));
+        assert!(
+            Cli::try_parse_from(["ecco", "send", "done", "--idempotency-key", "bad key",]).is_err()
+        );
         assert!(matches!(
             Cli::try_parse_from(["ecco", "log", "topic", "--json"])
                 .unwrap()

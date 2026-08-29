@@ -132,8 +132,19 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let body = crate::message_body(text, str_arg("in_reply_to"));
-            crate::post(home, &id, about, kind, body, to, encrypt)
-                .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
+            crate::post_idempotent(
+                home,
+                &id,
+                crate::SendInput {
+                    about,
+                    kind,
+                    body,
+                    to,
+                    encrypt,
+                },
+                str_arg("idempotency_key").as_deref(),
+            )
+            .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
         }
         "ecco_inbox" => {
             let new = args.get("new").and_then(Value::as_bool).unwrap_or(false);
@@ -242,7 +253,8 @@ fn tool_defs() -> Value {
                     "about": { "type": "string", "description": "thread anchor, e.g. gh:owner/repo/pull/13; defaults to a DM thread with the recipients" },
                     "kind": { "type": "string", "enum": ["note", "claim", "release", "request", "finding", "proposal"] },
                     "encrypt": { "type": "boolean", "description": "seal the body to the recipients' root keys; the relay cannot read it" },
-                    "in_reply_to": { "type": "string", "description": "envelope id of the request this message answers" }
+                    "in_reply_to": { "type": "string", "description": "envelope id of the request this message answers" },
+                    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_.:-]+$", "description": "stable retry key for managed dispatchers" }
                 },
                 "required": ["text"]
             }
