@@ -1,3 +1,4 @@
+mod agent_surface;
 mod client;
 mod coordination;
 mod envelope;
@@ -9,7 +10,6 @@ mod store;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use client::Stored;
@@ -327,15 +327,15 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             let id = Identity::load(home)?;
             let start = if new { load_cursor(home) } else { since };
             let msgs = client::inbox(&id, start, wait)?;
-            let max_gseq = next_cursor(start, &msgs);
-            let (visible, held, rejected) = partition(home, &id, msgs);
+            let max_gseq = agent_surface::next_cursor(start, &msgs);
             if as_json {
                 println!(
                     "{}",
-                    serde_json::to_string(&json_batch(&id, max_gseq, &visible, &held, &rejected))
+                    serde_json::to_string(&agent_surface::inbox_json(home, &id, max_gseq, msgs))
                         .unwrap()
                 );
             } else {
+                let (visible, held, _) = agent_surface::partition(home, &id, msgs);
                 for s in &visible {
                     println!("{}", fmt(&id, s, false));
                 }
@@ -361,7 +361,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             loop {
                 let batch = client::inbox(&id, cursor, 25)?;
                 let max_gseq = batch.iter().map(|s| s.gseq).max();
-                let (visible, held, _) = partition(home, &id, batch);
+                let (visible, held, _) = agent_surface::partition(home, &id, batch);
                 for s in &visible {
                     println!("{}", fmt(&id, s, false));
                 }
@@ -385,9 +385,10 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             let mut msgs = client::thread(&id, &about, 0, 0)?;
             msgs.sort_by_key(|s| s.tseq);
             if as_json {
-                let (visible, held, rejected) = partition(home, &id, msgs);
-                let value = json_log(&id, &visible, &held, &rejected);
-                println!("{}", serde_json::to_string(&value).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string(&agent_surface::log_json(home, &id, msgs)).unwrap()
+                );
             } else {
                 let contacts = identity::contacts_load(home);
                 let me = id.addr();
@@ -403,7 +404,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
         Cmd::Requests => {
             let id = Identity::load(home)?;
             let msgs = client::inbox(&id, 0, 0)?;
-            let (_, held, _) = partition(home, &id, msgs);
+            let (_, held, _) = agent_surface::partition(home, &id, msgs);
             if held.is_empty() {
                 println!("no pending contact requests");
                 return Ok(());
@@ -606,75 +607,6 @@ fn local_status(home: &Path) -> LocalStatus {
     }
 }
 
-fn held_summaries(held: &[Stored]) -> Vec<Value> {
-    let mut counts = BTreeMap::<(&str, &str), usize>::new();
-    for stored in held {
-        *counts
-            .entry((&stored.env.from, &stored.env.kind))
-            .or_default() += 1;
-    }
-    counts
-        .into_iter()
-        .map(|((sender, kind), count)| json!({ "sender": sender, "kind": kind, "count": count }))
-        .collect()
-}
-
-fn rejected_summaries(rejected: &[Stored]) -> Vec<Value> {
-    rejected
-        .iter()
-        .map(|stored| json!({ "id": stored.env.id, "reason": "sender is blocked" }))
-        .collect()
-}
-
-fn json_batch(
-    id: &Identity,
-    cursor: u64,
-    visible: &[Stored],
-    held: &[Stored],
-    rejected: &[Stored],
-) -> Value {
-    json!({
-        "cursor": cursor.to_string(),
-        "messages": visible.iter().map(|s| stored_json(id, s)).collect::<Vec<_>>(),
-        "held": held_summaries(held),
-        "rejected": rejected_summaries(rejected),
-    })
-}
-
-fn json_log(id: &Identity, visible: &[Stored], held: &[Stored], rejected: &[Stored]) -> Value {
-    json!({
-        "messages": visible.iter().map(|s| stored_json(id, s)).collect::<Vec<_>>(),
-        "held": held_summaries(held),
-        "rejected": rejected_summaries(rejected),
-    })
-}
-
-fn next_cursor(start: u64, messages: &[Stored]) -> u64 {
-    messages
-        .iter()
-        .map(|stored| stored.gseq)
-        .fold(start, u64::max)
-}
-
-/// Split inbox messages by sender standing: (visible, held). Blocked are dropped.
-fn partition(
-    home: &Path,
-    id: &Identity,
-    msgs: Vec<Stored>,
-) -> (Vec<Stored>, Vec<Stored>, Vec<Stored>) {
-    let contacts = identity::contacts_load(home);
-    let me = id.addr();
-    let (mut visible, mut held, mut rejected) = (Vec::new(), Vec::new(), Vec::new());
-    for s in msgs {
-        match identity::standing(&contacts, &me, &s.env.from) {
-            identity::Standing::Trusted => visible.push(s),
-            identity::Standing::Unknown => held.push(s),
-            identity::Standing::Blocked => rejected.push(s),
-        }
-    }
-    (visible, held, rejected)
-}
-
 /// A decision is the human ruling on a proposal: signed by the root key, never the agent's.
 fn decide(home: &Path, target: &str, verb: &str) -> Result<(), String> {
     let id = Identity::load(home)?;
@@ -704,7 +636,7 @@ fn decide(home: &Path, target: &str, verb: &str) -> Result<(), String> {
 /// Proposals from trusted senders whose thread does not yet contain a decision.
 fn pending_proposals(home: &Path, id: &Identity) -> Result<Vec<Stored>, String> {
     let msgs = client::inbox(id, 0, 0)?;
-    let (visible, _, _) = partition(home, id, msgs);
+    let (visible, _, _) = agent_surface::partition(home, id, msgs);
     let mut pending = Vec::new();
     for s in visible.into_iter().filter(|s| s.env.kind == "proposal") {
         let decided = client::thread(id, &s.env.about, 0, 0)?.iter().any(|t| {
@@ -752,31 +684,8 @@ fn token_for<'a>(id: &'a Identity, addr: &str) -> Option<&'a str> {
         .and(id.token.as_deref())
 }
 
-/// Decrypt a sealed body for display; (body, was_encrypted).
-fn resolved_body(id: &Identity, env: &Envelope) -> (serde_json::Value, bool) {
-    if envelope::is_encrypted(&env.body) {
-        match envelope::open_body(&env.body, &id.addr(), &id.root_key()) {
-            Some(v) => (v, true),
-            None => (json!({ "text": "<encrypted: not sealed to you>" }), true),
-        }
-    } else {
-        (env.body.clone(), false)
-    }
-}
-
-/// Serialize a stored message and replace ciphertext with its local plaintext view.
-pub(crate) fn stored_json(id: &Identity, stored: &Stored) -> Value {
-    let mut value = serde_json::to_value(stored).unwrap();
-    let (body, encrypted) = resolved_body(id, &stored.env);
-    if encrypted {
-        value["env"]["body"] = body;
-        value["env"]["encrypted"] = json!(true);
-    }
-    value
-}
-
 fn fmt(id: &Identity, s: &Stored, untrusted: bool) -> String {
-    let (body, encrypted) = resolved_body(id, &s.env);
+    let (body, encrypted) = agent_surface::resolved_body(id, s);
     let text = body.get("text").and_then(|t| t.as_str()).unwrap_or("");
     let tag = if untrusted { "[untrusted] " } else { "" };
     let lock = if encrypted { "[enc] " } else { "" };
@@ -807,34 +716,6 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("ecco-main-test-{}-{nonce}", std::process::id()))
-    }
-
-    fn stored(id: &Identity, gseq: u64, from: &str, kind: &str, body: Value) -> Stored {
-        let key = if from == id.addr() {
-            id.agent_key()
-        } else {
-            Identity::generate(
-                from.split('@').next().unwrap(),
-                "http://localhost:4200",
-                None,
-            )
-            .agent_key()
-        };
-        Stored {
-            gseq,
-            tseq: gseq,
-            received_at: 1,
-            env: Envelope::seal(
-                "topic".into(),
-                body,
-                from.into(),
-                kind.into(),
-                vec![],
-                vec![id.addr()],
-                1,
-                &key,
-            ),
-        }
     }
 
     #[test]
@@ -902,77 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_partitions_summaries_and_keeps_cursor_monotonic() {
-        let home = temp_home();
-        let id = Identity::generate("me", "http://localhost:4200", None);
-        id.save(&home).unwrap();
-        identity::contacts_set(&home, "trusted@localhost:4200", "approved").unwrap();
-        identity::contacts_set(&home, "blocked@localhost:4200", "blocked").unwrap();
-        let messages = vec![
-            stored(
-                &id,
-                4,
-                "trusted@localhost:4200",
-                "request",
-                json!({"text":"ok"}),
-            ),
-            stored(
-                &id,
-                7,
-                "unknown@localhost:4200",
-                "request",
-                json!({"text":"secret"}),
-            ),
-            stored(
-                &id,
-                6,
-                "unknown@localhost:4200",
-                "request",
-                json!({"text":"secret2"}),
-            ),
-            stored(
-                &id,
-                5,
-                "blocked@localhost:4200",
-                "note",
-                json!({"text":"drop"}),
-            ),
-        ];
-        assert_eq!(next_cursor(9, &messages), 9);
-        assert_eq!(next_cursor(0, &messages), 7);
-        let (visible, held, rejected) = partition(&home, &id, messages);
-        let batch = json_batch(&id, 7, &visible, &held, &rejected);
-        assert_eq!(batch["cursor"], "7");
-        assert_eq!(batch["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            batch["held"],
-            json!([{"sender":"unknown@localhost:4200","kind":"request","count":2}])
-        );
-        assert_eq!(batch["rejected"].as_array().unwrap().len(), 1);
-        let log = json_log(&id, &visible, &held, &rejected);
-        assert_eq!(
-            log.as_object().unwrap().keys().cloned().collect::<Vec<_>>(),
-            ["held", "messages", "rejected"]
-        );
-        assert!(log.get("cursor").is_none());
-        let summaries = format!("{}{}", batch["held"], batch["rejected"]);
-        assert!(!summaries.contains("secret"));
-        assert!(!summaries.contains("drop"));
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn json_messages_decrypt_and_reply_field_is_optional() {
-        let id = Identity::generate("me", "http://localhost:4200", None);
-        let sealed = envelope::seal_body(
-            &json!({"text":"private"}),
-            &[(id.addr(), id.root_key().verifying_key())],
-        )
-        .unwrap();
-        let message = stored(&id, 1, &id.addr(), "finding", sealed);
-        let value = stored_json(&id, &message);
-        assert_eq!(value["env"]["body"]["text"], "private");
-        assert_eq!(value["env"]["encrypted"], true);
+    fn reply_field_is_optional() {
         assert_eq!(
             message_body("done".into(), Some("b3:req".into())),
             json!({"text":"done","in_reply_to":"b3:req"})

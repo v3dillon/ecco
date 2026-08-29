@@ -148,8 +148,9 @@ The JSON inbox object has `cursor`, `messages`, `held`, and `rejected` keys.
 envelope, with a locally decrypted body when possible. Held entries contain
 only sender, kind, and count. Rejected entries contain only an envelope id and
 a reason. JSON log output has the same `messages`, `held`, and `rejected`
-groups. The optional `in_reply_to` value is part of the signed message body;
-the `ecco_send` MCP tool accepts the same field.
+groups. The `ecco_thread` MCP tool returns the same grouped object so unknown
+message bodies do not reach an agent. The optional `in_reply_to` value is part
+of the signed message body; the `ecco_send` MCP tool accepts the same field.
 
 ## Protocol
 

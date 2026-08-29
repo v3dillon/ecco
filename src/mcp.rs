@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::client;
 use crate::envelope;
-use crate::identity::{self, Identity};
+use crate::identity::Identity;
 
 const TOOLS: &[&str] = &[
     "ecco_send",
@@ -144,14 +144,14 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
             };
             let msgs = client::inbox(&id, since, 0)?;
             if new {
-                if let Some(max) = msgs.iter().map(|s| s.gseq).max() {
-                    crate::save_cursor(home, max)?;
-                }
+                crate::save_cursor(home, crate::agent_surface::next_cursor(since, &msgs))?;
             }
-            let (visible, held, _) = crate::partition(home, &id, msgs);
+            let (visible, held, _) = crate::agent_surface::partition(home, &id, msgs);
             let mut out = serde_json::Map::new();
-            let decrypted: Vec<Value> =
-                visible.iter().map(|s| crate::stored_json(&id, s)).collect();
+            let decrypted: Vec<Value> = visible
+                .iter()
+                .map(|s| crate::agent_surface::stored_json(&id, s))
+                .collect();
             out.insert("msgs".into(), json!(decrypted));
             if !held.is_empty() {
                 // Sender + kind only — held content never reaches the agent surface.
@@ -171,27 +171,14 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
             let about = str_arg("about").ok_or("'about' is required")?;
             let mut msgs = client::thread(&id, &about, 0, 0)?;
             msgs.sort_by_key(|s| s.tseq);
-            let contacts = identity::contacts_load(home);
-            let me = id.addr();
-            let annotated: Vec<Value> = msgs
-                .iter()
-                .filter_map(|s| match identity::standing(&contacts, &me, &s.env.from) {
-                    identity::Standing::Blocked => None,
-                    st => {
-                        let mut v = crate::stored_json(&id, s);
-                        if st == identity::Standing::Unknown {
-                            v["untrusted_sender"] = json!(true);
-                        }
-                        Some(v)
-                    }
-                })
-                .collect();
-            Ok(pretty(&json!(annotated)))
+            Ok(pretty(&crate::agent_surface::log_json(home, &id, msgs)))
         }
         "ecco_pending" => {
             let pending = crate::pending_proposals(home, &id)?;
-            let decrypted: Vec<Value> =
-                pending.iter().map(|s| crate::stored_json(&id, s)).collect();
+            let decrypted: Vec<Value> = pending
+                .iter()
+                .map(|s| crate::agent_surface::stored_json(&id, s))
+                .collect();
             Ok(pretty(&json!(decrypted)))
         }
         "ecco_work_status" => {
@@ -273,7 +260,7 @@ fn tool_defs() -> Value {
         },
         {
             "name": "ecco_thread",
-            "description": "Full history of one thread — the signed ledger for an artifact — oldest first.",
+            "description": "Trusted history of one thread, oldest first. Unknown senders are reduced to sender and kind summaries for human review; blocked senders are reduced to rejected ids.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "about": { "type": "string" } },

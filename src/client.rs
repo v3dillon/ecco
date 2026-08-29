@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::envelope::{self, encode_key, Envelope};
 use crate::identity::{addr_relay_url, request_signing_bytes, Identity, Profile};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stored {
     pub gseq: u64,
     pub tseq: u64,
