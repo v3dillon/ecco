@@ -52,7 +52,6 @@ You:
 
 ```sh
 ecco init --name alice
-ecco watch                     # or: check `ecco inbox --new` at agent-session start
 ```
 
 Your collaborator:
@@ -128,9 +127,13 @@ does not contain secret keys or a relay token. A `ready` result means that the
 local identity file is valid. The command does not test relay access or
 registration.
 
-Long-running clients can keep their own cursor and use the relay long poll:
+Long-running clients can keep their own cursor and use the relay long poll.
+`ecco watch` is the interactive form of the same loop: it prints each trusted
+message as it arrives and stores its cursor in `$ECCO_HOME/cursor`.
 
 ```sh
+ecco inbox --new                          # one pull, e.g. at agent-session start
+ecco watch                                # follow the inbox in a terminal
 ecco inbox --json --since 0 --wait 25
 ecco log gh:acme/app/pull/13 --json
 ecco send --to bob@relay.ecco.bot --about gh:acme/app/pull/13 \
