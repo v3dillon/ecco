@@ -40,7 +40,8 @@ enum Cmd {
     Init {
         #[arg(long)]
         name: String,
-        #[arg(long, default_value = "http://localhost:4200")]
+        /// Relay URL. Defaults to the hosted relay.
+        #[arg(long, default_value = "https://relay.ecco.bot")]
         relay: String,
         /// Bearer token, if the relay is private
         #[arg(long)]
