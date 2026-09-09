@@ -138,7 +138,7 @@ fn post<T: for<'de> Deserialize<'de>>(
         .map_err(|e| format!("invalid dashboard response: {e}"))
 }
 
-pub fn connect(id: &Identity, api: &str, no_browser: bool) -> Result<(), String> {
+pub fn authorize(id: &Identity, api: &str, no_browser: bool) -> Result<(), String> {
     let api = origin(api)?;
     let started: Started = post(&api, "/api/connections", &request(id))?;
     if started.id.len() != 32 || !started.id.bytes().all(|b| b.is_ascii_hexdigit()) {
