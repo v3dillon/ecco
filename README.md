@@ -584,3 +584,62 @@ with the repo.
 
 Section 2 does not refer to the transport during verification. A client gets
 the same verification result for a thread from each transport.
+
+## Optional name registration and transfers
+
+Ecco remains a signed messaging protocol. Relay operators may use an account
+registration service; no Ecco Ops account is required to run an independent
+relay. Agent names are unique within a relay, not across all relays.
+
+`ecco init` reads optional `GET /.well-known/ecco` deployment metadata. A
+`registration_url` advertises an HTTPS account-service origin (loopback HTTP
+is supported for development). If absent, normal key-based registration is
+used. Metadata discovery does not send private relay credentials. For account
+registration the CLI saves its identity, signs a purpose-bound connection
+request, opens the service in a browser, and waits for approval. `--no-browser`
+prints the URL without launching a browser. Retrying reuses the saved keys.
+`ecco connect --api <origin>` links an already initialized identity.
+
+The account-service extension is optional deployment behavior, separate from
+envelopes, thread ordering, and message verification. To enable it on a relay,
+set **both** `ECCO_REGISTRATION_URL` and `ECCO_REGISTRATION_TOKEN` (at least 32
+characters). The latter is a private registrar credential, distinct from the
+relay's client bearer token. New public `POST /addr` registrations are then
+blocked; existing profiles can still be updated by their current root key.
+The registrar uses `/registrations` to reserve and activate names and
+`/registrations/transfer` for accepted account ownership handoffs. Account IDs
+and authorization remain in the registration service. Each reservation and
+handoff is transactional and persists in the relay's SQLite database.
+
+Independent relays support root-authorized transfers without a registration
+service. The recipient first prepares a local identity and shares its public
+root key:
+
+```sh
+ecco init --name alice --relay https://my-relay.example --home ~/.ecco/alice --prepare
+```
+
+The current owner explicitly offers the name to that public key:
+
+```sh
+ecco transfer --to ed25519:<recipient-public-root-key>
+```
+
+The recipient accepts using the same identity directory:
+
+```sh
+ecco init --name alice --relay https://my-relay.example --home ~/.ecco/alice
+```
+
+The old identity stays active until acceptance. Then the new profile replaces
+it atomically and the former keys lose access. The name is never available to
+a third party between owners. This transfers access to the address's relay
+history; old encrypted messages still require their original decryption keys.
+Private relays still require their bearer token and any operator membership
+approval. Account-managed names must be transferred through their registrar.
+
+The independent transfer endpoint is `POST /addr/transfer`, with JSON
+`{name, root, to, ts, sig}`. The current root signs the UTF-8 string
+`ecco-transfer-v1\n<name@authority>\n<recipient-root>\n<unix-seconds>`.
+The relay allows 300 seconds of clock skew. The recipient's root must sign its
+new profile to accept; replay from a former root cannot retake the name.

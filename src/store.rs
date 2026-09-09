@@ -53,6 +53,10 @@ fn min_window(default_days: u32, min_entry_days: Option<i64>) -> Option<u64> {
 
 const SQLITE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS profiles (name TEXT PRIMARY KEY, root TEXT NOT NULL, doc TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS registrations (name TEXT PRIMARY KEY, owner TEXT NOT NULL, root TEXT, transfer_id TEXT);
+CREATE TABLE IF NOT EXISTS name_transfers (name TEXT PRIMARY KEY, from_root TEXT NOT NULL, to_root TEXT NOT NULL, proof_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS name_transfer_proofs (id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS registration_transfers (id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS threads (about TEXT PRIMARY KEY, last_tseq INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS msgs (
   gseq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,9 +147,30 @@ fn build_stored((gseq, tseq, received_at, env_json): (i64, i64, i64, String)) ->
 
 impl Store {
     /// First-write-wins per name; the same root key may update its document.
+    #[cfg(test)]
     pub fn register(&self, profile: Profile) -> Res<()> {
-        let conn = self.conn.lock().unwrap();
-        let existing: Option<String> = sq(conn
+        self.register_with_policy(profile, false)
+    }
+
+    pub fn register_with_policy(&self, profile: Profile, require_registration: bool) -> Res<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sq(conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+        let reserved: Option<Option<String>> = sq(tx
+            .query_row(
+                "SELECT root FROM registrations WHERE name=?1",
+                [&profile.name],
+                |r| r.get(0),
+            )
+            .optional())?;
+        if let Some(root) = reserved {
+            if root.as_deref() != Some(&profile.root) {
+                return Err((
+                    403,
+                    "name is reserved; connect through the owning account".into(),
+                ));
+            }
+        }
+        let existing: Option<String> = sq(tx
             .query_row(
                 "SELECT root FROM profiles WHERE name=?1",
                 [&profile.name],
@@ -154,15 +179,190 @@ impl Store {
             .optional())?;
         if let Some(root) = existing {
             if root != profile.root {
-                return Err((409, format!("name '{}' is taken", profile.name)));
+                let accepted: bool = sq(tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM name_transfers WHERE name=?1 AND from_root=?2 AND to_root=?3)",
+                    rusqlite::params![profile.name, root, profile.root], |r| r.get(0),
+                ))?;
+                if require_registration || !accepted {
+                    return Err((409, format!("name '{}' is taken", profile.name)));
+                }
+                sq(tx.execute("DELETE FROM name_transfers WHERE name=?1", [&profile.name]))?;
             }
+        } else if require_registration {
+            return Err((
+                403,
+                "register this name in the dashboard, then run ecco init".into(),
+            ));
         }
         let doc = serde_json::to_string(&profile).unwrap();
-        sq(conn.execute(
+        sq(tx.execute(
             "INSERT INTO profiles(name,root,doc) VALUES(?1,?2,?3)
              ON CONFLICT(name) DO UPDATE SET root=excluded.root, doc=excluded.doc",
             rusqlite::params![profile.name, profile.root, doc],
         ))?;
+        sq(tx.commit())?;
+        Ok(())
+    }
+
+    /// Registrar-only operation. Reservation and activation share the same lock
+    /// and transaction as public registration, including across relay processes.
+    /// Activation of a legacy identity preserves its current profile.
+    pub fn reserve(&self, name: &str, owner: &str, profile: Option<&Profile>) -> Res<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sq(conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+        let reservation: Option<(String, Option<String>)> = sq(tx
+            .query_row(
+                "SELECT owner, root FROM registrations WHERE name=?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional())?;
+        if let Some((existing_owner, root)) = &reservation {
+            if existing_owner != owner
+                || profile.is_some_and(|p| root.as_ref().is_some_and(|r| r != &p.root))
+            {
+                return Err((409, format!("name '{name}' is taken")));
+            }
+        }
+        let existing: Option<String> = sq(tx
+            .query_row("SELECT root FROM profiles WHERE name=?1", [name], |r| {
+                r.get(0)
+            })
+            .optional())?;
+        if let Some(root) = &existing {
+            if profile
+                .map(|p| &p.root != root)
+                .unwrap_or(reservation.is_none())
+            {
+                return Err((409, format!("name '{name}' is taken")));
+            }
+        }
+        sq(tx.execute(
+            "INSERT INTO registrations(name,owner,root) VALUES(?1,?2,?3)
+             ON CONFLICT(name) DO UPDATE SET root=COALESCE(registrations.root,excluded.root)",
+            rusqlite::params![name, owner, profile.map(|p| &p.root)],
+        ))?;
+        if let Some(p) = profile.filter(|_| existing.is_none()) {
+            sq(tx.execute(
+                "INSERT INTO profiles(name,root,doc) VALUES(?1,?2,?3)",
+                rusqlite::params![name, p.root, serde_json::to_string(p).unwrap()],
+            ))?;
+        }
+        sq(tx.commit())?;
+        Ok(())
+    }
+
+    /// Account handoff on a registrar-managed relay. The transfer ID makes an
+    /// interrupted dashboard transaction safely retryable without reassigning
+    /// an address that has subsequently moved again.
+    pub fn transfer_registration(
+        &self,
+        name: &str,
+        from_owner: &str,
+        owner: &str,
+        root: Option<&str>,
+        id: &str,
+        profile: &Profile,
+    ) -> Res<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sq(conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+        let existing: Option<(String, Option<String>, Option<String>)> = sq(tx
+            .query_row(
+                "SELECT owner,root,transfer_id FROM registrations WHERE name=?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional())?;
+        if let Some((current, current_root, transfer_id)) = &existing {
+            if current == owner
+                && current_root.as_deref() == Some(&profile.root)
+                && transfer_id.as_deref() == Some(id)
+            {
+                return Ok(());
+            }
+            if current != from_owner
+                || current_root.as_deref() != root
+                || root == Some(&profile.root)
+            {
+                return Err((409, "name ownership changed; transfer refused".into()));
+            }
+        } else {
+            return Err((409, "name is not registered to the sender".into()));
+        }
+        let used: bool = sq(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM registration_transfers WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        ))?;
+        if used {
+            return Err((409, "transfer was already completed".into()));
+        }
+        sq(tx.execute("INSERT INTO registration_transfers(id) VALUES(?1)", [id]))?;
+        sq(tx.execute(
+            "UPDATE registrations SET owner=?2,root=?3,transfer_id=?4 WHERE name=?1",
+            rusqlite::params![name, owner, profile.root, id],
+        ))?;
+        sq(tx.execute("INSERT INTO profiles(name,root,doc) VALUES(?1,?2,?3) ON CONFLICT(name) DO UPDATE SET root=excluded.root,doc=excluded.doc",
+            rusqlite::params![name, profile.root, serde_json::to_string(profile).unwrap()]))?;
+        sq(tx.commit())?;
+        Ok(())
+    }
+
+    /// An unmanaged relay accepts a handoff only from the current root key.
+    /// The current identity works until the recipient publishes its profile.
+    pub fn offer_name_transfer(
+        &self,
+        name: &str,
+        from: &str,
+        to: &str,
+        proof: &str,
+        expires_at: u64,
+    ) -> Res<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = sq(conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
+        let owned: bool = sq(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM profiles WHERE name=?1 AND root=?2)",
+            rusqlite::params![name, from],
+            |r| r.get(0),
+        ))?;
+        let managed: bool = sq(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM registrations WHERE name=?1)",
+            [name],
+            |r| r.get(0),
+        ))?;
+        if !owned || managed {
+            return Err((
+                403,
+                "name transfer must be authorized by its current owner".into(),
+            ));
+        }
+        sq(tx.execute(
+            "DELETE FROM name_transfer_proofs WHERE expires_at < ?1",
+            [crate::envelope::now()],
+        ))?;
+        let used: bool = sq(tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM name_transfer_proofs WHERE id=?1)",
+            [proof],
+            |r| r.get(0),
+        ))?;
+        if used {
+            let pending: bool = sq(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM name_transfers WHERE name=?1 AND proof_id=?2)",
+                rusqlite::params![name, proof],
+                |r| r.get(0),
+            ))?;
+            return if pending {
+                Ok(())
+            } else {
+                Err((409, "transfer proof was already used".into()))
+            };
+        }
+        sq(tx.execute(
+            "INSERT INTO name_transfer_proofs(id,expires_at) VALUES(?1,?2)",
+            rusqlite::params![proof, expires_at],
+        ))?;
+        sq(tx.execute("INSERT INTO name_transfers(name,from_root,to_root,proof_id) VALUES(?1,?2,?3,?4) ON CONFLICT(name) DO UPDATE SET from_root=excluded.from_root,to_root=excluded.to_root,proof_id=excluded.proof_id", rusqlite::params![name, from, to, proof]))?;
+        sq(tx.commit())?;
         Ok(())
     }
 

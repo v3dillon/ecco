@@ -5,6 +5,7 @@ mod envelope;
 mod identity;
 mod mcp;
 mod outbox;
+mod registration;
 mod relay;
 mod store;
 
@@ -46,6 +47,27 @@ enum Cmd {
         /// Bearer token, if the relay is private
         #[arg(long)]
         token: Option<String>,
+        /// Registration service origin. Otherwise discovered from the relay.
+        #[arg(long)]
+        api: Option<String>,
+        /// Print the authorization URL without launching a browser
+        #[arg(long)]
+        no_browser: bool,
+        /// Save local keys and print their public keys without registering yet
+        #[arg(long)]
+        prepare: bool,
+    },
+    /// Connect an existing identity to your dashboard account without replacing keys
+    Connect {
+        #[arg(long)]
+        api: Option<String>,
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Offer an unmanaged relay name to another root key; recipient accepts with init
+    Transfer {
+        #[arg(long)]
+        to: String,
     },
     /// Run a relay
     Relay {
@@ -218,10 +240,34 @@ fn main() {
 
 fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
     match cmd {
-        Cmd::Init { name, relay, token } => {
+        Cmd::Init {
+            name,
+            relay,
+            token,
+            api,
+            no_browser,
+            prepare,
+        } => {
+            if !registration::valid_name(&name) {
+                return Err("name must be 1–31 lowercase letters, numbers, or hyphens, starting with a letter or number".into());
+            }
             let id = Identity::prepare(home, &name, &relay, token)?;
-            client::register(&id)?;
-            println!("registered {}", id.addr());
+            if !prepare {
+                let api = match api {
+                    Some(api) => Some(api),
+                    None => registration::discover(&id.relay)?,
+                };
+                if let Some(api) = api {
+                    registration::connect(&id, &api, no_browser)?;
+                } else {
+                    client::register(&id)?;
+                }
+            }
+            println!(
+                "{} {}",
+                if prepare { "prepared" } else { "registered" },
+                id.addr()
+            );
             println!(
                 "root key (you):    {}",
                 envelope::encode_key(&id.root_key().verifying_key())
@@ -232,6 +278,18 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             );
             Ok(())
         }
+        Cmd::Connect { api, no_browser } => {
+            let id = Identity::load(home)?;
+            let api = match api {
+                Some(api) => Some(api),
+                None => registration::discover(&id.relay)?,
+            }
+            .ok_or(
+                "this relay has no registration service; supply --api to connect to a dashboard",
+            )?;
+            registration::connect(&id, &api, no_browser)
+        }
+        Cmd::Transfer { to } => registration::transfer(&Identity::load(home)?, &to),
         Cmd::Relay {
             port,
             data,
