@@ -65,6 +65,8 @@ pub struct Relay {
     store: Store,
     key: SigningKey,
     token: Option<String>,
+    registration_token: Option<String>,
+    registration_url: Option<String>,
     signed: bool,
     authority: String,
     allow_roots: bool,
@@ -127,10 +129,20 @@ pub fn run(
         }
     };
     let store = Store::open(&data)?;
+    let registration_token = std::env::var("ECCO_REGISTRATION_TOKEN").ok();
+    let registration_url = std::env::var("ECCO_REGISTRATION_URL").ok();
+    if registration_token.is_some() != registration_url.is_some() {
+        return Err("set both ECCO_REGISTRATION_TOKEN and ECCO_REGISTRATION_URL to enable account registration".into());
+    }
+    if registration_token.as_ref().is_some_and(|t| t.len() < 32) {
+        return Err("ECCO_REGISTRATION_TOKEN must contain at least 32 characters".into());
+    }
     let relay = Arc::new(Relay {
         store,
         key,
         token,
+        registration_token,
+        registration_url,
         signed,
         authority,
         allow_roots,
@@ -180,8 +192,9 @@ impl Relay {
         // Transport-level gate (README §5): deployment config, not protocol.
         // GET /addr/{name} stays public — profile documents are public by design.
         if let Some(expected) = &self.token {
-            let public_profile = method == "GET" && path.starts_with("/addr/");
-            if !public_profile {
+            let public_profile =
+                method == "GET" && (path.starts_with("/addr/") || path == "/.well-known/ecco");
+            if !public_profile && path != "/registrations" && path != "/registrations/transfer" {
                 let authed = req.headers().iter().any(|h| {
                     h.field.equiv("authorization")
                         && h.value.as_str() == format!("Bearer {expected}")
@@ -212,6 +225,11 @@ impl Relay {
             }
         }
 
+        let authorization = req
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("authorization"))
+            .map(|h| h.value.as_str().to_owned());
         let mut body = String::new();
         let _ = std::io::Read::read_to_string(
             &mut std::io::Read::take(req.as_reader(), MAX_BODY_BYTES + 1),
@@ -223,6 +241,16 @@ impl Relay {
         } else {
             match (method.as_str(), path.as_str()) {
                 ("POST", "/addr") => self.post_addr(&body, &ip),
+                ("POST", "/registrations") => {
+                    self.post_registration(&body, authorization.as_deref(), false)
+                }
+                ("POST", "/registrations/transfer") => {
+                    self.post_registration(&body, authorization.as_deref(), true)
+                }
+                ("POST", "/addr/transfer") => self.post_name_transfer(&body),
+                ("GET", "/.well-known/ecco") => {
+                    Ok(serde_json::json!({"registration_url": self.registration_url}).to_string())
+                }
                 ("GET", p) if p.starts_with("/addr/") => self.get_addr(&p["/addr/".len()..]),
                 ("POST", "/msgs") => self.post_msgs(&body),
                 ("GET", "/threads") => self
@@ -269,7 +297,143 @@ impl Relay {
             }
         }
         self.allow_root(&profile.root)?;
-        self.store.register(profile)?;
+        self.store
+            .register_with_policy(profile, self.registration_token.is_some())?;
+        Ok("{\"ok\":true}".into())
+    }
+
+    fn post_registration(
+        &self,
+        body: &str,
+        authorization: Option<&str>,
+        transfer: bool,
+    ) -> Result<String, (u16, String)> {
+        let expected = self
+            .registration_token
+            .as_ref()
+            .ok_or((404, "not found".into()))?;
+        let supplied = authorization
+            .unwrap_or_default()
+            .strip_prefix("Bearer ")
+            .unwrap_or_default();
+        if blake3::hash(supplied.as_bytes()) != blake3::hash(expected.as_bytes()) {
+            return Err((401, "missing or bad registrar credential".into()));
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Registration {
+            name: String,
+            owner: String,
+            profile: Option<crate::identity::Profile>,
+            #[serde(rename = "fromOwner")]
+            from_owner: Option<String>,
+            root: Option<String>,
+            id: Option<String>,
+        }
+        let request: Registration =
+            serde_json::from_str(body).map_err(|_| (400, "invalid registration".into()))?;
+        if !crate::registration::valid_name(&request.name)
+            || request.owner.is_empty()
+            || request.owner.len() > 512
+        {
+            return Err((400, "invalid name or owner".into()));
+        }
+        if let Some(profile) = &request.profile {
+            profile.verify().map_err(|e| (400, e))?;
+            if profile.v != 0 || profile.name != request.name {
+                return Err((400, "profile does not match registration".into()));
+            }
+            for delegation in &profile.delegations {
+                if self
+                    .name_on_this_relay(&delegation.addr)
+                    .map_err(|e| (400, e))?
+                    != request.name
+                {
+                    return Err((400, "delegation does not match registration".into()));
+                }
+            }
+        }
+        if transfer {
+            let from = request
+                .from_owner
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or((400, "missing transfer sender".into()))?;
+            let id = request
+                .id
+                .as_deref()
+                .filter(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or((400, "invalid transfer ID".into()))?;
+            let profile = request
+                .profile
+                .as_ref()
+                .ok_or((400, "missing recipient profile".into()))?;
+            self.store.transfer_registration(
+                &request.name,
+                from,
+                &request.owner,
+                request.root.as_deref(),
+                id,
+                profile,
+            )?;
+        } else {
+            self.store
+                .reserve(&request.name, &request.owner, request.profile.as_ref())?;
+        }
+        // A trusted registrar checked team membership. Make this approval usable
+        // immediately; subsequent membership snapshots remain authoritative.
+        if self.allow_roots {
+            if let Some(profile) = &request.profile {
+                self.allowed_roots
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(HashSet::new)
+                    .insert(profile.root.clone());
+            }
+        }
+        Ok("{\"ok\":true}".into())
+    }
+
+    fn post_name_transfer(&self, body: &str) -> Result<String, (u16, String)> {
+        if self.registration_token.is_some() {
+            return Err((
+                403,
+                "transfer this name through its registration service".into(),
+            ));
+        }
+        #[derive(serde::Deserialize)]
+        struct Transfer {
+            name: String,
+            root: String,
+            to: String,
+            ts: u64,
+            sig: String,
+        }
+        let t: Transfer =
+            serde_json::from_str(body).map_err(|_| (400, "invalid name transfer".into()))?;
+        if !crate::registration::valid_name(&t.name)
+            || t.ts.abs_diff(envelope::now()) > 300
+            || t.root == t.to
+        {
+            return Err((400, "invalid or expired name transfer".into()));
+        }
+        let key = envelope::decode_key(&t.root).map_err(|e| (400, e))?;
+        envelope::decode_key(&t.to).map_err(|e| (400, e))?;
+        let signature: [u8; 64] = envelope::decode_prefixed(&t.sig, "ed25519:")
+            .map_err(|e| (400, e))?
+            .try_into()
+            .map_err(|_| (400, "invalid transfer signature".into()))?;
+        let message = format!(
+            "ecco-transfer-v1\n{}@{}\n{}\n{}",
+            t.name, self.authority, t.to, t.ts
+        );
+        key.verify(
+            message.as_bytes(),
+            &ed25519_dalek::Signature::from_bytes(&signature),
+        )
+        .map_err(|_| (403, "invalid transfer signature".into()))?;
+        self.store
+            .offer_name_transfer(&t.name, &t.root, &t.to, &t.sig, t.ts + 300)?;
         Ok("{\"ok\":true}".into())
     }
 
@@ -593,6 +757,228 @@ mod tests {
 
     static N: AtomicUsize = AtomicUsize::new(0);
 
+    #[test]
+    fn names_are_reserved_and_transfer_revokes_the_previous_key() {
+        let mut r = relay();
+        r.registration_token = Some("s".repeat(32));
+        let auth = format!("Bearer {}", "s".repeat(32));
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let replacement = Identity::generate("alice", "http://localhost:4200", None);
+        let reserve = json!({"name":"alice", "owner":"first"}).to_string();
+        assert_eq!(
+            r.post_registration(&reserve, None, false).unwrap_err().0,
+            401
+        );
+        r.post_registration(&reserve, Some(&auth), false).unwrap();
+        assert_eq!(
+            r.post_addr(&serde_json::to_string(&alice.profile()).unwrap(), "a")
+                .unwrap_err()
+                .0,
+            403
+        );
+        assert_eq!(
+            r.post_registration(
+                &json!({"name":"alice", "owner":"other"}).to_string(),
+                Some(&auth),
+                false
+            )
+            .unwrap_err()
+            .0,
+            409
+        );
+        r.post_registration(
+            &json!({"name":"alice", "owner":"first", "profile":alice.profile()}).to_string(),
+            Some(&auth),
+            false,
+        )
+        .unwrap();
+        r.post_addr(&serde_json::to_string(&alice.profile()).unwrap(), "a")
+            .unwrap();
+        assert_eq!(
+            r.post_addr(&serde_json::to_string(&replacement.profile()).unwrap(), "b")
+                .unwrap_err()
+                .0,
+            403
+        );
+        let transfer = json!({"name":"alice", "fromOwner":"first", "owner":"second", "root":alice.profile().root, "id":"a".repeat(32), "profile":replacement.profile()}).to_string();
+        r.post_registration(&transfer, Some(&auth), true).unwrap();
+        r.post_registration(&transfer, Some(&auth), true).unwrap();
+        assert_eq!(
+            r.post_addr(&serde_json::to_string(&alice.profile()).unwrap(), "a")
+                .unwrap_err()
+                .0,
+            403
+        );
+        assert_eq!(
+            post(&r, &alice, "transfer-thread", &[], "old")
+                .unwrap_err()
+                .0,
+            403
+        );
+        post(&r, &replacement, "transfer-thread", &[], "new").unwrap();
+        let profile = r.store.profile("alice").unwrap().unwrap();
+        assert!(profile
+            .authorizes_read(&alice.profile().root, envelope::now())
+            .is_err());
+        assert!(profile
+            .authorizes_read(&replacement.profile().root, envelope::now())
+            .is_ok());
+    }
+
+    #[test]
+    fn independent_relay_transfer_requires_the_old_root_and_new_root_acceptance() {
+        let r = relay();
+        let old = Identity::generate("alice", "http://localhost:4200", None);
+        let new = Identity::generate("alice", "http://localhost:4200", None);
+        let unrelated = Identity::generate("alice", "http://localhost:4200", None);
+        r.store.register(old.profile()).unwrap();
+        let ts = envelope::now();
+        let message = format!(
+            "ecco-transfer-v1\n{}\n{}\n{ts}",
+            old.addr(),
+            new.profile().root
+        );
+        let signature = format!(
+            "ed25519:{}",
+            hex::encode(old.root_key().sign(message.as_bytes()).to_bytes())
+        );
+        let transfer = json!({"name":"alice", "root":old.profile().root, "to":new.profile().root, "ts":ts, "sig":signature});
+        let mut bad = transfer.clone();
+        bad["to"] = json!(unrelated.profile().root);
+        assert_eq!(r.post_name_transfer(&bad.to_string()).unwrap_err().0, 403);
+        r.post_name_transfer(&transfer.to_string()).unwrap();
+        assert_eq!(
+            r.store.profile("alice").unwrap().unwrap().root,
+            old.profile().root
+        );
+        assert_eq!(
+            r.post_addr(&serde_json::to_string(&unrelated.profile()).unwrap(), "b")
+                .unwrap_err()
+                .0,
+            409
+        );
+        r.post_addr(&serde_json::to_string(&new.profile()).unwrap(), "b")
+            .unwrap();
+        assert_eq!(
+            r.post_addr(&serde_json::to_string(&old.profile()).unwrap(), "a")
+                .unwrap_err()
+                .0,
+            409
+        );
+        assert_eq!(
+            r.post_name_transfer(&transfer.to_string()).unwrap_err().0,
+            403
+        );
+    }
+
+    #[test]
+    fn transfer_proofs_cannot_replay_after_a_round_trip() {
+        let r = relay();
+        let a = Identity::generate("alice", "http://localhost:4200", None);
+        let b = Identity::generate("alice", "http://localhost:4200", None);
+        r.store.register(a.profile()).unwrap();
+        r.store
+            .offer_name_transfer(
+                "alice",
+                &a.profile().root,
+                &b.profile().root,
+                "proof-a",
+                envelope::now() + 300,
+            )
+            .unwrap();
+        r.store.register(b.profile()).unwrap();
+        r.store
+            .offer_name_transfer(
+                "alice",
+                &b.profile().root,
+                &a.profile().root,
+                "proof-b",
+                envelope::now() + 300,
+            )
+            .unwrap();
+        r.store.register(a.profile()).unwrap();
+        assert_eq!(
+            r.store
+                .offer_name_transfer(
+                    "alice",
+                    &a.profile().root,
+                    &b.profile().root,
+                    "proof-a",
+                    envelope::now() + 300
+                )
+                .unwrap_err()
+                .0,
+            409
+        );
+        r.store.reserve("alice", "a", Some(&a.profile())).unwrap();
+        r.store
+            .transfer_registration(
+                "alice",
+                "a",
+                "b",
+                Some(&a.profile().root),
+                "first",
+                &b.profile(),
+            )
+            .unwrap();
+        r.store
+            .transfer_registration(
+                "alice",
+                "b",
+                "a",
+                Some(&b.profile().root),
+                "second",
+                &a.profile(),
+            )
+            .unwrap();
+        assert_eq!(
+            r.store
+                .transfer_registration(
+                    "alice",
+                    "a",
+                    "b",
+                    Some(&a.profile().root),
+                    "first",
+                    &b.profile()
+                )
+                .unwrap_err()
+                .0,
+            409
+        );
+    }
+
+    #[test]
+    fn reservations_survive_restart_and_compete_atomically_across_connections() {
+        let dir = std::env::temp_dir().join(format!(
+            "ecco-reservation-race-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let first = Store::open(&dir).unwrap();
+        let second = Store::open(&dir).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let other = barrier.clone();
+        let a = std::thread::spawn(move || {
+            barrier.wait();
+            first.reserve("alice", "a", None)
+        });
+        let b = std::thread::spawn(move || {
+            other.wait();
+            second.reserve("alice", "b", None)
+        });
+        let a = a.join().unwrap();
+        let b = b.join().unwrap();
+        assert_ne!(a.is_ok(), b.is_ok());
+        let reopened = Store::open(&dir).unwrap();
+        assert_eq!(
+            reopened.reserve("alice", "outsider", None).unwrap_err().0,
+            409
+        );
+        let intruder = Identity::generate("alice", "http://localhost:4200", None);
+        assert_eq!(reopened.register(intruder.profile()).unwrap_err().0, 403);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn relay() -> Relay {
         let dir = std::env::temp_dir().join(format!(
             "ecco-relay-{}-{}",
@@ -603,6 +989,8 @@ mod tests {
             store: Store::open(&dir).unwrap(),
             key: SigningKey::generate(&mut rand::rngs::OsRng),
             token: None,
+            registration_token: None,
+            registration_url: None,
             signed: true,
             authority: "localhost:4200".into(),
             allow_roots: false,

@@ -1,6 +1,6 @@
 [package]
 name = "ecco"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 description = "Async messaging between agents owned by different people. Email, not phone calls."
 license = "MIT"
@@ -17,6 +17,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tiny_http = "0.12"
 ureq = "2"
+url = "2"
 
 [profile.release]
 strip = true
