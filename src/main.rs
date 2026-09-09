@@ -37,32 +37,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create an identity and register it with a relay
+    /// Set up an agent, or resume setup using its saved name, relay, and keys
     Init {
+        /// Agent name. Uses the saved name when omitted
         #[arg(long)]
-        name: String,
-        /// Relay URL. Defaults to the hosted relay.
-        #[arg(long, default_value = "https://relay.ecco.bot")]
-        relay: String,
+        name: Option<String>,
+        /// Relay URL. Uses the saved relay, or https://relay.ecco.bot for a new agent
+        #[arg(long)]
+        relay: Option<String>,
         /// Bearer token, if the relay is private
         #[arg(long)]
         token: Option<String>,
-        /// Registration service origin. Otherwise discovered from the relay.
-        #[arg(long)]
-        api: Option<String>,
         /// Print the authorization URL without launching a browser
         #[arg(long)]
         no_browser: bool,
         /// Save local keys and print their public keys without registering yet
         #[arg(long)]
         prepare: bool,
-    },
-    /// Connect an existing identity to your dashboard account without replacing keys
-    Connect {
-        #[arg(long)]
-        api: Option<String>,
-        #[arg(long)]
-        no_browser: bool,
     },
     /// Offer an unmanaged relay name to another root key; recipient accepts with init
     Transfer {
@@ -238,27 +229,47 @@ fn main() {
     }
 }
 
+fn init_identity(
+    home: &Path,
+    name: Option<&str>,
+    relay: Option<&str>,
+    token: Option<String>,
+) -> Result<Identity, String> {
+    let saved = if home.join("identity.json").exists() {
+        Some(Identity::load(home).map_err(|e| {
+            format!(
+                "identity at {} is unreadable ({e}); not overwritten",
+                home.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    let name = name
+        .or_else(|| saved.as_ref().map(|id| id.name.as_str()))
+        .ok_or("choose a name for this agent with ecco init --name <name> [--relay <url>]")?;
+    if !registration::valid_name(name) {
+        return Err("name must be 1–31 lowercase letters, numbers, or hyphens, starting with a letter or number".into());
+    }
+    let relay = relay
+        .or_else(|| saved.as_ref().map(|id| id.relay.as_str()))
+        .unwrap_or("https://relay.ecco.bot");
+    Identity::prepare(home, name, relay, token)
+}
+
 fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
     match cmd {
         Cmd::Init {
             name,
             relay,
             token,
-            api,
             no_browser,
             prepare,
         } => {
-            if !registration::valid_name(&name) {
-                return Err("name must be 1–31 lowercase letters, numbers, or hyphens, starting with a letter or number".into());
-            }
-            let id = Identity::prepare(home, &name, &relay, token)?;
+            let id = init_identity(home, name.as_deref(), relay.as_deref(), token)?;
             if !prepare {
-                let api = match api {
-                    Some(api) => Some(api),
-                    None => registration::discover(&id.relay)?,
-                };
-                if let Some(api) = api {
-                    registration::connect(&id, &api, no_browser)?;
+                if let Some(service) = registration::discover(&id.relay)? {
+                    registration::authorize(&id, &service, no_browser)?;
                 } else {
                     client::register(&id)?;
                 }
@@ -277,17 +288,6 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                 envelope::encode_key(&id.agent_key().verifying_key())
             );
             Ok(())
-        }
-        Cmd::Connect { api, no_browser } => {
-            let id = Identity::load(home)?;
-            let api = match api {
-                Some(api) => Some(api),
-                None => registration::discover(&id.relay)?,
-            }
-            .ok_or(
-                "this relay has no registration service; supply --api to connect to a dashboard",
-            )?;
-            registration::connect(&id, &api, no_browser)
         }
         Cmd::Transfer { to } => registration::transfer(&Identity::load(home)?, &to),
         Cmd::Relay {
@@ -883,6 +883,85 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("ecco-main-test-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn init_resumes_the_saved_relay_name_and_keys() {
+        let home = temp_home();
+        let setup = Cli::try_parse_from([
+            "ecco",
+            "init",
+            "--name",
+            "alice",
+            "--relay",
+            "http://localhost:9876",
+            "--token",
+            "private-relay-token",
+            "--prepare",
+        ])
+        .unwrap();
+        run(setup.cmd, &home).unwrap();
+        let path = home.join("identity.json");
+        let original = std::fs::read(&path).unwrap();
+        for args in [
+            vec!["ecco", "init", "--prepare"],
+            vec!["ecco", "init", "--prepare", "--name", "alice"],
+            vec![
+                "ecco",
+                "init",
+                "--prepare",
+                "--relay",
+                "http://localhost:9876",
+            ],
+        ] {
+            run(Cli::try_parse_from(args).unwrap().cmd, &home).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        let saved = Identity::load(&home).unwrap();
+        assert_eq!(saved.addr(), "alice@localhost:9876");
+        assert_eq!(saved.token.as_deref(), Some("private-relay-token"));
+        for args in [
+            vec!["ecco", "init", "--prepare", "--name", "bob"],
+            vec![
+                "ecco",
+                "init",
+                "--prepare",
+                "--relay",
+                "http://localhost:9999",
+            ],
+        ] {
+            assert!(run(Cli::try_parse_from(args).unwrap().cmd, &home).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        std::fs::write(&path, "{invalid").unwrap();
+        let err = run(Cli::try_parse_from(["ecco", "init"]).unwrap().cmd, &home).unwrap_err();
+        assert!(err.contains("not overwritten"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{invalid");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn init_requires_a_name_only_for_a_new_identity() {
+        let home = temp_home();
+        let err = run(Cli::try_parse_from(["ecco", "init"]).unwrap().cmd, &home).unwrap_err();
+        assert!(err.contains("--name"));
+        assert!(!home.exists());
+        let bad = Cli::try_parse_from(["ecco", "init", "--name", "Bad/Name", "--prepare"]).unwrap();
+        assert!(run(bad.cmd, &home).is_err());
+        assert!(!home.exists());
+        let setup = Cli::try_parse_from(["ecco", "init", "--name", "alice", "--prepare"]).unwrap();
+        run(setup.cmd, &home).unwrap();
+        assert_eq!(
+            Identity::load(&home).unwrap().relay,
+            "https://relay.ecco.bot"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn setup_has_one_command_and_one_service_selection() {
+        assert!(Cli::try_parse_from(["ecco", "init", "--api", "https://app.example"]).is_err());
+        assert!(Cli::try_parse_from(["ecco", "connect"]).is_err());
     }
 
     #[test]

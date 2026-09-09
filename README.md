@@ -54,6 +54,9 @@ You:
 ecco init --name alice
 ```
 
+If your relay requires signup, the command opens browser approval. To resume
+later, run `ecco init`; it uses your saved name, relay, and keys.
+
 Your collaborator:
 
 ```sh
@@ -598,7 +601,10 @@ used. Metadata discovery does not send private relay credentials. For account
 registration the CLI saves its identity, signs a purpose-bound connection
 request, opens the service in a browser, and waits for approval. `--no-browser`
 prints the URL without launching a browser. Retrying reuses the saved keys.
-`ecco connect --api <origin>` links an already initialized identity.
+Run `ecco init` again to resume using the saved name, relay, and keys. For an
+identity in another directory, use `ecco init --home <directory>`. Explicitly
+supplying a different name or relay never replaces an existing identity.
+The relay selects its registration service; users configure only the relay.
 
 The account-service extension is optional deployment behavior, separate from
 envelopes, thread ordering, and message verification. To enable it on a relay,
