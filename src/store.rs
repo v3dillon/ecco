@@ -8,8 +8,12 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use crate::envelope::Envelope;
+use crate::client::Receipt;
+use crate::envelope::{now, Envelope};
+use crate::evidence::Bundle;
+use crate::federation::{self, Delivery, DeliveryReceipt, ReceivedEvidence};
 use crate::identity::Profile;
+use ed25519_dalek::SigningKey;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stored {
@@ -72,6 +76,18 @@ CREATE INDEX IF NOT EXISTS msgs_received ON msgs(received_at);
 CREATE TABLE IF NOT EXISTS msg_to (gseq INTEGER NOT NULL, addr TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS msg_to_addr ON msg_to(addr, gseq);
 CREATE TABLE IF NOT EXISTS retention (sender TEXT PRIMARY KEY, days INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS foreign_evidence (id TEXT PRIMARY KEY, addr TEXT NOT NULL, root TEXT NOT NULL, doc TEXT NOT NULL, receipt TEXT NOT NULL, retain_until INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS foreign_audience ON foreign_evidence(addr,root);
+CREATE TABLE IF NOT EXISTS profile_history (name TEXT NOT NULL, doc TEXT NOT NULL, observed_at INTEGER NOT NULL, PRIMARY KEY(name,doc));
+INSERT OR IGNORE INTO profile_history SELECT name,doc,unixepoch() FROM profiles;
+CREATE TRIGGER IF NOT EXISTS profile_insert_history AFTER INSERT ON profiles BEGIN
+ INSERT INTO profile_history SELECT NEW.name,NEW.doc,unixepoch() WHERE NOT EXISTS(SELECT 1 FROM profile_history WHERE name=NEW.name AND doc=NEW.doc); END;
+CREATE TRIGGER IF NOT EXISTS profile_update_history AFTER UPDATE ON profiles BEGIN
+ INSERT INTO profile_history SELECT NEW.name,NEW.doc,unixepoch() WHERE NOT EXISTS(SELECT 1 FROM profile_history WHERE name=NEW.name AND doc=NEW.doc); END;
+CREATE TABLE IF NOT EXISTS envelope_proofs (id TEXT PRIMARY KEY, about TEXT NOT NULL, doc TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS proofs_about ON envelope_proofs(about);
+CREATE TRIGGER IF NOT EXISTS remove_message_proof AFTER DELETE ON msgs BEGIN
+ DELETE FROM envelope_proofs WHERE id=OLD.id; END;
 ";
 
 /// First-time `participants` table: CREATE plus backfill in one
@@ -87,6 +103,8 @@ INSERT OR IGNORE INTO participants(about, addr) SELECT DISTINCT about, sender FR
 INSERT OR IGNORE INTO participants(about, addr)
   SELECT DISTINCT m.about, t.addr FROM msgs m JOIN msg_to t ON t.gseq=m.gseq;
 ";
+
+const MAX_FOREIGN_EVIDENCE: u64 = 10_000;
 
 pub struct Store {
     conn: Mutex<rusqlite::Connection>,
@@ -128,6 +146,10 @@ impl Store {
 
 fn sq<T>(r: Result<T, rusqlite::Error>) -> Res<T> {
     r.map_err(|e| (500, format!("storage error: {e}")))
+}
+
+fn parse<T: serde::de::DeserializeOwned>(doc: &str, what: &str) -> Res<T> {
+    serde_json::from_str(doc).map_err(|e| (500, format!("corrupt {what}: {e}")))
 }
 
 fn sqlite_row_to_stored(row: &rusqlite::Row) -> rusqlite::Result<(i64, i64, i64, String)> {
@@ -382,9 +404,16 @@ impl Store {
     }
 
     /// Idempotent by envelope id: resubmission returns the stored copy.
-    pub fn append(&self, env: Envelope, received_at: u64) -> Res<Stored> {
+    /// With `proof`, the relay also retains a signed acceptance bundle
+    /// under the sender's profile as admitted.
+    pub fn append(
+        &self,
+        env: Envelope,
+        received_at: u64,
+        proof: Option<(&Profile, &SigningKey)>,
+    ) -> Res<Stored> {
         let mut conn = self.conn.lock().unwrap();
-        let tx = sq(conn.transaction())?;
+        let tx = sq(conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate))?;
         if let Some(row) = sq(tx
             .query_row(
                 "SELECT gseq,tseq,received_at,env FROM msgs WHERE id=?1",
@@ -394,6 +423,16 @@ impl Store {
             .optional())?
         {
             return build_stored(row);
+        }
+        if let Some((profile, _)) = proof {
+            let current: bool = sq(tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM profiles WHERE name=?1 AND doc=?2)",
+                rusqlite::params![profile.name, serde_json::to_string(profile).unwrap()],
+                |r| r.get(0),
+            ))?;
+            if !current {
+                return Err((409, "profile changed during admission; retry".into()));
+            }
         }
         let tseq: i64 = sq(tx.query_row(
             "INSERT INTO threads(about,last_tseq) VALUES(?1,1)
@@ -431,6 +470,14 @@ impl Store {
                 rusqlite::params![env.about, addr],
             ))?;
         }
+        if let Some((profile, key)) = proof {
+            let receipt = Receipt::sign(&env, gseq as u64, tseq as u64, received_at, key);
+            let bundle = Bundle::sign(env.clone(), profile.clone(), receipt, key);
+            sq(tx.execute(
+                "INSERT INTO envelope_proofs(id,about,doc) VALUES(?1,?2,?3)",
+                rusqlite::params![env.id, env.about, serde_json::to_string(&bundle).unwrap()],
+            ))?;
+        }
         sq(tx.commit())?;
         Ok(Stored {
             gseq: gseq as u64,
@@ -438,6 +485,89 @@ impl Store {
             received_at,
             env,
         })
+    }
+
+    pub fn evidence(&self, about: &str) -> Res<Vec<Bundle>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sq(conn.prepare(
+            "SELECT p.doc FROM envelope_proofs p JOIN msgs m ON m.id=p.id
+             WHERE p.about=?1 ORDER BY m.tseq",
+        ))?;
+        let docs = sq(stmt
+            .query_map([about], |r| r.get::<_, String>(0))
+            .and_then(|r| r.collect::<Result<Vec<_>, _>>()))?;
+        docs.iter().map(|doc| parse(doc, "evidence")).collect()
+    }
+
+    pub fn proof(&self, id: &str) -> Res<Option<Bundle>> {
+        let conn = self.conn.lock().unwrap();
+        let doc: Option<String> = sq(conn
+            .query_row("SELECT doc FROM envelope_proofs WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional())?;
+        doc.map(|d| parse(&d, "evidence")).transpose()
+    }
+
+    /// Idempotent by disclosure digest: a repeated delivery gets the first receipt back.
+    pub fn receive_evidence(
+        &self,
+        delivery: &Delivery,
+        receipt: &DeliveryReceipt,
+    ) -> Res<DeliveryReceipt> {
+        let conn = self.conn.lock().unwrap();
+        sq(conn.execute(
+            "DELETE FROM foreign_evidence WHERE retain_until < ?1",
+            [now()],
+        ))?;
+        let id = federation::digest(delivery);
+        let old: Option<String> = sq(conn
+            .query_row(
+                "SELECT receipt FROM foreign_evidence WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .optional())?;
+        if let Some(doc) = old {
+            return parse(&doc, "foreign receipt");
+        }
+        let count: u64 =
+            sq(conn.query_row("SELECT COUNT(*) FROM foreign_evidence", [], |r| r.get(0)))?;
+        if count >= MAX_FOREIGN_EVIDENCE {
+            return Err((429, "foreign evidence capacity reached".into()));
+        }
+        sq(conn.execute(
+            "INSERT INTO foreign_evidence(id,addr,root,doc,receipt,retain_until)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![
+                id,
+                delivery.audience.addr,
+                delivery.audience.root,
+                serde_json::to_string(delivery).unwrap(),
+                serde_json::to_string(receipt).unwrap(),
+                receipt.retain_until
+            ],
+        ))?;
+        Ok(receipt.clone())
+    }
+
+    pub fn foreign_evidence(&self, addr: &str, root: &str) -> Res<Vec<ReceivedEvidence>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = sq(conn.prepare(
+            "SELECT doc,receipt FROM foreign_evidence
+             WHERE addr=?1 AND root=?2 AND retain_until>?3 ORDER BY id",
+        ))?;
+        let rows = sq(stmt.query_map(rusqlite::params![addr, root, now()], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }))?;
+        rows.map(|row| {
+            let (doc, receipt) = sq(row)?;
+            Ok(ReceivedEvidence {
+                delivery: parse(&doc, "foreign evidence")?,
+                receipt: parse(&receipt, "foreign receipt")?,
+            })
+        })
+        .collect()
     }
 
     pub fn thread(&self, about: &str, since: u64) -> Res<Vec<Stored>> {
@@ -594,13 +724,13 @@ mod tests {
         store.register(bob.profile()).unwrap();
         let now = 100 * DAY;
         store
-            .append(note(&alice, &bob, "a-old", 1), now - 20 * DAY)
+            .append(note(&alice, &bob, "a-old", 1), now - 20 * DAY, None)
             .unwrap();
         store
-            .append(note(&alice, &bob, "a-new", 2), now - DAY)
+            .append(note(&alice, &bob, "a-new", 2), now - DAY, None)
             .unwrap();
         store
-            .append(note(&bob, &alice, "b-old", 3), now - 20 * DAY)
+            .append(note(&bob, &alice, "b-old", 3), now - 20 * DAY, None)
             .unwrap();
 
         // Nothing configured for alice; default 0 keeps everything.
@@ -621,7 +751,9 @@ mod tests {
         assert_eq!(store.inbox(&bob.addr(), 0).unwrap().len(), 1);
 
         // Thread seq keeps counting; nothing is reused after a sweep.
-        let s = store.append(note(&alice, &bob, "a-next", 4), now).unwrap();
+        let s = store
+            .append(note(&alice, &bob, "a-next", 4), now, None)
+            .unwrap();
         assert_eq!(s.tseq, 4);
     }
 
@@ -647,11 +779,12 @@ mod tests {
                 .append(
                     note(&alice, &bob, &format!("old-{i}"), i as u64),
                     now - 10 * DAY,
+                    None,
                 )
                 .unwrap();
         }
         store
-            .append(note(&alice, &bob, "fresh", 9_999), now - DAY)
+            .append(note(&alice, &bob, "fresh", 9_999), now - DAY, None)
             .unwrap();
         assert_eq!(store.sweep(now, 7).unwrap(), old as u64);
         assert_eq!(store.sweep(now, 7).unwrap(), 0);
@@ -669,7 +802,7 @@ mod tests {
         let now = 100 * DAY;
         let about = "gh:acme/app/pull/1";
         store
-            .append(note(&alice, &bob, "old", 1), now - 20 * DAY)
+            .append(note(&alice, &bob, "old", 1), now - 20 * DAY, None)
             .unwrap();
         assert!(matches!(
             store.access(about, &alice.addr()).unwrap(),
@@ -703,7 +836,9 @@ mod tests {
             ThreadAccess::NotParticipant
         ));
 
-        let again = store.append(note(&alice, &bob, "again", 2), now).unwrap();
+        let again = store
+            .append(note(&alice, &bob, "again", 2), now, None)
+            .unwrap();
         assert_eq!(again.tseq, 2);
         assert!(store.remove(&again.env.id).unwrap());
         assert!(matches!(
@@ -722,7 +857,9 @@ mod tests {
         let store = Store::open(&dir).unwrap();
         let alice = Identity::generate("alice", "http://localhost:4200", None);
         let bob = Identity::generate("bob", "http://localhost:4200", None);
-        store.append(note(&alice, &bob, "hello", 1), 10).unwrap();
+        store
+            .append(note(&alice, &bob, "hello", 1), 10, None)
+            .unwrap();
         {
             let conn = store.conn.lock().unwrap();
             conn.execute("DELETE FROM participants", []).unwrap();
@@ -758,7 +895,7 @@ mod tests {
         let now = 100 * DAY;
         let about = "gh:acme/app/pull/1";
         store
-            .append(note(&alice, &bob, "old", 1), now - 20 * DAY)
+            .append(note(&alice, &bob, "old", 1), now - 20 * DAY, None)
             .unwrap();
         assert_eq!(store.sweep(now, 7).unwrap(), 1);
         assert!(store.thread(about, 0).unwrap().is_empty());
@@ -787,8 +924,12 @@ mod tests {
         let store = fresh();
         let alice = Identity::generate("alice", "http://localhost:4200", None);
         let bob = Identity::generate("bob", "http://localhost:4200", None);
-        let keep = store.append(note(&alice, &bob, "keep", 1), 10).unwrap();
-        let gone = store.append(note(&alice, &bob, "gone", 2), 11).unwrap();
+        let keep = store
+            .append(note(&alice, &bob, "keep", 1), 10, None)
+            .unwrap();
+        let gone = store
+            .append(note(&alice, &bob, "gone", 2), 11, None)
+            .unwrap();
         assert!(store.remove(&gone.env.id).unwrap());
         assert!(!store.remove(&gone.env.id).unwrap());
         let inbox = store.inbox(&bob.addr(), 0).unwrap();

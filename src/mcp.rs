@@ -10,10 +10,13 @@ use std::path::Path;
 
 use crate::client;
 use crate::envelope;
-use crate::identity::Identity;
+use crate::evidence::Origin;
+use crate::identity::{self, Identity, Standing};
 
 const TOOLS: &[&str] = &[
     "ecco_send",
+    "ecco_evidence",
+    "ecco_assess",
     "ecco_inbox",
     "ecco_thread",
     "ecco_pending",
@@ -131,7 +134,8 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
                 .get("encrypt")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let body = crate::message_body(text, str_arg("in_reply_to"));
+            let body =
+                crate::structured_body(args.get("body").cloned(), text, str_arg("in_reply_to"))?;
             crate::post_idempotent(
                 home,
                 &id,
@@ -145,6 +149,46 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
                 str_arg("idempotency_key").as_deref(),
             )
             .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
+        }
+        "ecco_assess" => {
+            let origin = std::env::var("ECCO_TRUST_API").map_err(|_| {
+                "configure ECCO_TRUST_API to select the account's trusted assessment service"
+            })?;
+            let input = args
+                .get("request")
+                .ok_or("exact assessment request is required")?;
+            Ok(pretty(&client::assess(&id, &origin, input)?))
+        }
+        "ecco_evidence" => {
+            let about = str_arg("about").ok_or("'about' is required")?;
+            let bindings: Vec<Origin> = args
+                .get("bindings")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| format!("bindings: {e}"))?
+                .ok_or("independently verified address/root/relay bindings are required")?;
+            let contacts = identity::contacts_load(home);
+            let mut visible = Vec::new();
+            let mut held = 0;
+            for bundle in client::evidence(&id, &about)? {
+                let standing = identity::standing(&contacts, &id.addr(), &bundle.env.from);
+                if standing != Standing::Trusted {
+                    held += 1;
+                    continue;
+                }
+                let pin = bindings
+                    .iter()
+                    .find(|p| p.address == bundle.env.from)
+                    .ok_or("missing independently verified sender binding")?;
+                bundle.verify_trusted(&pin.root, &pin.relay)?;
+                visible.push(bundle);
+            }
+            Ok(pretty(&json!({
+                "bundles": visible,
+                "held_for_human_review": held,
+                "coverage": "retained and admitted records only",
+            })))
         }
         "ecco_inbox" => {
             let new = args.get("new").and_then(Value::as_bool).unwrap_or(false);
@@ -243,12 +287,25 @@ fn tool_defs() -> Value {
     let no_args = json!({ "type": "object", "properties": {} });
     json!([
         {
+            "name":"ecco_assess",
+            "description":"Assess a counterparty for an exact proposed purchase using the configured organization service. Result is advisory and never authorizes payment. Requires operator-configured ECCO_TRUST_API.",
+            "inputSchema":{"type":"object","properties":{"request":{"type":"object","description":"Counterparty and exact action: id, type purchase, category, monetary amount in atomic decimal-string units, termsDigest, paymentDestinationRef and horizonDays."}},"required":["request"]}
+        },
+        {
+            "name": "ecco_evidence",
+            "description": "Export retained historical evidence for a thread and verify against independently pinned keys. Signature validity does not establish claim truth or current spending authority.",
+            "inputSchema": { "type": "object", "properties": {
+                "about": { "type": "string" }, "bindings": { "type": "array", "items": { "type": "object", "properties": { "address": { "type": "string" }, "root": { "type": "string" }, "relay": { "type": "string" } }, "required": ["address", "root", "relay"] } }
+            }, "required": ["about", "bindings"] }
+        },
+        {
             "name": "ecco_send",
             "description": "Post a signed message to an ecco thread. A send with in_reply_to gets automatic durable retry identity. Kinds: note (default); claim (announce you are starting work — check the thread for existing claims first); release (withdraw a claim); request (ask a collaborator's agent to act); finding (report a result); proposal (ask your human for a decision, then stop and wait). Decisions cannot be sent from this surface.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "text": { "type": "string" },
+                    "body": { "type": "object", "description": "Structured signed body fields. Economic assertions require separate evidence authority; text and in_reply_to remain explicit." },
                     "to": { "type": "array", "items": { "type": "string" }, "description": "recipient addresses, name@authority" },
                     "about": { "type": "string", "description": "thread anchor, e.g. gh:owner/repo/pull/13; defaults to a DM thread with the recipients" },
                     "kind": { "type": "string", "enum": ["note", "claim", "release", "request", "finding", "proposal"] },

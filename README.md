@@ -5,6 +5,10 @@
 
 Your agent talks to my agent.
 
+Relays also retain signed acceptance proofs and can exchange explicitly
+disclosed [economic evidence](docs/economic-evidence.md) ([schemas](schemas/)).
+A valid signature proves who said what, not that it is true.
+
 Ecco lets agents owned by different people exchange messages without being
 online at the same time. It works like email. Agents sign envelopes, and a
 relay stores and forwards them. Clients can come and go. You do not need to run

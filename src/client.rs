@@ -1,11 +1,16 @@
 //! HTTP client for the relay API. README §5.
 
-use ed25519_dalek::{Signature, Signer, Verifier};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::envelope::{self, encode_key, Envelope};
-use crate::identity::{addr_relay_url, request_signing_bytes, Identity, Profile};
+use crate::evidence::{self, Bundle};
+use crate::federation::ReceivedEvidence;
+use crate::identity::{addr_relay_url, authority, request_signing_bytes, Identity, Profile};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Stored {
@@ -36,6 +41,26 @@ struct ReceiptSigningView<'a> {
 }
 
 impl Receipt {
+    pub fn sign(env: &Envelope, gseq: u64, tseq: u64, received_at: u64, key: &SigningKey) -> Self {
+        let relay = encode_key(&key.verifying_key());
+        let bytes = serde_json::to_vec(&ReceiptSigningView {
+            gseq,
+            id: &env.id,
+            received_at,
+            relay: &relay,
+            tseq,
+        })
+        .unwrap();
+        Self {
+            gseq,
+            id: env.id.clone(),
+            received_at,
+            relay,
+            sig: format!("ed25519:{}", hex::encode(key.sign(&bytes).to_bytes())),
+            tseq,
+        }
+    }
+
     /// Verify the self-contained relay signature and bind it to the sent envelope.
     pub fn verify(&self, env: &Envelope) -> Result<(), String> {
         if self.id != env.id {
@@ -79,7 +104,9 @@ pub fn publish(id: &Identity, profile: &Profile) -> Result<(), String> {
 pub fn resolve(addr: &str, token: Option<&str>) -> Result<Profile, String> {
     let relay = addr_relay_url(addr)?;
     let name = addr.split_once('@').unwrap().0;
-    let mut req = ureq::get(&format!("{relay}/addr/{name}")).timeout(Duration::from_secs(15));
+    let mut req = http_agent()
+        .get(&format!("{relay}/addr/{name}"))
+        .timeout(Duration::from_secs(15));
     if let Some(t) = token {
         req = req.set("authorization", &format!("Bearer {t}"));
     }
@@ -101,6 +128,10 @@ pub fn send(id: &Identity, env: &Envelope) -> Result<Receipt, String> {
     let receipt: Receipt =
         serde_json::from_str(&raw).map_err(|e| format!("bad relay receipt: {e}"))?;
     receipt.verify(env)?;
+    // Economic evidence leaves the relay only through a signed disclosure.
+    if env.body.get("economic").is_some() {
+        return Ok(receipt);
+    }
     for to in &env.to {
         if let Ok(their_relay) = addr_relay_url(to) {
             if their_relay != id.relay {
@@ -116,7 +147,11 @@ pub fn thread(id: &Identity, about: &str, since: u64, wait: u64) -> Result<Vec<S
         "/threads?about={}&since={since}&wait={wait}",
         urlencode(about)
     );
-    fetch(id, &path, wait)
+    let messages = fetch(id, &path, wait)?;
+    if messages.iter().any(|s| s.env.about != about) {
+        return Err("relay returned an envelope from a different thread".into());
+    }
+    Ok(messages)
 }
 
 pub fn inbox(id: &Identity, since: u64, wait: u64) -> Result<Vec<Stored>, String> {
@@ -124,17 +159,140 @@ pub fn inbox(id: &Identity, since: u64, wait: u64) -> Result<Vec<Stored>, String
         "/inbox?addr={}&since={since}&wait={wait}",
         urlencode(&id.addr())
     );
-    fetch(id, &path, wait)
+    let messages = fetch(id, &path, wait)?;
+    if messages.iter().any(|s| !s.env.to.contains(&id.addr())) {
+        return Err("relay returned an envelope outside the requested inbox".into());
+    }
+    Ok(messages)
 }
 
+/// Fetch messages and check each sender against its current profile on our
+/// relay, falling back to the relay's acceptance proof when the profile has
+/// since changed.
 fn fetch(id: &Identity, path: &str, wait: u64) -> Result<Vec<Stored>, String> {
     let raw = get_signed(id, path, wait.saturating_add(10))?;
     let resp: MsgsResponse = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let mut profiles: HashMap<&str, Profile> = HashMap::new();
+    let mut proofs: HashMap<&str, Vec<Bundle>> = HashMap::new();
+    for stored in &resp.msgs {
+        let env = &stored.env;
+        env.verify()?;
+        let (name, from_authority) = env.from.split_once('@').ok_or("invalid sender address")?;
+        if from_authority != authority(&id.relay) {
+            return Err("foreign messages require the evidence federation endpoint".into());
+        }
+        if !profiles.contains_key(name) {
+            let raw = get_signed(id, &format!("/addr/{}", urlencode(name)), 15)?;
+            let profile: Profile = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            profile.verify()?;
+            if profile.name != name {
+                return Err("profile name mismatch".into());
+            }
+            profiles.insert(name, profile);
+        }
+        let profile = &profiles[name];
+        if evidence::sender_bound(env, profile, stored.received_at).is_ok() {
+            continue;
+        }
+        if !proofs.contains_key(env.about.as_str()) {
+            proofs.insert(&env.about, evidence(id, &env.about)?);
+        }
+        let bundle = proofs[env.about.as_str()]
+            .iter()
+            .find(|b| b.env.id == env.id)
+            .ok_or("missing historical sender authorization")?;
+        if bundle.profile.root != profile.root || bundle.receipt.received_at != stored.received_at {
+            return Err("historical sender binding is unavailable under the current root".into());
+        }
+    }
     Ok(resp.msgs)
 }
 
+/// Export originals and historical acceptance proofs; never decrypted projections.
+pub fn evidence(id: &Identity, about: &str) -> Result<Vec<Bundle>, String> {
+    let raw = get_signed(id, &format!("/evidence?about={}", urlencode(about)), 15)?;
+    let bundles: Vec<Bundle> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    for bundle in &bundles {
+        bundle.verify()?;
+        if bundle.env.about != about {
+            return Err("evidence is from another thread".into());
+        }
+    }
+    Ok(bundles)
+}
+
+pub fn received_evidence(id: &Identity) -> Result<Vec<ReceivedEvidence>, String> {
+    let raw = get_signed(id, "/federation/evidence", 15)?;
+    let records: Vec<ReceivedEvidence> = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    for record in &records {
+        record.delivery.verify()?;
+        record.receipt.verify(&record.delivery)?;
+        if record.delivery.audience.addr != id.addr()
+            || record.delivery.audience.root != encode_key(&id.root_key().verifying_key())
+        {
+            return Err("foreign evidence audience mismatch".into());
+        }
+    }
+    Ok(records)
+}
+
+/// Ask the hosted assessment service (ecco-ops signed-upload format) about an
+/// exact proposed action. The answer is advisory, never a permit.
+pub fn assess(id: &Identity, api: &str, input: &Value) -> Result<Value, String> {
+    let path = "/api/economic/assess";
+    let url = origin(api)?.join(path).unwrap();
+    envelope::validate_json(input)?;
+    let body = serde_json::to_string(input).map_err(|e| e.to_string())?;
+    let ts = envelope::now();
+    let statement = format!(
+        "POST\n{path}\n{ts}\n{}",
+        hex::encode(Sha256::digest(body.as_bytes()))
+    );
+    let sig = format!(
+        "ed25519:{}",
+        hex::encode(id.agent_key().sign(statement.as_bytes()).to_bytes())
+    );
+    let response = http_agent()
+        .post(url.as_str())
+        .timeout(Duration::from_secs(20))
+        .set("content-type", "application/json")
+        .set("x-ecco-addr", &id.addr())
+        .set("x-ecco-key", &encode_key(&id.agent_key().verifying_key()))
+        .set("x-ecco-ts", &ts.to_string())
+        .set("x-ecco-sig", &sig)
+        .send_string(&body)
+        .map_err(describe)?
+        .into_string()
+        .map_err(|e| e.to_string())?;
+    serde_json::from_str(&response).map_err(|e| e.to_string())
+}
+
+/// Parse a bare `scheme://host[:port]` origin: HTTPS, or HTTP to loopback.
+pub fn origin(url: &str) -> Result<url::Url, String> {
+    let url = url::Url::parse(url).map_err(|e| e.to_string())?;
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if url.username() != ""
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
+    {
+        return Err(format!(
+            "'{url}' must be a bare HTTPS origin (HTTP only on loopback)"
+        ));
+    }
+    Ok(url)
+}
+
+/// Redirects off: a relay must never be able to bounce a signed request elsewhere.
+pub(crate) fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().redirects(0).build()
+}
+
 fn post(url: &str, token: Option<&str>, body: &str) -> Result<String, String> {
-    let mut req = ureq::post(url)
+    let mut req = http_agent()
+        .post(url)
         .timeout(Duration::from_secs(15))
         .set("content-type", "application/json");
     if let Some(t) = token {
@@ -149,8 +307,9 @@ fn post(url: &str, token: Option<&str>, body: &str) -> Result<String, String> {
 /// Own-relay GET with auth-v0 headers (README §5) — signed reads are
 /// required on multi-tenant relays and harmlessly ignored on open ones.
 fn get_signed(id: &Identity, path: &str, timeout_secs: u64) -> Result<String, String> {
-    let mut req =
-        ureq::get(&format!("{}{path}", id.relay)).timeout(Duration::from_secs(timeout_secs));
+    let mut req = http_agent()
+        .get(&format!("{}{path}", id.relay))
+        .timeout(Duration::from_secs(timeout_secs));
     if let Some(t) = id.token.as_deref() {
         req = req.set("authorization", &format!("Bearer {t}"));
     }

@@ -66,13 +66,12 @@ pub(crate) fn resolved_body(id: &Identity, stored: &Stored) -> (Value, bool) {
     }
 }
 
-/// Replace ciphertext with the local plaintext view after contact-policy checks.
+/// Keep signed ciphertext intact; expose a separate local plaintext projection.
 pub(crate) fn stored_json(id: &Identity, stored: &Stored) -> Value {
     let mut value = serde_json::to_value(stored).unwrap();
     let (body, encrypted) = resolved_body(id, stored);
     if encrypted {
-        value["env"]["body"] = body;
-        value["env"]["encrypted"] = json!(true);
+        value["view"] = json!({"body": body, "encrypted": true});
     }
     value
 }
@@ -210,7 +209,10 @@ mod tests {
         .unwrap();
         let message = stored(&id, 1, &id.addr(), "finding", sealed);
         let value = stored_json(&id, &message);
-        assert_eq!(value["env"]["body"]["text"], "private");
-        assert_eq!(value["env"]["encrypted"], true);
+        assert_eq!(value["view"]["body"]["text"], "private");
+        assert_eq!(value["view"]["encrypted"], true);
+        let original: Envelope = serde_json::from_value(value["env"].clone()).unwrap();
+        original.verify().unwrap();
+        assert!(envelope::is_encrypted(&original.body));
     }
 }
