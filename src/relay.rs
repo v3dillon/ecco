@@ -1,15 +1,17 @@
 //! The relay: a dumb store-and-forward server. Verifies, stores, orders,
 //! serves. Storage is one SQLite file under --data (store::Store).
 
-use ed25519_dalek::{Signer, SigningKey, Verifier};
-use serde::Serialize;
+use ed25519_dalek::{SigningKey, Verifier};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::client::Receipt;
+use crate::economic;
 use crate::envelope::{self, encode_key, Envelope};
+use crate::federation::{Delivery, DeliveryReceipt, Peer};
 use crate::store::{Store, Stored, ThreadAccess};
 
 const MAX_WAIT_SECS: u64 = 30;
@@ -20,25 +22,6 @@ const POLL_STEP: Duration = Duration::from_millis(300);
 const MAX_BODY_BYTES: u64 = 64 * 1024;
 const MSGS_PER_MIN_PER_SENDER: u32 = 120;
 const REGISTRATIONS_PER_MIN_PER_IP: u32 = 10;
-
-#[derive(Serialize)]
-struct Receipt<'a> {
-    gseq: u64,
-    id: &'a str,
-    received_at: u64,
-    relay: &'a str,
-    sig: String,
-    tseq: u64,
-}
-
-#[derive(Serialize)]
-struct ReceiptSigningView<'a> {
-    gseq: u64,
-    id: &'a str,
-    received_at: u64,
-    relay: &'a str,
-    tseq: u64,
-}
 
 /// Fixed-window rate limiter; coarse on purpose — an abuse floor, not QoS.
 struct Limiter {
@@ -63,6 +46,8 @@ impl Limiter {
 
 pub struct Relay {
     store: Store,
+    /// Origins whose disclosures this relay retains; `federation-peers.json` in the data dir.
+    federation_peers: Vec<Peer>,
     key: SigningKey,
     token: Option<String>,
     registration_token: Option<String>,
@@ -137,8 +122,16 @@ pub fn run(
     if registration_token.as_ref().is_some_and(|t| t.len() < 32) {
         return Err("ECCO_REGISTRATION_TOKEN must contain at least 32 characters".into());
     }
+    let federation_peers = match fs::read_to_string(data.join("federation-peers.json")) {
+        Ok(raw) => {
+            serde_json::from_str(&raw).map_err(|e| format!("invalid federation policy: {e}"))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e.to_string()),
+    };
     let relay = Arc::new(Relay {
         store,
+        federation_peers,
         key,
         token,
         registration_token,
@@ -194,7 +187,11 @@ impl Relay {
         if let Some(expected) = &self.token {
             let public_profile =
                 method == "GET" && (path.starts_with("/addr/") || path == "/.well-known/ecco");
-            if !public_profile && path != "/registrations" && path != "/registrations/transfer" {
+            if !public_profile
+                && path != "/registrations"
+                && path != "/registrations/transfer"
+                && path != "/federation/evidence"
+            {
                 let authed = req.headers().iter().any(|h| {
                     h.field.equiv("authorization")
                         && h.value.as_str() == format!("Bearer {expected}")
@@ -214,8 +211,11 @@ impl Relay {
 
         // auth-v0 (README §5): on a signed relay, reads must be signed by
         // a key of a registered identity; writes are already self-certifying.
+        // Evidence reads are always signed: they are scoped to the reader.
         let mut reader: Option<String> = None;
-        if self.signed && method == "GET" && (path == "/threads" || path == "/inbox") {
+        let evidence_read = path == "/evidence" || path == "/federation/evidence";
+        let message_read = path == "/threads" || path == "/inbox";
+        if method == "GET" && (evidence_read || (self.signed && message_read)) {
             match self.verify_read(&req, &url) {
                 Ok(addr) => reader = Some(addr),
                 Err((code, e)) => {
@@ -240,6 +240,8 @@ impl Relay {
             Err((413, "body exceeds 64KB".into()))
         } else {
             match (method.as_str(), path.as_str()) {
+                ("POST", "/federation/evidence") => self.post_foreign_evidence(&body),
+                ("GET", "/federation/evidence") => self.get_foreign_evidence(reader.as_deref()),
                 ("POST", "/addr") => self.post_addr(&body, &ip),
                 ("POST", "/registrations") => {
                     self.post_registration(&body, authorization.as_deref(), false)
@@ -248,9 +250,13 @@ impl Relay {
                     self.post_registration(&body, authorization.as_deref(), true)
                 }
                 ("POST", "/addr/transfer") => self.post_name_transfer(&body),
-                ("GET", "/.well-known/ecco") => {
-                    Ok(serde_json::json!({"registration_url": self.registration_url}).to_string())
-                }
+                ("GET", "/.well-known/ecco") => Ok(serde_json::json!({
+                    "registration_url": self.registration_url,
+                    "relay_key": encode_key(&self.key.verifying_key()),
+                    "capabilities": ["evidence-v1", "federated-evidence-v1"],
+                })
+                .to_string()),
+                ("GET", "/evidence") => self.get_evidence(reader.as_deref(), &query),
                 ("GET", p) if p.starts_with("/addr/") => self.get_addr(&p["/addr/".len()..]),
                 ("POST", "/msgs") => self.post_msgs(&body),
                 ("GET", "/threads") => self
@@ -444,10 +450,86 @@ impl Relay {
             .ok_or((404, format!("no profile for '{name}'")))
     }
 
+    fn get_evidence(
+        &self,
+        reader: Option<&str>,
+        query: &HashMap<String, String>,
+    ) -> Result<String, (u16, String)> {
+        let reader = reader.ok_or((401, "signed evidence read required".into()))?;
+        self.authorize_thread(Some(reader), query)?;
+        let about = query.get("about").ok_or((400, "about required".into()))?;
+        let bundles = if let Some(id) = query.get("id") {
+            self.store
+                .proof(id)?
+                .filter(|b| b.env.about == *about)
+                .into_iter()
+                .collect()
+        } else {
+            self.store.evidence(about)?
+        };
+        Ok(serde_json::to_string(&bundles).unwrap())
+    }
+
+    fn get_foreign_evidence(&self, reader: Option<&str>) -> Result<String, (u16, String)> {
+        let addr = reader.ok_or((401, "signed evidence read required".into()))?;
+        let name = self.name_on_this_relay(addr).map_err(|e| (401, e))?;
+        let profile = self
+            .store
+            .profile(name)?
+            .ok_or((401, "unknown reader".into()))?;
+        let records = self.store.foreign_evidence(addr, &profile.root)?;
+        Ok(serde_json::to_string(&records).unwrap())
+    }
+
+    fn post_foreign_evidence(&self, body: &str) -> Result<String, (u16, String)> {
+        let d: Delivery = serde_json::from_str(body).map_err(|e| (400, e.to_string()))?;
+        let peer = self
+            .federation_peers
+            .iter()
+            .find(|p| p.origin.matches(&d.bundle))
+            .ok_or((403, "origin not admitted".into()))?;
+        if !self
+            .limiter
+            .allow(format!("federation:{}", peer.origin.address), 60)
+        {
+            return Err((429, "federation rate limit".into()));
+        }
+        d.verify().map_err(|e| (400, e))?;
+        let now = envelope::now();
+        if d.expires_at <= now
+            || d.expires_at > now + 86400
+            || peer.retain_days == 0
+            || peer.retain_days > 3650
+        {
+            return Err((400, "expired disclosure or unsupported retention".into()));
+        }
+        if d.audience.relay != encode_key(&self.key.verifying_key()) {
+            return Err((403, "wrong destination relay key".into()));
+        }
+        let name = self
+            .name_on_this_relay(&d.audience.addr)
+            .map_err(|e| (400, e))?;
+        let recipient = self
+            .store
+            .profile(name)?
+            .ok_or((403, "unknown recipient".into()))?;
+        if recipient.root != d.audience.root {
+            return Err((403, "wrong destination root".into()));
+        }
+        self.allow_root(&recipient.root)?;
+        let receipt = DeliveryReceipt::new(
+            &d,
+            now,
+            now + u64::from(peer.retain_days) * 86400,
+            &self.key,
+        );
+        Ok(serde_json::to_string(&self.store.receive_evidence(&d, &receipt)?).unwrap())
+    }
+
     fn post_msgs(&self, body: &str) -> Result<String, (u16, String)> {
         let env: Envelope =
             serde_json::from_str(body).map_err(|e| (400, format!("bad envelope: {e}")))?;
-        env.verify().map_err(|e| (400, e))?;
+        env.validate().map_err(|e| (400, e))?;
         if !self
             .limiter
             .allow(format!("msgs:{}", env.from), MSGS_PER_MIN_PER_SENDER)
@@ -464,6 +546,7 @@ impl Relay {
             .authorizes(&env.key, &env.kind, now)
             .map_err(|e| (403, e))?;
         self.allow_root(&profile.root)?;
+        economic::verify_assertion(&env, &profile, now).map_err(|e| (403, e))?;
         // Closed threads: an existing anchor accepts posts from its
         // participants only. Anyone may start an empty anchor, and being
         // addressed is how you join. A stranger reusing your anchor gets
@@ -477,26 +560,14 @@ impl Relay {
                 ),
             ));
         }
-        let stored = self.store.append(env, now)?;
-
-        let relay_key = encode_key(&self.key.verifying_key());
-        let signing = serde_json::to_vec(&ReceiptSigningView {
-            gseq: stored.gseq,
-            id: &stored.env.id,
-            received_at: stored.received_at,
-            relay: &relay_key,
-            tseq: stored.tseq,
-        })
-        .unwrap();
-        let sig = self.key.sign(&signing);
-        let receipt = Receipt {
-            gseq: stored.gseq,
-            id: &stored.env.id,
-            received_at: stored.received_at,
-            relay: &relay_key,
-            sig: format!("ed25519:{}", hex::encode(sig.to_bytes())),
-            tseq: stored.tseq,
-        };
+        let stored = self.store.append(env, now, Some((&profile, &self.key)))?;
+        let receipt = Receipt::sign(
+            &stored.env,
+            stored.gseq,
+            stored.tseq,
+            stored.received_at,
+            &self.key,
+        );
         Ok(serde_json::to_string(&receipt).unwrap())
     }
 
@@ -751,7 +822,10 @@ fn urldecode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evidence::{Bundle, Origin};
+    use crate::federation::Audience;
     use crate::identity::Identity;
+    use ed25519_dalek::Signer;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -986,6 +1060,7 @@ mod tests {
             N.fetch_add(1, Ordering::SeqCst)
         ));
         Relay {
+            federation_peers: Vec::new(),
             store: Store::open(&dir).unwrap(),
             key: SigningKey::generate(&mut rand::rngs::OsRng),
             token: None,
@@ -1019,6 +1094,40 @@ mod tests {
             &from.agent_key(),
         );
         r.post_msgs(&serde_json::to_string(&env).unwrap())
+    }
+
+    #[test]
+    fn evidence_id_lookup_remains_thread_and_participant_scoped() {
+        let r = relay();
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        for id in [&alice, &bob] {
+            r.store.register(id.profile()).unwrap();
+        }
+        post(&r, &alice, "first", &[], "one").unwrap();
+        post(&r, &alice, "first", &[], "two").unwrap();
+        post(&r, &alice, "second", &[], "private").unwrap();
+        let all = r.store.evidence("first").unwrap();
+        let query = HashMap::from([
+            ("about".into(), "first".into()),
+            ("id".into(), all[0].env.id.clone()),
+        ]);
+        let selected: Vec<Bundle> =
+            serde_json::from_str(&r.get_evidence(Some(&alice.addr()), &query).unwrap()).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].env.id, all[0].env.id);
+        assert_eq!(
+            r.get_evidence(Some(&bob.addr()), &query).unwrap_err().0,
+            403
+        );
+        assert_eq!(r.get_evidence(None, &query).unwrap_err().0, 401);
+        let other = r.store.evidence("second").unwrap();
+        let wrong = HashMap::from([
+            ("about".into(), "first".into()),
+            ("id".into(), other[0].env.id.clone()),
+        ]);
+        assert_eq!(r.get_evidence(Some(&alice.addr()), &wrong).unwrap(), "[]");
+        assert_eq!(r.store.evidence("first").unwrap().len(), 2);
     }
 
     #[test]
@@ -1300,5 +1409,84 @@ mod tests {
         assert_eq!(signed_get(port, path, &alice), 200);
         *relay.allowed_roots.lock().unwrap() = Some(HashSet::new());
         assert_eq!(signed_get(port, path, &alice), 403);
+    }
+    #[test]
+    fn foreign_evidence_is_pinned_audience_bound_idempotent_and_never_an_inbox_command() {
+        let mut source = relay();
+        source.authority = "source.test".into();
+        let mut destination = relay();
+        let alice = Identity::generate("alice", "https://source.test", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        source
+            .post_addr(&serde_json::to_string(&alice.profile()).unwrap(), "1.1.1.1")
+            .unwrap();
+        destination
+            .post_addr(&serde_json::to_string(&bob.profile()).unwrap(), "1.1.1.1")
+            .unwrap();
+        let env = Envelope::seal(
+            "contract".into(),
+            json!({"economic":{"schema":"ecco.economic-event/v1","type":"external_attestation","payload":{"claim":"seller asserts delivery"},"links":[]}}),
+            alice.addr(),
+            "finding".into(),
+            vec![],
+            vec![bob.addr()],
+            envelope::now(),
+            &alice.root_key(),
+        );
+        source
+            .post_msgs(&serde_json::to_string(&env).unwrap())
+            .unwrap();
+        let bundle = source.store.proof(&env.id).unwrap().unwrap();
+        let audience = Audience {
+            addr: bob.addr(),
+            root: bob.profile().root,
+            relay: encode_key(&destination.key.verifying_key()),
+        };
+        let delivery = Delivery::new(
+            bundle.clone(),
+            audience,
+            envelope::now() + 300,
+            "counterparty evidence".into(),
+            &alice.root_key(),
+        )
+        .unwrap();
+        let body = serde_json::to_string(&delivery).unwrap();
+        assert_eq!(destination.post_foreign_evidence(&body).unwrap_err().0, 403);
+        destination.federation_peers.push(Peer {
+            origin: Origin {
+                address: alice.addr(),
+                root: bundle.profile.root,
+                relay: bundle.receipt.relay,
+            },
+            retain_days: 365,
+        });
+        let receipt = destination.post_foreign_evidence(&body).unwrap();
+        assert_eq!(destination.post_foreign_evidence(&body).unwrap(), receipt);
+        let proof: DeliveryReceipt = serde_json::from_str(&receipt).unwrap();
+        proof.verify(&delivery).unwrap();
+        assert_eq!(
+            destination
+                .store
+                .foreign_evidence(&bob.addr(), &bob.profile().root)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(destination
+            .store
+            .foreign_evidence(&bob.addr(), &alice.profile().root)
+            .unwrap()
+            .is_empty());
+        assert!(destination.store.thread("contract", 0).unwrap().is_empty());
+        let mut wrong = delivery.clone();
+        wrong.audience.root = alice.profile().root;
+        assert!(destination
+            .post_foreign_evidence(&serde_json::to_string(&wrong).unwrap())
+            .is_err());
+        let mut expired = delivery;
+        expired.expires_at = envelope::now() - 1;
+        assert!(destination
+            .post_foreign_evidence(&serde_json::to_string(&expired).unwrap())
+            .is_err());
     }
 }
