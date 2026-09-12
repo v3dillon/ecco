@@ -1,0 +1,44 @@
+{
+  "schema": "ecco.evidence/v1",
+  "env": {
+    "id": "b3:29502cd97a94316a2029ae06a49f89a44115809d7d458ae53db917af0482c716",
+    "about": "vectors",
+    "body": {
+      "nested": {
+        "10": 10,
+        "2": 2,
+        "": 2,
+        "𐀀": 1
+      },
+      "safe": 9007199254740991,
+      "text": "portable"
+    },
+    "from": "alice@relay.example",
+    "key": "ed25519:8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "kind": "note",
+    "prev": [],
+    "sig": "ed25519:7a29ecc636baf42db20cdbe5926d3ebe5d67af41fe11db09e62110d8eb82017b73cf4e577a526fcba6bff12629dc08792031555a9983a579efac742f67ee0e09",
+    "to": [
+      "bob@relay.example"
+    ],
+    "ts": 1700000000,
+    "v": 0
+  },
+  "profile": {
+    "delegations": [],
+    "endpoints": [],
+    "name": "alice",
+    "root": "ed25519:8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "sig": "ed25519:e9f01f10a34993f171eaf07c6f6a3e0adff50308aa9bc99843f226ad2d3b61d3f1f584491f6ddcb58c3a151f93b848160e1b28873a97c12de6cd28bdb9237b03",
+    "v": 0
+  },
+  "receipt": {
+    "gseq": 1,
+    "id": "b3:29502cd97a94316a2029ae06a49f89a44115809d7d458ae53db917af0482c716",
+    "received_at": 1700000001,
+    "relay": "ed25519:ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+    "sig": "ed25519:fa1b8e4aa67b413ad1cb8769a042c15174f4a0a0e94028edb716f5c31d802e200bd638b15e052d1da3470f7a919aed6c2833afe33cf2e70503d034cb6226a601",
+    "tseq": 1
+  },
+  "acceptance_sig": "ed25519:61f14b5abdf756715804d2e33c2c4cfdb2db722ef8055928de6c06640e2d35b68e76a475a407dfbe5dba3bfdc22daa40d5f322b3ab7df67576826feada7e1a0f"
+}
