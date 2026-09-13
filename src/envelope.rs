@@ -53,6 +53,18 @@ struct IdView<'a> {
 }
 
 impl Envelope {
+    /// Validate new v0 input without changing the legacy signing representation.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.v != 0 {
+            return Err("unsupported envelope version".into());
+        }
+        if !self.body.is_object() {
+            return Err("envelope body must be an object".into());
+        }
+        validate_json(&serde_json::to_value(self).map_err(|e| e.to_string())?)?;
+        self.verify()
+    }
+
     fn signing_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(&SigningView {
             about: &self.about,
@@ -135,6 +147,23 @@ impl Envelope {
             .map_err(|_| "bad signature length".to_string())?;
         key.verify(&self.signing_bytes(), &Signature::from_bytes(&sig_bytes))
             .map_err(|_| "bad signature".to_string())
+    }
+}
+
+/// The portable v0 subset: exact integers, object keys sorted by UTF-8 bytes.
+/// Do not replace this with JCS: doing so changes existing signatures.
+pub fn validate_json(value: &Value) -> Result<(), String> {
+    match value {
+        Value::Number(n)
+            if n.is_f64()
+                || n.as_u64().is_some_and(|v| v > 9_007_199_254_740_991)
+                || n.as_i64().is_some_and(|v| v < -9_007_199_254_740_991) =>
+        {
+            Err("JSON numbers must be safe integers; use decimal strings".into())
+        }
+        Value::Array(values) => values.iter().try_for_each(validate_json),
+        Value::Object(values) => values.values().try_for_each(validate_json),
+        _ => Ok(()),
     }
 }
 

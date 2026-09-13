@@ -1,0 +1,250 @@
+{
+  "schema": "ecco.witness-conformance/v1",
+  "cases": [
+    {
+      "name": "original",
+      "checkpoint": {
+        "scope": "orders",
+        "audience": "C",
+        "sequence": 0,
+        "previous": null,
+        "observedAt": 100,
+        "events": [
+          "b3:61e417a33eed5fc085f95b00e189cbe5e172c0a56f18bf0ece807d38660b6274"
+        ],
+        "schema": "ecco.evidence-checkpoint/v1",
+        "key": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "commitment": "b3:9b6b94267736a241a1fd3621a87dd258fe465201a1b44d72ec95479e07a3a1a6",
+        "sig": "ed25519:707ee7ab26c7c6d0a52b6d52c9ba59a9975a10670818b5e6640c5b4df1c4a3c0466705722f35ca926e559dbc274264217a15a0cd0a417b67892428e0a23caa09"
+      },
+      "receipt": {
+        "schema": "ecco.checkpoint-witness/v1",
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "C",
+        "checkpoint": "b3:fe30881bd83806cc370739ddf528e3c66dcdb376941a56796da2e1b0cfae628e",
+        "receivedAt": 110,
+        "sig": "ed25519:edc8edca2314f60c20d4763216ca5836ae09abcb12cd570a8bc8823f4a41cd456da5e6f459bed8f83fc2cbf12dfe12862ae64f68c71180cc1cfdb7ba53147e03"
+      },
+      "policy": {
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "C"
+      },
+      "now": 120,
+      "valid": true
+    },
+    {
+      "name": "scope-substitution",
+      "checkpoint": {
+        "scope": "orders",
+        "audience": "C",
+        "sequence": 0,
+        "previous": null,
+        "observedAt": 100,
+        "events": [
+          "b3:61e417a33eed5fc085f95b00e189cbe5e172c0a56f18bf0ece807d38660b6274"
+        ],
+        "schema": "ecco.evidence-checkpoint/v1",
+        "key": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "commitment": "b3:9b6b94267736a241a1fd3621a87dd258fe465201a1b44d72ec95479e07a3a1a6",
+        "sig": "ed25519:707ee7ab26c7c6d0a52b6d52c9ba59a9975a10670818b5e6640c5b4df1c4a3c0466705722f35ca926e559dbc274264217a15a0cd0a417b67892428e0a23caa09"
+      },
+      "receipt": {
+        "schema": "ecco.checkpoint-witness/v1",
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "C",
+        "checkpoint": "b3:fe30881bd83806cc370739ddf528e3c66dcdb376941a56796da2e1b0cfae628e",
+        "receivedAt": 110,
+        "sig": "ed25519:edc8edca2314f60c20d4763216ca5836ae09abcb12cd570a8bc8823f4a41cd456da5e6f459bed8f83fc2cbf12dfe12862ae64f68c71180cc1cfdb7ba53147e03"
+      },
+      "policy": {
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "other"
+      },
+      "now": 120,
+      "valid": false
+    },
+    {
+      "name": "future-witness",
+      "checkpoint": {
+        "scope": "orders",
+        "audience": "C",
+        "sequence": 0,
+        "previous": null,
+        "observedAt": 100,
+        "events": [
+          "b3:61e417a33eed5fc085f95b00e189cbe5e172c0a56f18bf0ece807d38660b6274"
+        ],
+        "schema": "ecco.evidence-checkpoint/v1",
+        "key": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "commitment": "b3:9b6b94267736a241a1fd3621a87dd258fe465201a1b44d72ec95479e07a3a1a6",
+        "sig": "ed25519:707ee7ab26c7c6d0a52b6d52c9ba59a9975a10670818b5e6640c5b4df1c4a3c0466705722f35ca926e559dbc274264217a15a0cd0a417b67892428e0a23caa09"
+      },
+      "receipt": {
+        "schema": "ecco.checkpoint-witness/v1",
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "C",
+        "checkpoint": "b3:fe30881bd83806cc370739ddf528e3c66dcdb376941a56796da2e1b0cfae628e",
+        "receivedAt": 110,
+        "sig": "ed25519:edc8edca2314f60c20d4763216ca5836ae09abcb12cd570a8bc8823f4a41cd456da5e6f459bed8f83fc2cbf12dfe12862ae64f68c71180cc1cfdb7ba53147e03"
+      },
+      "policy": {
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "C"
+      },
+      "now": 109,
+      "valid": false
+    },
+    {
+      "name": "self-witness",
+      "checkpoint": {
+        "scope": "orders",
+        "audience": "C",
+        "sequence": 0,
+        "previous": null,
+        "observedAt": 100,
+        "events": [
+          "b3:61e417a33eed5fc085f95b00e189cbe5e172c0a56f18bf0ece807d38660b6274"
+        ],
+        "schema": "ecco.evidence-checkpoint/v1",
+        "key": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "commitment": "b3:9b6b94267736a241a1fd3621a87dd258fe465201a1b44d72ec95479e07a3a1a6",
+        "sig": "ed25519:707ee7ab26c7c6d0a52b6d52c9ba59a9975a10670818b5e6640c5b4df1c4a3c0466705722f35ca926e559dbc274264217a15a0cd0a417b67892428e0a23caa09"
+      },
+      "receipt": {
+        "schema": "ecco.checkpoint-witness/v1",
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "C",
+        "checkpoint": "b3:fe30881bd83806cc370739ddf528e3c66dcdb376941a56796da2e1b0cfae628e",
+        "receivedAt": 110,
+        "sig": "ed25519:edc8edca2314f60c20d4763216ca5836ae09abcb12cd570a8bc8823f4a41cd456da5e6f459bed8f83fc2cbf12dfe12862ae64f68c71180cc1cfdb7ba53147e03"
+      },
+      "policy": {
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "scope": "orders",
+        "audience": "C"
+      },
+      "now": 120,
+      "valid": false
+    },
+    {
+      "name": "changed-original",
+      "checkpoint": {
+        "scope": "orders",
+        "audience": "C",
+        "sequence": 0,
+        "previous": null,
+        "observedAt": 100,
+        "events": [
+          "b3:fb16e03aaccf3e78622715d7a2deafebd4f1a96132f5c94ce6e27ea8b733eb00"
+        ],
+        "schema": "ecco.evidence-checkpoint/v1",
+        "key": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "commitment": "b3:ff4c432fb6b570e54d305a51d97d14a1afc32ea169db78120eacc4fd428f0a60",
+        "sig": "ed25519:8c0695a283de53ac183dc4413ca4543a6afd9c32e41733412f4bcaf18560f055980abc006e4d0dc1144513a20e316be14726362b90754480a520bd251c576003"
+      },
+      "receipt": {
+        "schema": "ecco.checkpoint-witness/v1",
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "C",
+        "checkpoint": "b3:fe30881bd83806cc370739ddf528e3c66dcdb376941a56796da2e1b0cfae628e",
+        "receivedAt": 110,
+        "sig": "ed25519:edc8edca2314f60c20d4763216ca5836ae09abcb12cd570a8bc8823f4a41cd456da5e6f459bed8f83fc2cbf12dfe12862ae64f68c71180cc1cfdb7ba53147e03"
+      },
+      "policy": {
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "C"
+      },
+      "now": 120,
+      "valid": false
+    },
+    {
+      "name": "changed-clock",
+      "checkpoint": {
+        "scope": "orders",
+        "audience": "C",
+        "sequence": 0,
+        "previous": null,
+        "observedAt": 100,
+        "events": [
+          "b3:61e417a33eed5fc085f95b00e189cbe5e172c0a56f18bf0ece807d38660b6274"
+        ],
+        "schema": "ecco.evidence-checkpoint/v1",
+        "key": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "commitment": "b3:9b6b94267736a241a1fd3621a87dd258fe465201a1b44d72ec95479e07a3a1a6",
+        "sig": "ed25519:707ee7ab26c7c6d0a52b6d52c9ba59a9975a10670818b5e6640c5b4df1c4a3c0466705722f35ca926e559dbc274264217a15a0cd0a417b67892428e0a23caa09"
+      },
+      "receipt": {
+        "schema": "ecco.checkpoint-witness/v1",
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "C",
+        "checkpoint": "b3:fe30881bd83806cc370739ddf528e3c66dcdb376941a56796da2e1b0cfae628e",
+        "receivedAt": 111,
+        "sig": "ed25519:edc8edca2314f60c20d4763216ca5836ae09abcb12cd570a8bc8823f4a41cd456da5e6f459bed8f83fc2cbf12dfe12862ae64f68c71180cc1cfdb7ba53147e03"
+      },
+      "policy": {
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "C"
+      },
+      "now": 120,
+      "valid": false
+    },
+    {
+      "name": "before-source",
+      "checkpoint": {
+        "scope": "orders",
+        "audience": "C",
+        "sequence": 0,
+        "previous": null,
+        "observedAt": 100,
+        "events": [
+          "b3:61e417a33eed5fc085f95b00e189cbe5e172c0a56f18bf0ece807d38660b6274"
+        ],
+        "schema": "ecco.evidence-checkpoint/v1",
+        "key": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "commitment": "b3:9b6b94267736a241a1fd3621a87dd258fe465201a1b44d72ec95479e07a3a1a6",
+        "sig": "ed25519:707ee7ab26c7c6d0a52b6d52c9ba59a9975a10670818b5e6640c5b4df1c4a3c0466705722f35ca926e559dbc274264217a15a0cd0a417b67892428e0a23caa09"
+      },
+      "receipt": {
+        "schema": "ecco.checkpoint-witness/v1",
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "C",
+        "checkpoint": "b3:fe30881bd83806cc370739ddf528e3c66dcdb376941a56796da2e1b0cfae628e",
+        "receivedAt": 99,
+        "sig": "ed25519:fbc9fae903074f9595c908b4dc9d02d80d8cd4b502ca4bacb816e64a8ee5a548e7e460f1ea69a7d5d00468ec3e414d058c52433af6909a8adaf95fece86e8709"
+      },
+      "policy": {
+        "source": "ed25519:3bdcbd5d584b0d901f33e612f4982883f06e5cb9cc2274939d63648fe3bce384",
+        "witness": "ed25519:b1058d0a13e6d7807090901daa1e902e90d8669b0039f7747dc386f6cef3b043",
+        "scope": "orders",
+        "audience": "C"
+      },
+      "now": 120,
+      "valid": false
+    }
+  ]
+}

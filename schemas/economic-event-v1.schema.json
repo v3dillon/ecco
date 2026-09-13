@@ -1,0 +1,418 @@
+{
+  "type": "object",
+  "properties": {
+    "schema": {
+      "const": "ecco.economic-event/v1"
+    },
+    "type": {
+      "enum": [
+        "identity_created",
+        "identity_verified",
+        "key_rotated",
+        "identity_recovered",
+        "ownership_transferred",
+        "delegation_created",
+        "delegation_revoked",
+        "authorization_granted",
+        "intent_created",
+        "offer_created",
+        "offer_accepted",
+        "interaction_started",
+        "task_started",
+        "artifact_delivered",
+        "payment_authorized",
+        "payment_settled",
+        "fulfillment_acknowledged",
+        "fulfillment_rejected",
+        "refund",
+        "chargeback",
+        "dispute_opened",
+        "evidence_submitted",
+        "dispute_resolved",
+        "external_attestation",
+        "operating_version_changed"
+      ]
+    },
+    "interaction": {
+      "type": "string",
+      "minLength": 1
+    },
+    "principal": {
+      "type": "string",
+      "minLength": 1
+    },
+    "controllerHead": {
+      "type": "string",
+      "minLength": 1
+    },
+    "payload": {
+      "type": "object"
+    },
+    "links": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "grant": {
+      "$ref": "#/$defs/grant"
+    }
+  },
+  "required": [
+    "schema",
+    "type",
+    "payload",
+    "links"
+  ],
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Ecco economic event v1 structural profile",
+  "$comment": "Structural validation is not signature, authority, issuer, identity continuity or economic truth verification. See docs/economic-evidence.md and src/economic.rs. Unknown payload fields are extensible; semantic projectors independently select supported claims.",
+  "$defs": {
+    "money": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,37})$"
+        },
+        "currency": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$"
+        },
+        "unit": {
+          "const": "minor"
+        },
+        "exponent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9
+        }
+      },
+      "required": [
+        "value",
+        "currency",
+        "unit",
+        "exponent"
+      ]
+    },
+    "grant": {
+      "type": "object",
+      "properties": {
+        "schema": {
+          "const": "ecco.evidence-grant/v1"
+        },
+        "issuer": {
+          "type": "string",
+          "pattern": "^ed25519:[0-9a-f]{64}$"
+        },
+        "key": {
+          "type": "string",
+          "pattern": "^ed25519:[0-9a-f]{64}$"
+        },
+        "types": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "identity_created",
+              "identity_verified",
+              "key_rotated",
+              "identity_recovered",
+              "ownership_transferred",
+              "delegation_created",
+              "delegation_revoked",
+              "authorization_granted",
+              "intent_created",
+              "offer_created",
+              "offer_accepted",
+              "interaction_started",
+              "task_started",
+              "artifact_delivered",
+              "payment_authorized",
+              "payment_settled",
+              "fulfillment_acknowledged",
+              "fulfillment_rejected",
+              "refund",
+              "chargeback",
+              "dispute_opened",
+              "evidence_submitted",
+              "dispute_resolved",
+              "external_attestation",
+              "operating_version_changed"
+            ]
+          },
+          "minItems": 1
+        },
+        "interaction": {
+          "type": "string"
+        },
+        "notBefore": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "expiresAt": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "sig": {
+          "type": "string",
+          "pattern": "^ed25519:[0-9a-f]{128}$"
+        }
+      },
+      "required": [
+        "schema",
+        "issuer",
+        "key",
+        "types",
+        "interaction",
+        "notBefore",
+        "expiresAt",
+        "sig"
+      ]
+    },
+    "recovery": {
+      "type": "object",
+      "required": [
+        "keys",
+        "threshold"
+      ],
+      "properties": {
+        "keys": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^ed25519:[0-9a-f]{64}$"
+          }
+        },
+        "threshold": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "delaySeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2592000
+        },
+        "contestSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2592000
+        }
+      }
+    },
+    "disputePolicy": {
+      "type": "object",
+      "required": [
+        "procedureDigest",
+        "appealArbiter",
+        "appealWindowSeconds"
+      ],
+      "properties": {
+        "procedureDigest": {
+          "type": "string",
+          "pattern": "^(b3|sha256):[0-9a-f]{64}$"
+        },
+        "appealArbiter": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "appealWindowSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2592000
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "payment_authorized",
+              "payment_settled",
+              "refund",
+              "chargeback"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "interaction"
+        ],
+        "properties": {
+          "payload": {
+            "type": "object",
+            "properties": {
+              "amount": {
+                "$ref": "#/$defs/money"
+              },
+              "source": {
+                "type": "object",
+                "properties": {
+                  "provider": {
+                    "type": "string"
+                  },
+                  "account": {
+                    "type": "string"
+                  },
+                  "environment": {
+                    "enum": [
+                      "test",
+                      "live"
+                    ]
+                  },
+                  "objectId": {
+                    "type": "string"
+                  },
+                  "method": {
+                    "type": "string"
+                  },
+                  "observer": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "provider",
+                  "account",
+                  "environment",
+                  "objectId",
+                  "method",
+                  "observer"
+                ]
+              }
+            },
+            "required": [
+              "amount",
+              "source"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "artifact_delivered",
+              "fulfillment_acknowledged",
+              "fulfillment_rejected"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "interaction"
+        ],
+        "properties": {
+          "payload": {
+            "type": "object",
+            "properties": {
+              "termsDigest": {
+                "type": "string",
+                "pattern": "^(b3|sha256):[0-9a-f]{64}$"
+              },
+              "artifactDigest": {
+                "type": "string",
+                "pattern": "^(b3|sha256):[0-9a-f]{64}$"
+              },
+              "milestone": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "termsDigest",
+              "artifactDigest",
+              "milestone"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "operating_version_changed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "required": [
+              "previous",
+              "versionDigest"
+            ],
+            "properties": {
+              "previous": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "versionDigest": {
+                "type": "string",
+                "pattern": "^(b3|sha256):[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "identity_created"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "recovery": {
+                "$ref": "#/$defs/recovery"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "interaction_started"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "disputePolicy": {
+                "$ref": "#/$defs/disputePolicy"
+              }
+            },
+            "dependentRequired": {
+              "disputePolicy": [
+                "arbiter"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

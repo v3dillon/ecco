@@ -1,13 +1,14 @@
 mod agent_surface;
-mod client;
 mod coordination;
-mod envelope;
-mod identity;
 mod mcp;
 mod outbox;
 mod registration;
 mod relay;
 mod store;
+
+use ecco::{
+    client, economic, economic_history, envelope, evidence, exchange, federation, identity,
+};
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -19,7 +20,16 @@ use envelope::Envelope;
 use identity::Identity;
 
 const DURABLE_CORRELATED_SEND_CAPABILITY: &str = "durable-correlated-send-v1";
-const CAPABILITIES: &[&str] = &[DURABLE_CORRELATED_SEND_CAPABILITY];
+const CAPABILITIES: &[&str] = &[
+    DURABLE_CORRELATED_SEND_CAPABILITY,
+    "evidence-v1",
+    "original-envelope-view-v1",
+    "structured-body-v1",
+    "economic-assertion-v1",
+    "federated-evidence-v1",
+    "contextual-assessment-client-v1",
+    "economic-semantic-verification-v1",
+];
 
 #[derive(Parser)]
 #[command(
@@ -93,6 +103,9 @@ enum Cmd {
     /// Post a message to a thread
     Send {
         text: String,
+        /// Merge a JSON object from this file into the signed body; text stays explicit
+        #[arg(long)]
+        body_file: Option<PathBuf>,
         /// Recipient address(es), name@authority
         #[arg(long)]
         to: Vec<String>,
@@ -115,6 +128,52 @@ enum Cmd {
     Work {
         #[command(subcommand)]
         cmd: WorkCmd,
+    },
+    /// Export original signed evidence for a thread
+    Evidence { about: String },
+    /// Assess an exact proposed action within an Ecco product account. Advisory only.
+    Assess {
+        file: PathBuf,
+        #[arg(long)]
+        api: String,
+    },
+    /// Queue an already signed, audience-bound disclosure. Never forwards relay credentials.
+    EvidenceQueue {
+        file: PathBuf,
+        #[arg(long)]
+        url: String,
+    },
+    /// Retry up to 32 pending evidence deliveries. Suitable for an operator timer.
+    EvidenceFlush,
+    /// Export independently retained foreign evidence and destination custody receipts.
+    EvidenceReceived,
+    /// Inspect delivery acknowledgment and retry state.
+    EvidenceStatus { id: String },
+    /// Create a disclosure on the principal's trusted machine, using its root key.
+    EvidenceDisclose {
+        file: PathBuf,
+        #[arg(long)]
+        recipient: String,
+        #[arg(long)]
+        root: String,
+        #[arg(long)]
+        relay_key: String,
+        #[arg(long)]
+        purpose: String,
+    },
+    /// Verify a portable bundle against independently trusted root and relay keys
+    Verify {
+        file: PathBuf,
+        #[arg(long)]
+        root: String,
+        #[arg(long)]
+        relay_key: String,
+    },
+    /// Independently project a bundle array using an operator-supplied origin/issuer policy
+    VerifyHistory {
+        file: PathBuf,
+        #[arg(long)]
+        pins: PathBuf,
     },
     /// Show messages addressed to you
     Inbox {
@@ -342,6 +401,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
         },
         Cmd::Send {
             text,
+            body_file,
             to,
             about,
             kind,
@@ -351,7 +411,8 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
         } => {
             let id = Identity::load(home)?;
             let about = about.unwrap_or_else(|| dm_thread(&id.addr(), &to));
-            let body = message_body(text, in_reply_to);
+            let extra = body_file.map(|p| read_json(&p)).transpose()?;
+            let body = structured_body(extra, text, in_reply_to)?;
             let receipt = post_idempotent(
                 home,
                 &id,
@@ -365,6 +426,94 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                 idempotency_key.as_deref(),
             )?;
             println!("{}", serde_json::to_string(&receipt).unwrap());
+            Ok(())
+        }
+        Cmd::Assess { file, api } => {
+            let input: Value = read_json(&file)?;
+            println!("{}", client::assess(&Identity::load(home)?, &api, &input)?);
+            Ok(())
+        }
+        Cmd::EvidenceQueue { file, url } => {
+            let delivery: federation::Delivery = read_json(&file)?;
+            println!("{}", exchange::queue(home, &delivery, &url)?);
+            Ok(())
+        }
+        Cmd::EvidenceReceived => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&client::received_evidence(&Identity::load(home)?)?)
+                    .unwrap()
+            );
+            Ok(())
+        }
+        Cmd::EvidenceFlush => {
+            println!("{}", exchange::flush(home)?);
+            Ok(())
+        }
+        Cmd::EvidenceStatus { id } => {
+            println!(
+                "{}",
+                serde_json::to_string(&exchange::status(home, &id)?).unwrap()
+            );
+            Ok(())
+        }
+        Cmd::EvidenceDisclose {
+            file,
+            recipient,
+            root,
+            relay_key,
+            purpose,
+        } => {
+            let id = Identity::load(home)?;
+            let delivery = federation::Delivery::new(
+                read_json(&file)?,
+                federation::Audience {
+                    addr: recipient,
+                    root,
+                    relay: relay_key,
+                },
+                envelope::now() + 3600,
+                purpose,
+                &id.root_key(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&delivery).unwrap());
+            Ok(())
+        }
+        Cmd::Evidence { about } => {
+            let id = Identity::load(home)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&client::evidence(&id, &about)?).unwrap()
+            );
+            Ok(())
+        }
+        Cmd::VerifyHistory { file, pins } => {
+            let bundles: Vec<evidence::Bundle> = read_json(&file)?;
+            let pins: Vec<economic_history::Pin> = read_json(&pins)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&economic_history::project(&bundles, &pins)?).unwrap()
+            );
+            Ok(())
+        }
+        Cmd::Verify {
+            file,
+            root,
+            relay_key,
+        } => {
+            let bundle: evidence::Bundle = read_json(&file)?;
+            bundle.verify_trusted(&root, &relay_key)?;
+            println!(
+                "{}",
+                json!({
+                    "id": bundle.env.id,
+                    "integrity": "verified",
+                    "root": root,
+                    "relay": relay_key,
+                    "truth": "not_assessed",
+                    "current_authority": "not_assessed",
+                })
+            );
             Ok(())
         }
         Cmd::Work { cmd } => {
@@ -729,6 +878,26 @@ fn message_body(text: String, in_reply_to: Option<String>) -> Value {
     }
 }
 
+/// Caller-supplied structured fields plus the explicit text and reply id,
+/// checked against the portable JSON subset before signing.
+fn structured_body(
+    extra: Option<Value>,
+    text: String,
+    in_reply_to: Option<String>,
+) -> Result<Value, String> {
+    let mut body = extra.unwrap_or_else(|| json!({}));
+    let fields = body.as_object_mut().ok_or("body must be a JSON object")?;
+    let explicit = message_body(text, in_reply_to);
+    fields.extend(explicit.as_object().unwrap().clone());
+    envelope::validate_json(&body)?;
+    Ok(body)
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let raw = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    serde_json::from_slice(&raw).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 #[derive(Serialize)]
 struct LocalStatus {
     schema: &'static str,
@@ -1014,10 +1183,7 @@ mod tests {
         let home = temp_home();
         let missing = serde_json::to_value(local_status(&home)).unwrap();
         assert_eq!(missing["schema"], "ecco-status-v1");
-        assert_eq!(
-            missing["capabilities"],
-            json!([DURABLE_CORRELATED_SEND_CAPABILITY])
-        );
+        assert_eq!(missing["capabilities"], json!(CAPABILITIES));
         assert_eq!(missing["ready"], false);
         assert_eq!(missing["identity"]["state"], "missing");
 
