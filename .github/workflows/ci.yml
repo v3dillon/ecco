@@ -5,6 +5,20 @@ on:
   pull_request:
 
 jobs:
+  authors:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Reject dileet commit identities
+        run: |
+          if git log --format='%an <%ae>%n%cn <%ce>' | grep -qiE 'dileet|242292965'; then
+            echo "found dileet identity in git history:" >&2
+            git log --format='%h %an <%ae> | %cn <%ce> %s' | grep -iE 'dileet|242292965' >&2
+            exit 1
+          fi
+
   check:
     runs-on: ubuntu-latest
     steps:
