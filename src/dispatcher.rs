@@ -1,13 +1,11 @@
 //! Local durable dispatch. Agent launch details are separate from queue policy.
 use crate::{
-    agents,
     client::{self, Stored},
-    dashboard,
     identity::{self, Identity},
-    local,
+    local, reporting,
 };
-use agents::handler::ResultMessage;
 use clap::Subcommand;
+use handler::{Handler, ResultMessage};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,6 +20,7 @@ use std::{
     },
     time::Duration,
 };
+mod handler;
 mod service;
 
 #[derive(Subcommand)]
@@ -32,14 +31,13 @@ pub enum DispatcherCmd {
         allow: Vec<String>,
         #[arg(long)]
         workdir: PathBuf,
-        #[arg(long, required_unless_present = "handler", conflicts_with = "handler")]
-        agent: Option<String>,
-        #[arg(long, requires = "agent")]
-        agent_path: Option<String>,
         #[arg(long)]
-        handler: Option<PathBuf>,
-        #[arg(long, requires = "handler")]
+        handler: PathBuf,
+        #[arg(long)]
         handler_arg: Vec<String>,
+        /// Environment variable names to retain for the handler
+        #[arg(long)]
+        handler_env: Vec<String>,
         #[arg(long,default_value_t=8,value_parser=clap::value_parser!(u32).range(1..=32))]
         max_thread_requests: u32,
         #[arg(long,default_value_t=3600,value_parser=clap::value_parser!(u32).range(1..=86400))]
@@ -58,18 +56,6 @@ pub enum DispatcherCmd {
     },
 }
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-pub enum Handler {
-    Builtin {
-        provider: String,
-        executable: String,
-    },
-    Argv {
-        executable: String,
-        args: Vec<String>,
-    },
-}
-#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
     version: u32,
@@ -80,11 +66,11 @@ pub struct Config {
     thread_ttl_seconds: u32,
 }
 impl Config {
-    fn provider(&self) -> &str {
-        match &self.handler {
-            Handler::Builtin { provider, .. } => provider,
-            Handler::Argv { .. } => "custom",
-        }
+    fn handler_name(&self) -> &str {
+        Path::new(&self.handler.executable)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("handler")
     }
 }
 pub fn config_path(home: &Path) -> PathBuf {
@@ -122,50 +108,12 @@ fn validate(home: &Path, cfg: &Config) -> Result<(), String> {
     {
         return Err("invalid dispatcher conversation limits".into());
     }
-    match &cfg.handler {
-        Handler::Builtin {
-            provider,
-            executable,
-        } => {
-            agents::find(provider)?;
-            local::executable(executable)?;
-        }
-        Handler::Argv { executable, .. } => {
-            local::executable(executable)?;
-        }
-    }
-    Ok(())
-}
-pub fn install(home: &Path, agent: &str, allow: &[String], workdir: &Path) -> Result<(), String> {
-    let a = agents::find(agent)?;
-    install_config(
-        home,
-        Config {
-            version: 1,
-            allow: allow.into(),
-            work_dir: workdir.into(),
-            handler: Handler::Builtin {
-                provider: agent.into(),
-                executable: local::executable(&a.command)?
-                    .to_string_lossy()
-                    .into_owned(),
-            },
-            max_thread_requests: 8,
-            thread_ttl_seconds: 3600,
-        },
-    )
+    cfg.handler.validate()
 }
 fn install_config(home: &Path, cfg: Config) -> Result<(), String> {
     validate(home, &cfg)?;
-    if let Handler::Builtin {
-        provider,
-        executable,
-    } = &cfg.handler
-    {
-        agents::handler::ready(provider, executable, &cfg.work_dir)?;
-    }
     service::install(home, &cfg)?;
-    println!("Dispatcher installed and started. Job reporting uses this identity's dashboard.");
+    println!("Dispatcher installed and started.");
     Ok(())
 }
 pub fn command(home: &Path, cmd: DispatcherCmd) -> Result<(), String> {
@@ -173,32 +121,16 @@ pub fn command(home: &Path, cmd: DispatcherCmd) -> Result<(), String> {
         DispatcherCmd::Install {
             allow,
             workdir,
-            agent,
-            agent_path,
             handler,
             handler_arg,
+            handler_env,
             max_thread_requests,
             thread_ttl_seconds,
         } => {
-            let handler = if let Some(path) = handler {
-                if !path.is_absolute() {
-                    return Err("--handler must be absolute".into());
-                }
-                Handler::Argv {
-                    executable: local::executable(&path.to_string_lossy())?
-                        .to_string_lossy()
-                        .into_owned(),
-                    args: handler_arg,
-                }
-            } else {
-                let name = agent.ok_or("--agent or --handler is required")?;
-                let a = agents::find(&name)?;
-                Handler::Builtin {
-                    executable: local::executable(agent_path.as_deref().unwrap_or(&a.command))?
-                        .to_string_lossy()
-                        .into_owned(),
-                    provider: name,
-                }
+            let handler = Handler {
+                executable: handler.to_string_lossy().into_owned(),
+                args: handler_arg,
+                env: handler_env,
             };
             install_config(
                 home,
@@ -268,7 +200,7 @@ fn event(
 ) -> Result<(), String> {
     let sequence:i64=db.query_row("UPDATE state SET value=CAST(value AS INTEGER)+1 WHERE key='sequence' RETURNING CAST(value AS INTEGER)",[],|r|r.get(0)).map_err(|e|e.to_string())?;
     let dispatcher = state(db, "dispatcher_id")?;
-    let payload = json!({"v":1,"eventId":format!("{dispatcher}/{sequence}"),"dispatcherId":dispatcher,"jobId":job.env.id,"sequence":sequence,"state":status,"provider":cfg.provider(),"attempt":attempt,"at":local::timestamp(),"about":job.env.about});
+    let payload = json!({"v":1,"eventId":format!("{dispatcher}/{sequence}"),"dispatcherId":dispatcher,"jobId":job.env.id,"sequence":sequence,"state":status,"provider":cfg.handler_name(),"attempt":attempt,"at":local::timestamp(),"about":job.env.about});
     db.execute(
         "INSERT INTO report_outbox(sequence,payload) VALUES (?,?)",
         rusqlite::params![sequence, payload.to_string()],
@@ -341,8 +273,8 @@ fn report(db: &Connection, id: &Identity, api: &str, cfg: &Config) -> Result<(),
         .map(|(_, s)| serde_json::from_str(s))
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
-    let body=json!({"v":1,"events":events,"heartbeat":{"v":1,"dispatcherId":state(db,"dispatcher_id")?,"provider":cfg.provider(),"at":local::timestamp()}}).to_string();
-    dashboard::post(id, api, "/api/dispatcher/reports", &body, None)?;
+    let body=json!({"v":1,"events":events,"heartbeat":{"v":1,"dispatcherId":state(db,"dispatcher_id")?,"provider":cfg.handler_name(),"at":local::timestamp()}}).to_string();
+    reporting::post(id, api, "/api/dispatcher/reports", &body, None)?;
     for (sequence, _) in rows {
         db.execute("DELETE FROM report_outbox WHERE sequence=?", [sequence])
             .map_err(|e| e.to_string())?;
@@ -424,16 +356,13 @@ fn send(
         },
         None,
     )?;
-    let receipt = client::send(id, &env)?;
+    let receipt = client::send(home, id, &env)?;
     Ok(Stored {
         env,
         gseq: receipt.gseq,
         tseq: receipt.tseq,
         received_at: receipt.received_at,
     })
-}
-fn message_event(stored: &Stored, direction: &str) -> Value {
-    json!({"kind":"message","ts":local::timestamp(),"direction":direction,"envelopeId":stored.env.id,"about":stored.env.about,"from":stored.env.from,"to":stored.env.to,"envelopeKind":stored.env.kind,"text":stored.env.body["text"],"tseq":stored.tseq,"gseq":stored.gseq})
 }
 fn execute(
     db: &Connection,
@@ -452,7 +381,7 @@ fn execute(
     {
         return Err("request sender is no longer trusted and allowed".into());
     }
-    let thread = client::thread(id, &request.env.about, 0, 0)?;
+    let thread = client::thread(home, id, &request.env.about, 0, 0)?;
     let replied = correlated(&thread, &id.addr(), &request.env.id, false);
     if replied && saved.is_none() {
         return Ok("completed");
@@ -461,23 +390,7 @@ fn execute(
         ResultMessage::decode(serde_json::from_str(saved).map_err(|e| e.to_string())?)?
     } else {
         let input = json!({"schema":"ecco-dispatch-v1","type":"request","untrusted":true,"envelope":{"id":request.env.id,"from":request.env.from,"about":request.env.about,"text":request.env.body["text"]}});
-        let result = match &cfg.handler {
-            Handler::Builtin {
-                provider,
-                executable,
-            } => agents::handler::run(provider, executable, &cfg.work_dir, &input)?,
-            Handler::Argv { executable, args } => {
-                let output = local::process(
-                    &[vec![executable.clone()], args.clone()].concat(),
-                    Some(&input.to_string()),
-                    &cfg.work_dir,
-                    &std::env::vars().collect(),
-                    Duration::from_secs(300),
-                    65536,
-                )?;
-                ResultMessage::decode(serde_json::from_str(&output).map_err(|e| e.to_string())?)?
-            }
-        };
+        let result = cfg.handler.run(&cfg.work_dir, &input)?;
         db.execute(
             "UPDATE jobs SET result=? WHERE id=?",
             rusqlite::params![serde_json::to_string(&result).unwrap(), request.env.id],
@@ -485,43 +398,14 @@ fn execute(
         .map_err(|e| e.to_string())?;
         result
     };
-    let reply = if let Some(reply) = correlated_message(&thread, &id.addr(), &request.env.id, false)
-    {
-        reply.clone()
-    } else {
-        send(home, id, request, &result.kind, &result.text)?
-    };
-    let mut messages = vec![
-        message_event(request, "received"),
-        message_event(&reply, "sent"),
-    ];
-    if let Some(text) = &result.follow_up {
-        if let Some(follow) = correlated_message(&thread, &id.addr(), &request.env.id, true) {
-            messages.push(message_event(follow, "sent"));
-        } else if follow_allowed(&thread, request, id, cfg, crate::envelope::now()) {
-            messages.push(message_event(
-                &send(home, id, request, "request", text)?,
-                "sent",
-            ));
-        }
+    if !replied {
+        send(home, id, request, &result.kind, &result.text)?;
     }
-    if let Ok(api) = dashboard::api(home, None) {
-        let mut events = vec![
-            json!({"v":1,"kind":"header","agent":id.name,"model":null,"startedAt":local::timestamp(),"source":"ecco-dispatcher","about":request.env.about,"envelopeIds":messages.iter().map(|v| &v["envelopeId"]).collect::<Vec<_>>()}),
-        ];
-        events.push(json!({"kind":"tool_call","ts":local::timestamp(),"name":cfg.provider(),"input":{"request":request.env.id},"output":serde_json::to_string(&result).unwrap()}));
-        events.extend(messages);
-        events.push(json!({"kind":"end","ts":local::timestamp(),"status":"completed"}));
-        let trace = events
-            .iter()
-            .map(Value::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        if let Err(e) =
-            dashboard::Outbox::open(home, api).and_then(|q| q.enqueue("ecco-trace-v1", &trace))
+    if let Some(text) = &result.follow_up {
+        if !correlated(&thread, &id.addr(), &request.env.id, true)
+            && follow_allowed(&thread, request, id, cfg, crate::envelope::now())
         {
-            eprintln!("dispatcher trace: {e}");
+            send(home, id, request, "request", text)?;
         }
     }
     Ok(if result.kind == "proposal" {
@@ -596,16 +480,15 @@ fn run(home: &Path, once: bool) -> Result<(), String> {
     let worker_home = home.to_path_buf();
     let worker_cfg = cfg.clone();
     let reporter = std::thread::spawn(move || {
-        if let (Ok(db), Ok(id), Ok(api)) = (
-            database(&worker_home),
-            Identity::load(&worker_home),
-            dashboard::api(&worker_home, None),
-        ) {
+        if let (Ok(db), Ok(id)) = (database(&worker_home), Identity::load(&worker_home)) {
             loop {
-                if let Err(e) = report(&db, &id, &api, &worker_cfg) {
-                    eprintln!("dispatcher reporting retained: {e}");
+                if let Ok(api) = reporting::api(&worker_home, None) {
+                    if let Err(e) = report(&db, &id, &api, &worker_cfg) {
+                        eprintln!("dispatcher reporting retained: {e}");
+                    }
+                    let _ =
+                        reporting::Outbox::open(&worker_home, api).and_then(|q| q.flush(3, true));
                 }
-                let _ = dashboard::Outbox::open(&worker_home, api.clone()).and_then(|q| q.flush(3));
                 for _ in 0..60 {
                     if worker_stop.load(Ordering::Relaxed) {
                         return;
@@ -623,7 +506,7 @@ fn run(home: &Path, once: bool) -> Result<(), String> {
             let cursor = state(&db, "cursor")?
                 .parse()
                 .map_err(|e: std::num::ParseIntError| e.to_string())?;
-            match client::inbox(&id, cursor, if once { 0 } else { 20 })
+            match client::inbox(home, &id, cursor, if once { 0 } else { 20 })
                 .and_then(|messages| ingest(&mut db, home, &id, &cfg, messages))
             {
                 Ok(()) => {}
@@ -644,9 +527,9 @@ fn run(home: &Path, once: bool) -> Result<(), String> {
     })();
     stop.store(true, Ordering::Relaxed);
     let _ = reporter.join();
-    if let Ok(api) = dashboard::api(home, None) {
+    if let Ok(api) = reporting::api(home, None) {
         let _ = report(&db, &id, &api, &cfg);
-        let _ = dashboard::Outbox::open(home, api).and_then(|q| q.flush(3));
+        let _ = reporting::Outbox::open(home, api).and_then(|q| q.flush(3, true));
     }
     result
 }
@@ -661,9 +544,10 @@ mod tests {
             version: 1,
             allow: vec![peer.into()],
             work_dir: PathBuf::from("/tmp"),
-            handler: Handler::Argv {
+            handler: Handler {
                 executable: "/bin/true".into(),
                 args: vec![],
+                env: vec![],
             },
             max_thread_requests: 3,
             thread_ttl_seconds: 300,
@@ -709,9 +593,10 @@ mod tests {
             version: 1,
             allow: vec!["peer@relay.test".into()],
             work_dir: home.clone(),
-            handler: Handler::Argv {
+            handler: Handler {
                 executable: "/bin/true".into(),
                 args: vec![],
+                env: vec![],
             },
             max_thread_requests: 8,
             thread_ttl_seconds: 3600,

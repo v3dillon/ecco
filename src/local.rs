@@ -82,9 +82,6 @@ pub fn read(path: &Path, maximum: usize) -> Result<String, String> {
     }
     String::from_utf8(bytes).map_err(|_| "file is not UTF-8".into())
 }
-pub fn shell(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
 pub fn home() -> Result<PathBuf, String> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -112,7 +109,10 @@ pub fn executable(value: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 pub fn timestamp() -> String {
-    let seconds = crate::envelope::now() as libc::time_t;
+    timestamp_at(crate::envelope::now())
+}
+pub fn timestamp_at(seconds: u64) -> String {
+    let seconds = seconds as libc::time_t;
     let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
     unsafe {
         libc::gmtime_r(&seconds, tm.as_mut_ptr());
@@ -142,20 +142,6 @@ pub fn process(
     timeout: Duration,
     maximum: usize,
 ) -> Result<String, String> {
-    process_output(argv, input, cwd, env, timeout, maximum).map(|output| output.stdout)
-}
-pub struct ProcessOutput {
-    pub stdout: String,
-    pub stderr: String,
-}
-pub fn process_output(
-    argv: &[String],
-    input: Option<&str>,
-    cwd: &Path,
-    env: &BTreeMap<String, String>,
-    timeout: Duration,
-    maximum: usize,
-) -> Result<ProcessOutput, String> {
     let mut command = Command::new(argv.first().ok_or("empty command")?);
     command
         .args(&argv[1..])
@@ -207,10 +193,10 @@ pub fn process_output(
             break Err("dispatcher stopped".into());
         }
         if exceeded.load(Ordering::SeqCst) {
-            break Err("agent output exceeded limit".into());
+            break Err("handler output exceeded limit".into());
         }
         if start.elapsed() >= timeout {
-            break Err("agent command timed out".into());
+            break Err("handler command timed out".into());
         }
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -218,7 +204,7 @@ pub fn process_output(
             Err(e) => break Err(e.to_string()),
         }
     };
-    // Close inherited pipes as well as the direct child; no detached agent work.
+    // Close inherited pipes as well as the direct child; no detached handler work.
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
@@ -229,17 +215,14 @@ pub fn process_output(
     let status = outcome?;
     if !status.success() {
         return Err(format!(
-            "agent exited {status}: {}",
+            "handler exited {status}: {}",
             String::from_utf8_lossy(&err)
         ));
     }
     if exceeded.load(Ordering::SeqCst) {
-        return Err("agent output exceeded limit".into());
+        return Err("handler output exceeded limit".into());
     }
-    Ok(ProcessOutput {
-        stdout: String::from_utf8(out).map_err(|_| "agent output is not UTF-8")?,
-        stderr: String::from_utf8_lossy(&err).into_owned(),
-    })
+    String::from_utf8(out).map_err(|_| "handler output is not UTF-8".into())
 }
 
 #[cfg(test)]

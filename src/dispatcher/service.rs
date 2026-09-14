@@ -63,12 +63,7 @@ fn argv(home: &Path) -> Result<Vec<String>, String> {
 fn definition(home: &Path, cfg: &Config) -> Result<String, String> {
     let args = argv(home)?;
     let logs = home.join("dispatcher/logs");
-    let env = match &cfg.handler {
-        super::Handler::Builtin { provider, .. } => {
-            crate::agents::handler::environment_for(provider)?
-        }
-        super::Handler::Argv { .. } => local::environment(&["HOME".into(), "PATH".into()]),
-    };
+    let env = cfg.handler.environment();
 
     if cfg!(target_os = "macos") {
         let label = xml(&id(home));
@@ -340,9 +335,10 @@ mod tests {
             version: 1,
             allow: vec!["peer@relay".into()],
             work_dir: PathBuf::from("/tmp/repo"),
-            handler: super::super::Handler::Argv {
+            handler: super::super::Handler {
                 executable: "/bin/true".into(),
                 args: vec![],
+                env: vec![],
             },
             max_thread_requests: 8,
             thread_ttl_seconds: 3600,

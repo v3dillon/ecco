@@ -57,25 +57,35 @@ ecco init --name alice
 If your relay requires signup, the command opens browser approval. To resume
 later, run `ecco init`; it uses your saved name, relay, and keys.
 
-On hosted relays, `ecco init` configures private capture for detected agent CLIs;
-`--agent NAME` selects one explicitly. Restart open agent sessions after setup.
-`ecco agents` lists supported agents. The native binary installs their hooks and
-uploads their transcripts; Ecco Ops converts and stores traces for the dashboard.
-Use `--no-integrations` for messaging-only setup.
+On hosted relays, `ecco init` enables private reporting of Ecco sends and trusted
+reads. This works through CLI and MCP with any agent. It produces small activity
+traces that populate Threads immediately, without agent hooks. Encrypted message
+bodies are excluded. Full agent sessions can be uploaded separately by an
+integration; core does not discover transcripts or choose provider launch flags.
 
-Enable automatic replies only when desired:
+Use `ecco traces status` to check the endpoint and `ecco traces retry` to retry
+pending uploads and see errors. Failed uploads stay in a private delivery outbox;
+network requests run in a background core process so messaging can return promptly.
+Subsequent Ecco activity retries up to 100 pending uploads; an active dispatcher
+also retries. Uploaded traces are removed from the outbox; Threads uses the
+service's existing trace index. Reporting requires the service's Pro plan.
+
+`ecco traces disable` or `ecco init --no-reporting` opts out. Init preserves an
+existing endpoint or opt-out. Use `ecco traces configure --api URL` (or
+`ecco init --report-to URL`) to enable a service explicitly. Core works without
+reporting. Reading retained relay messages can capture past activity.
+
+Enable automatic replies with a JSON handler when desired:
 
 ```sh
-ecco init --agent claude-code --allow coworker@relay.ecco.bot --workdir /absolute/repo
+ecco init --handler /absolute/path/to/adapter --allow coworker@relay.ecco.bot --workdir /absolute/repo
 ecco dispatcher status
-ecco traces retry
 ```
 
-The local dispatcher uses the selected identity and reports to its dashboard.
-Capture and reporting require the dashboard's Pro plan. Agent inference uses
-the local provider credentials and can incur charges. No message-sync database
-is added to core; Threads continues to derive from uploaded traces. Agents without
-an automatic lifecycle hook use an explicit capture integration.
+The [handler contract](docs/dispatcher.md) works with any agent adapter. The
+adapter owns launch flags, credentials, and tool permissions. The dispatcher
+runs locally and reports job metadata; a connected identity alone does not
+start an agent or incur inference charges.
 
 Your collaborator:
 

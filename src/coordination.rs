@@ -151,8 +151,8 @@ fn parse_claim(stored: &Stored) -> Option<ClaimBody> {
         .flatten()
 }
 
-pub fn status(id: &Identity, about: &str) -> Result<WorkStatus, String> {
-    let messages = verified_thread(id, about)?;
+pub fn status(home: &Path, id: &Identity, about: &str) -> Result<WorkStatus, String> {
+    let messages = verified_thread(home, id, about)?;
     evaluate(about, &messages, crate::envelope::now())
 }
 
@@ -167,7 +167,7 @@ pub fn claim(
 ) -> Result<ClaimResult, String> {
     validate_ttl(ttl_seconds)?;
     validate_recipients(id, &to)?;
-    let messages = verified_thread(id, about)?;
+    let messages = verified_thread(home, id, about)?;
     let current = evaluate(about, &messages, crate::envelope::now())?;
     if let Some(active) = current.active.clone() {
         if active.from != id.addr() {
@@ -225,7 +225,7 @@ fn send_claim(
     let body = json!({ "after": after, "branch": branch, "claim_id": claim_id, "renewal_of": renewal_of, "text": text, "ttl_seconds": ttl_seconds });
     let (env, receipt) =
         crate::post_envelope(home, id, about.into(), "claim".into(), body, to, false)?;
-    let messages = verified_thread(id, about)?;
+    let messages = verified_thread(home, id, about)?;
     bind_receipt(&receipt, &env, about, &messages)?;
     let status = evaluate(about, &messages, crate::envelope::now())?;
     let Some(active) = status.active.clone() else {
@@ -254,7 +254,7 @@ pub fn release(
     about: &str,
     claim_id: Option<String>,
 ) -> Result<ReleaseResult, String> {
-    let current = status(id, about)?;
+    let current = status(home, id, about)?;
     let Some(active) = current.active else {
         return Ok(ReleaseResult {
             about: about.into(),
@@ -286,7 +286,7 @@ pub fn release(
         Vec::new(),
         false,
     )?;
-    let messages = verified_thread(id, about)?;
+    let messages = verified_thread(home, id, about)?;
     bind_receipt(&receipt, &env, about, &messages)?;
     Ok(ReleaseResult {
         about: about.into(),
@@ -297,8 +297,8 @@ pub fn release(
     })
 }
 
-fn verified_thread(id: &Identity, about: &str) -> Result<Vec<Stored>, String> {
-    let messages = client::thread(id, about, 0, 0)?;
+fn verified_thread(home: &Path, id: &Identity, about: &str) -> Result<Vec<Stored>, String> {
+    let messages = client::thread(home, id, about, 0, 0)?;
     for stored in &messages {
         stored.env.verify()?;
         if stored.env.about != about {
