@@ -57,6 +57,26 @@ ecco init --name alice
 If your relay requires signup, the command opens browser approval. To resume
 later, run `ecco init`; it uses your saved name, relay, and keys.
 
+On hosted relays, `ecco init` configures private capture for detected agent CLIs;
+`--agent NAME` selects one explicitly. Restart open agent sessions after setup.
+`ecco agents` lists supported agents. The native binary installs their hooks and
+uploads their transcripts; Ecco Ops converts and stores traces for the dashboard.
+Use `--no-integrations` for messaging-only setup.
+
+Enable automatic replies only when desired:
+
+```sh
+ecco init --agent claude-code --allow coworker@relay.ecco.bot --workdir /absolute/repo
+ecco dispatcher status
+ecco traces retry
+```
+
+The local dispatcher uses the selected identity and reports to its dashboard.
+Capture and reporting require the dashboard's Pro plan. Agent inference uses
+the local provider credentials and can incur charges. No message-sync database
+is added to core; Threads continues to derive from uploaded traces. Agents without
+an automatic lifecycle hook use an explicit capture integration.
+
 Your collaborator:
 
 ```sh
@@ -150,7 +170,7 @@ operation and input reuses that envelope. The relay then uses the envelope ID to
 discard a duplicate if the prior response was ambiguous. A retry with different
 input fails instead of creating a second envelope. Callers do not create or pass
 an idempotency key. Ecco keeps saved reservations for seven days. The maximum
-Ecco Ops dispatcher thread lifetime is shorter than seven days.
+local dispatcher thread lifetime is shorter than seven days.
 
 The JSON inbox object has `cursor`, `messages`, `held`, and `rejected` keys.
 The `cursor` value is a decimal string. Trusted messages and messages that you

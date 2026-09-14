@@ -1,0 +1,470 @@
+{
+  "claude-code": {
+    "help": [
+      "--help"
+    ],
+    "required": [
+      "--print",
+      "--restricted",
+      "--safe-mode",
+      "--tools",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "--permission-mode",
+      "--no-session-persistence",
+      "--no-chrome",
+      "--disable-slash-commands",
+      "--output-format",
+      "--json-schema"
+    ],
+    "keys": [
+      "USER",
+      "LOGNAME",
+      "CLAUDE_CONFIG_DIR",
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_AUTH_TOKEN",
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "ANTHROPIC_BASE_URL"
+    ],
+    "ready": [
+      "auth",
+      "status"
+    ],
+    "argv": [
+      "@@agent@@",
+      "--print",
+      "--restricted",
+      "--safe-mode",
+      "--tools",
+      "",
+      "--strict-mcp-config",
+      "--mcp-config",
+      "{\"mcpServers\":{}}",
+      "--permission-mode",
+      "dontAsk",
+      "--no-session-persistence",
+      "--no-chrome",
+      "--disable-slash-commands",
+      "--output-format",
+      "json",
+      "--json-schema",
+      "@@schema@@"
+    ],
+    "input": "@@prompt@@",
+    "env": {},
+    "files": {}
+  },
+  "cursor": {
+    "help": [
+      "--help"
+    ],
+    "required": [
+      "--print",
+      "--output-format"
+    ],
+    "keys": [
+      "CURSOR_API_KEY"
+    ],
+    "ready": [
+      "status"
+    ],
+    "argv": [
+      "@@agent@@",
+      "--print",
+      "--output-format",
+      "json"
+    ],
+    "input": "@@prompt@@",
+    "env": {
+      "CURSOR_CONFIG_DIR": "@@temp@@"
+    },
+    "files": {
+      "cli-config.json": "{\"version\":1,\"editor\":{\"vimMode\":false},\"permissions\":{\"allow\":[],\"deny\":[\"Shell(*)\",\"Read(**)\",\"Write(**)\",\"WebFetch(*)\",\"Mcp(*:*)\"]},\"approvalMode\":\"allowlist\"}"
+    }
+  },
+  "grok": {
+    "help": [
+      "--help"
+    ],
+    "required": [
+      "--cwd",
+      "--output-format",
+      "--json-schema",
+      "--tools",
+      "--disallowed-tools",
+      "--no-subagents",
+      "--disable-web-search",
+      "--deny",
+      "--permission-mode",
+      "--sandbox",
+      "--max-turns",
+      "--prompt-file",
+      "--verbatim"
+    ],
+    "keys": [
+      "XAI_API_KEY"
+    ],
+    "ready": [
+      "models"
+    ],
+    "argv": [
+      "@@agent@@",
+      "--prompt-file",
+      "@@temp@@/prompt.txt",
+      "--cwd",
+      "@@workdir@@",
+      "--output-format",
+      "json",
+      "--json-schema",
+      "@@schema@@",
+      "--tools",
+      "read_file,grep,list_dir",
+      "--disallowed-tools",
+      "Agent,run_terminal_cmd,search_replace,web_search,web_fetch",
+      "--no-subagents",
+      "--disable-web-search",
+      "--deny",
+      "MCPTool",
+      "--permission-mode",
+      "dontAsk",
+      "--sandbox",
+      "strict",
+      "--max-turns",
+      "8",
+      "--verbatim"
+    ],
+    "input": null,
+    "env": {
+      "GROK_MEMORY": "0",
+      "GROK_DISABLE_AUTOUPDATER": "1"
+    },
+    "files": {
+      "prompt.txt": "@@prompt@@"
+    }
+  },
+  "opencode": {
+    "help": [
+      "run",
+      "--help"
+    ],
+    "required": [
+      "--pure",
+      "--format",
+      "--dir",
+      "--agent",
+      "--file"
+    ],
+    "keys": [
+      "OPENCODE_CONFIG_DIR",
+      "OPENCODE_DATA_DIR"
+    ],
+    "ready": [
+      "auth",
+      "list"
+    ],
+    "argv": [
+      "@@agent@@",
+      "run",
+      "--pure",
+      "--format",
+      "json",
+      "--dir",
+      "@@workdir@@",
+      "--agent",
+      "ecco-dispatcher",
+      "--file",
+      "@@temp@@/request.txt",
+      "Answer the attached Ecco request under the dispatcher rules."
+    ],
+    "input": null,
+    "env": {
+      "OPENCODE_CONFIG_CONTENT": "{\"plugin\":[],\"mcp\":{},\"agent\":{\"ecco-dispatcher\":{\"mode\":\"primary\",\"description\":\"Read-only Ecco request handler\",\"permission\":{\"*\":\"deny\",\"external_directory\":\"deny\",\"read\":\"allow\",\"grep\":\"allow\",\"glob\":\"allow\",\"list\":\"allow\"}}}}"
+    },
+    "files": {
+      "request.txt": "@@prompt@@"
+    },
+    "modelKeys": true
+  },
+  "pi": {
+    "help": [
+      "--help"
+    ],
+    "required": [
+      "--mode",
+      "--no-session",
+      "--no-approve",
+      "--no-extensions",
+      "--no-skills",
+      "--no-prompt-templates",
+      "--no-context-files",
+      "--no-tools",
+      "--print"
+    ],
+    "keys": [],
+    "ready": [
+      "--list-models"
+    ],
+    "argv": [
+      "@@agent@@",
+      "--mode",
+      "json",
+      "--no-session",
+      "--no-approve",
+      "--no-extensions",
+      "--no-skills",
+      "--no-prompt-templates",
+      "--no-context-files",
+      "--no-tools",
+      "--print",
+      "Answer the Ecco request supplied through stdin under the dispatcher rules."
+    ],
+    "input": "@@prompt@@",
+    "env": {},
+    "files": {},
+    "modelKeys": true
+  },
+  "openclaw": {
+    "help": [
+      "agent",
+      "exec",
+      "--help"
+    ],
+    "required": [
+      "--message-file",
+      "--cwd",
+      "--config",
+      "--code-mode",
+      "--json"
+    ],
+    "keys": [
+      "OPENCLAW_HOME",
+      "OPENCLAW_CONFIG_PATH"
+    ],
+    "ready": [
+      "doctor"
+    ],
+    "argv": [
+      "@@agent@@",
+      "agent",
+      "exec",
+      "--message-file",
+      "-",
+      "--cwd",
+      "@@workdir@@",
+      "--config",
+      "@@temp@@/openclaw.json",
+      "--code-mode",
+      "direct",
+      "--json"
+    ],
+    "input": "@@prompt@@",
+    "env": {
+      "OPENCLAW_INCLUDE_ROOTS": "@@openclaw_include@@"
+    },
+    "files": {
+      "openclaw.json": "{\"$include\":\"@@openclaw_config@@\",\"agents\":{\"defaults\":{\"sandbox\":{\"mode\":\"all\",\"workspaceAccess\":\"ro\"}}},\"tools\":{\"profile\":\"minimal\",\"allow\":[\"read\"],\"deny\":[\"group:runtime\",\"group:web\",\"group:sessions\",\"group:memory\",\"group:messaging\",\"group:plugins\",\"write\",\"edit\",\"apply_patch\",\"skill_workshop\",\"mcp__*\"],\"fs\":{\"workspaceOnly\":true},\"elevated\":{\"enabled\":false}}}"
+    },
+    "modelKeys": true
+  },
+  "hermes": {
+    "help": [
+      "chat",
+      "--help"
+    ],
+    "required": [
+      "--query-file",
+      "--oneshot",
+      "--quiet",
+      "--in",
+      "--toolsets",
+      "--max-turns"
+    ],
+    "keys": [
+      "HERMES_HOME"
+    ],
+    "ready": [
+      "--list-tools",
+      "--toolsets",
+      "context_engine"
+    ],
+    "argv": [
+      "@@agent@@",
+      "chat",
+      "--query-file",
+      "-",
+      "--oneshot",
+      "--quiet",
+      "--in",
+      "@@workdir@@",
+      "--toolsets",
+      "context_engine",
+      "--max-turns",
+      "1"
+    ],
+    "input": "@@prompt@@",
+    "env": {},
+    "files": {},
+    "modelKeys": true
+  },
+  "droid": {
+    "help": [
+      "exec",
+      "--help"
+    ],
+    "required": [
+      "--cwd",
+      "--output-format",
+      "--file",
+      "--disabled-tools"
+    ],
+    "keys": [
+      "FACTORY_API_KEY"
+    ],
+    "ready": [
+      "exec",
+      "--list-tools",
+      "--output-format",
+      "json",
+      "--disabled-tools",
+      "ConnectorSearch,Create,CreateAutomation,CronCreate,CronDelete,CronList,DeleteAutomation,DismissHandoffItems,Edit,EditAutomation,EndFeatureRun,Execute,ExitSpecMode,FetchUrl,ListAutomations,ProposeMission,ReadAutomation,Skill,StartMissionRun,Task,TaskOutput,TaskStop,TodoWrite,ToolSearch,WebSearch,Glob,Grep,LS,Read"
+    ],
+    "argv": [
+      "@@agent@@",
+      "exec",
+      "--cwd",
+      "@@workdir@@",
+      "--output-format",
+      "json",
+      "--file",
+      "@@temp@@/prompt.txt",
+      "--disabled-tools",
+      "ConnectorSearch,Create,CreateAutomation,CronCreate,CronDelete,CronList,DeleteAutomation,DismissHandoffItems,Edit,EditAutomation,EndFeatureRun,Execute,ExitSpecMode,FetchUrl,ListAutomations,ProposeMission,ReadAutomation,Skill,StartMissionRun,Task,TaskOutput,TaskStop,TodoWrite,ToolSearch,WebSearch,Glob,Grep,LS,Read"
+    ],
+    "input": null,
+    "env": {
+      "FACTORY_DROID_AUTO_UPDATE_ENABLED": "false"
+    },
+    "files": {
+      "prompt.txt": "@@prompt@@"
+    }
+  },
+  "kimi-code": {
+    "help": [
+      "--help"
+    ],
+    "required": [
+      "--prompt",
+      "--output-format",
+      "--final-message-only",
+      "--agent-file",
+      "--skills-dir"
+    ],
+    "keys": [
+      "KIMI_API_KEY",
+      "MOONSHOT_API_KEY"
+    ],
+    "ready": [
+      "doctor"
+    ],
+    "argv": [
+      "@@agent@@",
+      "--agent-file",
+      "@@temp@@/kimi-agent.md",
+      "--skills-dir",
+      "@@temp@@/skills",
+      "--prompt",
+      "Answer the Ecco request contained in the private agent instructions.",
+      "--output-format",
+      "stream-json",
+      "--final-message-only"
+    ],
+    "input": null,
+    "env": {
+      "KIMI_CODE_EXPERIMENTAL_FLAG": "1",
+      "KIMI_TELEMETRY_ENABLED": "false"
+    },
+    "files": {
+      "kimi-agent.md": "---\nname: ecco-dispatcher\ndescription: Read-only Ecco request handler\ntools: []\ndisallowedTools: [Read, Grep, Glob, Write, Edit, Bash, WebSearch, WebFetch, Agent, AgentSwarm, Task, Skill, AskUserQuestion]\nsubagents: []\n---\n@@prompt@@\n",
+      "skills/": ""
+    }
+  },
+  "fx": {
+    "help": [
+      "ask",
+      "--help"
+    ],
+    "required": [
+      "--json",
+      "--no-save"
+    ],
+    "keys": [],
+    "ready": [
+      "status"
+    ],
+    "argv": [
+      "@@agent@@",
+      "ask",
+      "--json",
+      "--no-save"
+    ],
+    "input": "@@prompt@@",
+    "env": {
+      "HOME": "@@temp@@/home",
+      "FX_PERMISSION_MODE": "ask",
+      "FX_HOME": "@@temp@@/home/.fx"
+    },
+    "files": {
+      "home/": "",
+      "home/.fx/": "",
+      "home/.fx/settings.json": "{\"permission_mode\":\"ask\",\"permission\":{\"*\":\"deny\"}}"
+    },
+    "modelKeys": true
+  },
+  "codex": {
+    "help": [
+      "exec",
+      "--help"
+    ],
+    "required": [
+      "--sandbox",
+      "--ephemeral",
+      "--ignore-user-config",
+      "--output-schema",
+      "--output-last-message"
+    ],
+    "keys": [
+      "CODEX_HOME",
+      "OPENAI_API_KEY",
+      "OPENAI_BASE_URL"
+    ],
+    "ready": [
+      "login",
+      "status"
+    ],
+    "argv": [
+      "@@agent@@",
+      "exec",
+      "--disable",
+      "shell_tool",
+      "--sandbox",
+      "read-only",
+      "--ephemeral",
+      "--ignore-user-config",
+      "--output-schema",
+      "@@temp@@/result.schema.json",
+      "--output-last-message",
+      "@@temp@@/last-message.json",
+      "--skip-git-repo-check",
+      "--color",
+      "never",
+      "--cd",
+      "@@workdir@@",
+      "-"
+    ],
+    "input": "@@prompt@@",
+    "env": {},
+    "files": {
+      "result.schema.json": "@@schema@@"
+    }
+  }
+}

@@ -1,8 +1,13 @@
 mod agent_surface;
+mod agents;
+mod capture;
 mod client;
 mod coordination;
+mod dashboard;
+mod dispatcher;
 mod envelope;
 mod identity;
+mod local;
 mod mcp;
 mod outbox;
 mod registration;
@@ -54,6 +59,18 @@ enum Cmd {
         /// Save local keys and print their public keys without registering yet
         #[arg(long)]
         prepare: bool,
+        /// Configure this agent's trace integration (otherwise detect installed agents)
+        #[arg(long, conflicts_with_all = ["prepare", "no_integrations"])]
+        agent: Option<String>,
+        /// Trust these senders and enable automatic replies; requires --agent and --workdir
+        #[arg(long, requires_all = ["agent", "workdir"])]
+        allow: Vec<String>,
+        /// Working directory for automatic replies
+        #[arg(long, requires = "allow")]
+        workdir: Option<PathBuf>,
+        /// Register messaging only, without dashboard integrations
+        #[arg(long)]
+        no_integrations: bool,
     },
     /// Offer an unmanaged relay name to another root key; recipient accepts with init
     Transfer {
@@ -157,6 +174,21 @@ enum Cmd {
     Reject { id: String },
     /// Serve ecco as MCP tools over stdio (for agent harnesses)
     Mcp,
+    /// List supported trace and dispatcher agents
+    Agents {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage trace capture: install, uninstall, push, or retry
+    Traces {
+        #[command(subcommand)]
+        cmd: capture::TraceCmd,
+    },
+    /// Install and control the local automatic-reply dispatcher
+    Dispatcher {
+        #[command(subcommand)]
+        cmd: dispatcher::DispatcherCmd,
+    },
     /// Fetch and verify another address's profile
     Resolve { addr: String },
     /// Show your identity
@@ -265,11 +297,17 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             token,
             no_browser,
             prepare,
+            agent,
+            allow,
+            workdir,
+            no_integrations,
         } => {
             let id = init_identity(home, name.as_deref(), relay.as_deref(), token)?;
+            let mut dashboard = None;
             if !prepare {
                 if let Some(service) = registration::discover(&id.relay)? {
                     registration::authorize(&id, &service, no_browser)?;
+                    dashboard = Some(service);
                 } else {
                     client::register(&id)?;
                 }
@@ -287,8 +325,30 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                 "agent key (bot):   {}",
                 envelope::encode_key(&id.agent_key().verifying_key())
             );
+            if !prepare && !no_integrations {
+                if let Some(api) = dashboard {
+                    dashboard::configure(home, &api)?;
+                    capture::setup(home, &api, agent.as_deref(), false)?;
+                    if !allow.is_empty() {
+                        dispatcher::install(
+                            home,
+                            agent.as_deref().ok_or("--agent is required")?,
+                            &allow,
+                            workdir.as_deref().ok_or("--workdir is required")?,
+                        )?;
+                    }
+                } else if agent.is_some() || !allow.is_empty() {
+                    return Err("this relay has no dashboard registration service; configure traces with ecco traces install --api <dashboard-url>".into());
+                }
+            }
             Ok(())
         }
+        Cmd::Agents { json } => {
+            agents::list(json);
+            Ok(())
+        }
+        Cmd::Traces { cmd } => capture::run(home, cmd),
+        Cmd::Dispatcher { cmd } => dispatcher::command(home, cmd),
         Cmd::Transfer { to } => registration::transfer(&Identity::load(home)?, &to),
         Cmd::Relay {
             port,
@@ -883,6 +943,47 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("ecco-main-test-{}-{nonce}", std::process::id()))
+    }
+
+    #[test]
+    fn init_dispatcher_options_require_explicit_agent_and_workdir() {
+        assert!(Cli::try_parse_from(["ecco", "init", "--allow", "peer@relay"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ecco", "init", "--agent", "pi", "--no-integrations"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["ecco", "init", "--agent", "hermes", "--prepare"]).is_err());
+        assert!(Cli::try_parse_from([
+            "ecco",
+            "init",
+            "--agent",
+            "claude-code",
+            "--allow",
+            "peer@relay",
+            "--workdir",
+            "/repo"
+        ])
+        .is_ok());
+        let cli = Cli::try_parse_from([
+            "ecco",
+            "--home",
+            "/identity",
+            "dispatcher",
+            "install",
+            "--agent",
+            "grok",
+            "--allow",
+            "peer@relay",
+            "--workdir",
+            "/repo",
+        ])
+        .unwrap();
+        assert_eq!(cli.home, Some(PathBuf::from("/identity")));
+        match cli.cmd {
+            Cmd::Dispatcher {
+                cmd: dispatcher::DispatcherCmd::Install { agent, .. },
+            } => assert_eq!(agent.as_deref(), Some("grok")),
+            _ => panic!("expected native dispatcher command"),
+        }
     }
 
     #[test]

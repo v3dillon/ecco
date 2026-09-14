@@ -16,7 +16,7 @@ pub fn valid_name(name: &str) -> bool {
         && name.as_bytes()[0] != b'-'
 }
 
-fn origin(value: &str) -> Result<String, String> {
+pub(crate) fn origin(value: &str) -> Result<String, String> {
     validate_origin(value, true)
 }
 

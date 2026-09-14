@@ -1,0 +1,136 @@
+[
+  {
+    "name": "claude-code",
+    "label": "Claude Code",
+    "command": "claude",
+    "env": "CLAUDE_CONFIG_DIR",
+    "dir": ".claude",
+    "kind": "group",
+    "path": "settings.json",
+    "event": "SessionEnd",
+    "files": {}
+  },
+  {
+    "name": "cursor",
+    "label": "Cursor",
+    "command": "cursor-agent",
+    "env": "CURSOR_HOME",
+    "dir": ".cursor",
+    "kind": "flat",
+    "path": "hooks.json",
+    "event": "sessionEnd",
+    "files": {}
+  },
+  {
+    "name": "codex",
+    "label": "Codex",
+    "command": "codex",
+    "env": "CODEX_HOME",
+    "dir": ".codex",
+    "kind": "group",
+    "path": "hooks.json",
+    "event": "Stop",
+    "files": {}
+  },
+  {
+    "name": "grok",
+    "label": "Grok",
+    "command": "grok",
+    "env": "GROK_HOME",
+    "dir": ".grok",
+    "kind": "group",
+    "path": "hooks/ecco-trace.json",
+    "event": "SessionEnd",
+    "files": {}
+  },
+  {
+    "name": "opencode",
+    "label": "OpenCode",
+    "command": "opencode",
+    "env": "OPENCODE_CONFIG_DIR",
+    "dir": ".config/opencode",
+    "kind": "files",
+    "path": "",
+    "event": "",
+    "files": {
+      "plugins/ecco-trace.js": "// managed by ecco; changes will be replaced\nimport { spawn } from \"node:child_process\";\n\nconst executable = \"@@ecco@@\";\nconst baseArgs = [\"traces\",\"push\",\"--from\",\"opencode\",\"--api\",\"@@api@@\",\"--home\",\"@@home@@\"];\n\nfunction upload(args, input) {\n  return new Promise((resolve) => {\n    let child;\n    let timer;\n    const finish = () => { if (timer) clearTimeout(timer); resolve(); };\n    try {\n      child = spawn(executable, [...baseArgs, ...args], { stdio: [input === undefined ? \"ignore\" : \"pipe\", \"ignore\", \"ignore\"] });\n      child.once(\"error\", finish);\n      child.once(\"exit\", finish);\n      if (input !== undefined) child.stdin.end(JSON.stringify(input));\n      timer = setTimeout(() => { child.kill(); finish(); }, 60000);\n      timer.unref?.();\n    } catch {\n      finish();\n    }\n  });\n}\n\nconst active = new Set();\n\nexport const EccoTracePlugin = async () => ({\n  event: async ({ event }) => {\n    if (event?.type !== \"session.idle\") return;\n    const sessionID = event?.properties?.sessionID;\n    if (typeof sessionID !== \"string\" || !sessionID || active.has(sessionID)) return;\n    active.add(sessionID);\n    try {\n      await upload([], { session_id: sessionID });\n    } finally {\n      active.delete(sessionID);\n    }\n  },\n});\n"
+    }
+  },
+  {
+    "name": "pi",
+    "label": "Pi",
+    "command": "pi",
+    "env": "PI_AGENT_DIR",
+    "dir": ".pi/agent",
+    "kind": "files",
+    "path": "",
+    "event": "",
+    "files": {
+      "extensions/ecco-trace.ts": "// managed by ecco; changes will be replaced\nimport { spawn } from \"node:child_process\";\n\nconst executable = \"@@ecco@@\";\nconst baseArgs = [\"traces\",\"push\",\"--from\",\"pi\",\"--api\",\"@@api@@\",\"--home\",\"@@home@@\"];\n\nfunction upload(args, input) {\n  return new Promise((resolve) => {\n    let child;\n    let timer;\n    const finish = () => { if (timer) clearTimeout(timer); resolve(); };\n    try {\n      child = spawn(executable, [...baseArgs, ...args], { stdio: [input === undefined ? \"ignore\" : \"pipe\", \"ignore\", \"ignore\"] });\n      child.once(\"error\", finish);\n      child.once(\"exit\", finish);\n      if (input !== undefined) child.stdin.end(JSON.stringify(input));\n      timer = setTimeout(() => { child.kill(); finish(); }, 60000);\n      timer.unref?.();\n    } catch {\n      finish();\n    }\n  });\n}\n\nexport default function eccoTrace(pi) {\n  pi.on(\"session_shutdown\", async (_event, ctx) => {\n    const transcript = ctx?.sessionManager?.getSessionFile?.();\n    if (typeof transcript !== \"string\" || !transcript) return;\n    await upload([\"--transcript\", transcript]);\n  });\n}\n"
+    }
+  },
+  {
+    "name": "openclaw",
+    "label": "OpenClaw",
+    "command": "openclaw",
+    "env": "OPENCLAW_STATE_DIR",
+    "dir": ".openclaw",
+    "kind": "openclaw",
+    "path": "openclaw.json",
+    "event": "",
+    "files": {
+      "extensions/ecco-trace/openclaw.plugin.json": "{\n  \"id\": \"ecco-trace\",\n  \"name\": \"Ecco Trace\",\n  \"description\": \"Upload completed OpenClaw turns to ecco; managed by ecco; changes will be replaced\",\n  \"activation\": {\n    \"onStartup\": true\n  },\n  \"configSchema\": {\n    \"type\": \"object\",\n    \"additionalProperties\": false\n  }\n}\n",
+      "extensions/ecco-trace/package.json": "{\n  \"name\": \"ecco-trace\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"description\": \"managed by ecco; changes will be replaced\",\n  \"openclaw\": {\n    \"extensions\": [\n      \"./index.js\"\n    ]\n  }\n}\n",
+      "extensions/ecco-trace/index.js": "// managed by ecco; changes will be replaced\nimport { spawn } from \"node:child_process\";\n\nconst executable = \"@@ecco@@\";\nconst baseArgs = [\"traces\",\"push\",\"--from\",\"openclaw\",\"--api\",\"@@api@@\",\"--home\",\"@@home@@\"];\n\nfunction upload(args, input) {\n  return new Promise((resolve) => {\n    let child;\n    let timer;\n    const finish = () => { if (timer) clearTimeout(timer); resolve(); };\n    try {\n      child = spawn(executable, [...baseArgs, ...args], { stdio: [input === undefined ? \"ignore\" : \"pipe\", \"ignore\", \"ignore\"] });\n      child.once(\"error\", finish);\n      child.once(\"exit\", finish);\n      if (input !== undefined) child.stdin.end(JSON.stringify(input));\n      timer = setTimeout(() => { child.kill(); finish(); }, 60000);\n      timer.unref?.();\n    } catch {\n      finish();\n    }\n  });\n}\n\nexport default {\n  id: \"ecco-trace\",\n  name: \"Ecco Trace\",\n  description: \"Upload completed OpenClaw turns to ecco\",\n  register(api) {\n    api.on(\"agent_end\", async (_event, ctx) => {\n      const sessionId = ctx?.sessionId;\n      if (typeof sessionId !== \"string\" || !sessionId) return;\n      await upload([], { session_id: sessionId, agent_id: ctx?.agentId });\n    });\n  },\n};\n"
+    }
+  },
+  {
+    "name": "hermes",
+    "label": "Hermes",
+    "command": "hermes",
+    "env": "HERMES_HOME",
+    "dir": ".hermes",
+    "kind": "hermes",
+    "path": "config.yaml",
+    "event": "",
+    "files": {
+      "plugins/ecco-trace/plugin.yaml": "# managed by ecco; changes will be replaced\nname: ecco-trace\nversion: \"1.0.0\"\ndescription: Upload completed Hermes sessions to ecco\nprovides_hooks:\n  - on_session_end\n",
+      "plugins/ecco-trace/__init__.py": "# managed by ecco; changes will be replaced\nimport json\nimport subprocess\n\nEXECUTABLE = \"@@ecco@@\"\nBASE_ARGS = [\"traces\",\"push\",\"--from\",\"hermes\",\"--api\",\"@@api@@\",\"--home\",\"@@home@@\"]\n\ndef _session_id(args, kwargs):\n    value = kwargs.get(\"session_id\")\n    if isinstance(value, str):\n        return value\n    for item in args:\n        if isinstance(item, dict) and isinstance(item.get(\"session_id\"), str):\n            return item[\"session_id\"]\n        if isinstance(item, str):\n            return item\n    return None\n\ndef _upload(*args, **kwargs):\n    session_id = _session_id(args, kwargs)\n    if not session_id:\n        return\n    try:\n        subprocess.run(\n            [EXECUTABLE, *BASE_ARGS],\n            input=json.dumps({\"session_id\": session_id}),\n            text=True,\n            stdout=subprocess.DEVNULL,\n            stderr=subprocess.DEVNULL,\n            timeout=60,\n            check=False,\n        )\n    except Exception:\n        pass\n\ndef register(ctx):\n    ctx.register_hook(\"on_session_end\", _upload)\n"
+    }
+  },
+  {
+    "name": "droid",
+    "label": "Droid",
+    "command": "droid",
+    "env": "FACTORY_HOME",
+    "dir": ".factory",
+    "kind": "group",
+    "path": "hooks.json",
+    "event": "SessionEnd",
+    "files": {}
+  },
+  {
+    "name": "kimi-code",
+    "label": "Kimi Code",
+    "command": "kimi",
+    "env": "KIMI_CODE_HOME",
+    "dir": ".kimi-code",
+    "kind": "toml",
+    "path": "config.toml",
+    "event": "SessionEnd",
+    "files": {}
+  },
+  {
+    "name": "fx",
+    "label": "Fx",
+    "command": "fx",
+    "env": "FX_HOME",
+    "dir": ".fx",
+    "kind": "files",
+    "path": "",
+    "event": "",
+    "files": {
+      "skills/ecco-trace/SKILL.md": "---\nname: ecco-trace\ndescription: Upload the current fx session to ecco when the user asks to share or save a trace.\n---\n\n<!-- managed by ecco; changes will be replaced -->\n# Ecco trace\n\nWhen the user asks to share or save the current session, find its session.json file in ~/.fx/sessions and run:\n\n`\"@@ecco@@\" \"traces\" \"push\" \"--from\" \"fx\" \"--api\" \"@@api@@\" \"--home\" \"@@home@@\" \"--transcript\" \"<session.json>\"`\n\nDo not upload a session without the user's request.\n"
+    }
+  }
+]
