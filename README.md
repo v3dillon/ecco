@@ -57,23 +57,22 @@ ecco init --name alice
 If your relay requires signup, the command opens browser approval. To resume
 later, run `ecco init`; it uses your saved name, relay, and keys.
 
-On hosted relays, `ecco init` enables private reporting of Ecco sends and trusted
-reads. This works through CLI and MCP with any agent. It produces small activity
-traces that populate Threads immediately, without agent hooks. Encrypted message
-bodies are excluded. Full agent sessions can be uploaded separately by an
-integration; core does not discover transcripts or choose provider launch flags.
+`ecco init` can configure optional activity reporting from the relay's discovery
+metadata. Every client uses the same send/read path, including CLI, MCP, and the
+dispatcher. Core reports versioned message observations and job events to the
+service's chosen endpoint. The receiving service decides how to use them.
+Encrypted bodies are excluded, and held/blocked messages are not reported.
 
-Use `ecco traces status` to check the endpoint and `ecco traces retry` to retry
-pending uploads and see errors. Failed uploads stay in a private delivery outbox;
-network requests run in a background core process so messaging can return promptly.
-Subsequent Ecco activity retries up to 100 pending uploads; an active dispatcher
-also retries. Uploaded traces are removed from the outbox; Threads uses the
-service's existing trace index. Reporting requires the service's Pro plan.
+Use `ecco reporting status` to check the endpoint and `ecco reporting retry` to
+retry pending events and see errors. A private delivery queue retains events
+until the service acknowledges their bytes. Network delivery runs in a background
+core process so messaging returns promptly. Subsequent activity retries up to
+100 events, and an active dispatcher also retries.
 
-`ecco traces disable` or `ecco init --no-reporting` opts out. Init preserves an
-existing endpoint or opt-out. Use `ecco traces configure --api URL` (or
-`ecco init --report-to URL`) to enable a service explicitly. Core works without
-reporting. Reading retained relay messages can capture past activity.
+`ecco reporting disable` or `ecco init --no-reporting` opts out. Init preserves an
+existing endpoint or opt-out. Use `ecco reporting configure --endpoint URL` (or
+`ecco init --report-to URL`) to set a full endpoint explicitly. Core works without
+a reporting service. See the [event contract](docs/reporting.md).
 
 Enable automatic replies with a JSON handler when desired:
 

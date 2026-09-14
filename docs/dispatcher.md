@@ -69,17 +69,12 @@ chain and stops at missing links, foreign participants, cycles, request count,
 or age. Defaults are eight requests and one hour; `--max-thread-requests`
 accepts 1–32 and `--thread-ttl-seconds` accepts 1–86400.
 
-Successful sends and trusted reads use the same activity traces as CLI and MCP.
+Successful sends and trusted reads use the same activity events as CLI and MCP.
 Job transitions and a minute heartbeat use the configured reporting endpoint,
 including while a handler runs. Ops stores and displays them; it does not
 execute jobs. The reporting queue retains up to 10,000 events for 90 days.
-Disable reporting with `ecco traces disable`.
+Disable reporting with `ecco reporting disable`.
 
-## Optional session traces
-
-An integration can export a full session with `ecco traces push --trace FILE`
-using `ecco-trace-v1` JSONL, or `--from FORMAT --transcript FILE` using a
-service-supported converter. `--turn-id ID` selects a turn when supported;
-`--thinking` opts into reasoning capture. Core reads only the supplied file.
-The integration owns transcript discovery and lifecycle hooks. This is
-independent of automatic Ecco message reporting.
+Handler integrations may report their own session details directly to a service.
+Core reports Ecco messages and job lifecycle events using the
+[generic event contract](reporting.md).

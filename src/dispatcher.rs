@@ -273,8 +273,9 @@ fn report(db: &Connection, id: &Identity, api: &str, cfg: &Config) -> Result<(),
         .map(|(_, s)| serde_json::from_str(s))
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
-    let body=json!({"v":1,"events":events,"heartbeat":{"v":1,"dispatcherId":state(db,"dispatcher_id")?,"provider":cfg.handler_name(),"at":local::timestamp()}}).to_string();
-    reporting::post(id, api, "/api/dispatcher/reports", &body, None)?;
+    let body = json!({"v":1,"events":events,"heartbeat":{"v":1,"dispatcherId":state(db,"dispatcher_id")?,"provider":cfg.handler_name(),"at":local::timestamp()}});
+    let activity = json!({"schema":reporting::ACTIVITY_SCHEMA,"type":"dispatcher","observer":id.addr(),"report":body});
+    reporting::post(id, api, &activity.to_string())?;
     for (sequence, _) in rows {
         db.execute("DELETE FROM report_outbox WHERE sequence=?", [sequence])
             .map_err(|e| e.to_string())?;
@@ -482,7 +483,7 @@ fn run(home: &Path, once: bool) -> Result<(), String> {
     let reporter = std::thread::spawn(move || {
         if let (Ok(db), Ok(id)) = (database(&worker_home), Identity::load(&worker_home)) {
             loop {
-                if let Ok(api) = reporting::api(&worker_home, None) {
+                if let Ok(api) = reporting::destination(&worker_home) {
                     if let Err(e) = report(&db, &id, &api, &worker_cfg) {
                         eprintln!("dispatcher reporting retained: {e}");
                     }
@@ -527,7 +528,7 @@ fn run(home: &Path, once: bool) -> Result<(), String> {
     })();
     stop.store(true, Ordering::Relaxed);
     let _ = reporter.join();
-    if let Ok(api) = reporting::api(home, None) {
+    if let Ok(api) = reporting::destination(home) {
         let _ = report(&db, &id, &api, &cfg);
         let _ = reporting::Outbox::open(home, api).and_then(|q| q.flush(3, true));
     }

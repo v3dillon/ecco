@@ -1,3 +1,0 @@
-{"about":"topic","agent":"alice","envelopeIds":["b3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"kind":"header","model":null,"source":"ecco","startedAt":"2026-09-14T19:10:00.000Z","v":1}
-{"about":"topic","direction":"sent","envelopeId":"b3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","envelopeKind":"note","from":"alice@relay.test","gseq":10,"kind":"message","text":"hello","to":["bob@relay.test"],"ts":"2026-09-14T19:10:00.000Z","tseq":1}
-{"kind":"end","status":"completed","ts":"2026-09-14T19:10:00.000Z"}

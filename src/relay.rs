@@ -67,6 +67,7 @@ pub struct Relay {
     token: Option<String>,
     registration_token: Option<String>,
     registration_url: Option<String>,
+    reporting_url: Option<String>,
     signed: bool,
     authority: String,
     allow_roots: bool,
@@ -143,6 +144,7 @@ pub fn run(
         token,
         registration_token,
         registration_url,
+        reporting_url: std::env::var("ECCO_REPORTING_URL").ok(),
         signed,
         authority,
         allow_roots,
@@ -249,7 +251,7 @@ impl Relay {
                 }
                 ("POST", "/addr/transfer") => self.post_name_transfer(&body),
                 ("GET", "/.well-known/ecco") => {
-                    Ok(serde_json::json!({"registration_url": self.registration_url}).to_string())
+                    Ok(serde_json::json!({"registration_url": self.registration_url, "reporting_url": self.reporting_url}).to_string())
                 }
                 ("GET", p) if p.starts_with("/addr/") => self.get_addr(&p["/addr/".len()..]),
                 ("POST", "/msgs") => self.post_msgs(&body),
@@ -991,6 +993,7 @@ mod tests {
             token: None,
             registration_token: None,
             registration_url: None,
+            reporting_url: None,
             signed: true,
             authority: "localhost:4200".into(),
             allow_roots: false,

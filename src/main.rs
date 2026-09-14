@@ -11,7 +11,6 @@ mod registration;
 mod relay;
 mod reporting;
 mod store;
-mod traces;
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -58,7 +57,7 @@ enum Cmd {
         /// Save local keys and print their public keys without registering yet
         #[arg(long)]
         prepare: bool,
-        /// Reporting service URL (otherwise use the hosted registration service)
+        /// Activity endpoint URL (otherwise use the relay's reporting metadata)
         #[arg(long, conflicts_with_all = ["prepare", "no_reporting"])]
         report_to: Option<String>,
         /// Disable activity uploads for this identity
@@ -180,10 +179,10 @@ enum Cmd {
     Reject { id: String },
     /// Serve ecco as MCP tools over stdio (for agent harnesses)
     Mcp,
-    /// Configure activity reporting, upload a trace, or retry pending uploads
-    Traces {
+    /// Configure or retry optional Ecco activity reporting
+    Reporting {
         #[command(subcommand)]
-        cmd: traces::TraceCmd,
+        cmd: reporting::ReportingCmd,
     },
     /// Install and control the local automatic-reply dispatcher
     Dispatcher {
@@ -309,9 +308,10 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             let id = init_identity(home, name.as_deref(), relay.as_deref(), token)?;
             let mut service_endpoint = None;
             if !prepare {
-                if let Some(service) = registration::discover(&id.relay)? {
+                let services = registration::discover(&id.relay)?;
+                service_endpoint = services.reporting_url;
+                if let Some(service) = services.registration_url {
                     registration::authorize(&id, &service, no_browser)?;
-                    service_endpoint = Some(service);
                 } else {
                     client::register(&id)?;
                 }
@@ -354,7 +354,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             }
             Ok(())
         }
-        Cmd::Traces { cmd } => traces::run(home, cmd),
+        Cmd::Reporting { cmd } => reporting::command(home, cmd),
         Cmd::Dispatcher { cmd } => dispatcher::command(home, cmd),
         Cmd::Transfer { to } => registration::transfer(&Identity::load(home)?, &to),
         Cmd::Relay {

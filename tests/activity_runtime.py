@@ -50,7 +50,7 @@ esac
             raise AssertionError((args, result.stderr, result.stdout))
         return result
 
-    traces, reports = {}, []
+    activities, reports = {}, []
     fail_upload = threading.Event()
     slow_upload = threading.Event()
     upload_started = threading.Event()
@@ -67,18 +67,17 @@ esac
                 self.end_headers()
                 self.wfile.write(b"{}")
                 return
-            if self.path == "/api/traces":
-                fmt = self.headers["x-trace-format"]
-                assert self.headers["x-trace-visibility"] == "private"
-                body = ([json.loads(line) for line in data.decode().splitlines() if line]
-                        if fmt == "ecco-trace-v1" else json.loads(data))
-                trace_hash = "sha256:" + hashlib.sha256(data).hexdigest()
-                traces[trace_hash] = (fmt, body, self.headers["x-ecco-addr"])
-                reply = {"hash": trace_hash}
+            assert self.path == "/collector"
+            assert not any(name.lower().startswith("x-trace-") for name in self.headers)
+            body = json.loads(data)
+            assert body["schema"] == "ecco-activity-v1"
+            digest = "sha256:" + hashlib.sha256(data).hexdigest()
+            if body["type"] == "message":
+                activities[digest] = body
             else:
-                body = json.loads(data)
-                reports.append(body)
-                reply = {"accepted": len(body["events"])}
+                assert body["type"] == "dispatcher"
+                reports.append(body["report"])
+            reply = {"accepted": digest}
             self.send_response(200)
             self.end_headers()
             self.wfile.write(json.dumps(reply).encode())
@@ -88,13 +87,13 @@ esac
 
     service = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Reporting)
     threading.Thread(target=service.serve_forever, daemon=True).start()
-    api = f"http://127.0.0.1:{service.server_port}"
+    api = f"http://127.0.0.1:{service.server_port}/collector"
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     authority = f"localhost:{port}"
     relay = subprocess.Popen([BINARY, "relay", "--port", str(port), "--data", str(root / "relay"), "--signed"],
-                             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                             env={**env, "ECCO_REPORTING_URL": api}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def relay_ready():
         try:
@@ -104,24 +103,22 @@ esac
             return False
 
     def events(addr=None):
-        return [event for fmt, body, owner in list(traces.values())
-                if fmt == "ecco-trace-v1" and (addr is None or owner == addr)
-                for event in body if event["kind"] == "message"]
+        return [body["envelope"] for body in list(activities.values()) if addr is None or body["observer"] == addr]
 
     def pending(home):
-        return list((home / "trace-outbox").glob("*/*.json"))
+        return list((home / "reporting-outbox").glob("*/*.json"))
 
     try:
         wait_until(relay_ready)
         alice, bob = root / "alice", root / "bob"
         for name, home in [("alice", alice), ("bob", bob)]:
-            run(home, "init", "--name", name, "--relay", f"http://localhost:{port}", "--report-to", api)
+            run(home, "init", "--name", name, "--relay", f"http://localhost:{port}")
         assert not (user / ".codex").exists()  # init does not install agent hooks
         before = (alice / "identity.json").read_bytes()
         run(alice, "init")
         assert (alice / "identity.json").read_bytes() == before
 
-        # A held request is visible only after trust. No session needs to finish.
+        # A held request is visible only after trust. Reporting is independent of agent sessions.
         request = json.loads(run(bob, "send", "--to", f"alice@{authority}", "--about", "smoke",
                                  "--kind", "request", "ping").stdout)
         run(alice, "inbox", "--json")
@@ -130,11 +127,11 @@ esac
         run(alice, "trust", f"bob@{authority}")
         run(alice, "log", "smoke", "--json")
         wait_until(lambda: len(events(f"alice@{authority}")) == 1)
-        assert events(f"alice@{authority}")[0]["direction"] == "received"
-        hashes = set(traces)
+        assert events(f"alice@{authority}")[0]["from"] == f"bob@{authority}"
+        hashes = set(activities)
         run(alice, "inbox", "--json")
-        run(alice, "traces", "retry")
-        assert set(traces) == hashes  # deterministic per-envelope trace bytes
+        run(alice, "reporting", "retry")
+        assert set(activities) == hashes  # deterministic per-envelope event bytes
 
         # A stalled service must not delay a successful send or hold its stdout pipe.
         slow_upload.set()
@@ -145,9 +142,9 @@ esac
         assert upload_started.wait(5)
         upload_release.set()
         slow_upload.clear()
-        wait_until(lambda: any(e["envelopeId"] == encrypted["id"] for e in events()))
-        assert "never-upload-this-plaintext" not in json.dumps(traces)
-        assert any(e["text"] == "<encrypted>" for e in events())
+        wait_until(lambda: any(e["id"] == encrypted["id"] for e in events()))
+        assert "never-upload-this-plaintext" not in json.dumps(activities)
+        assert any(e["encrypted"] and e["text"] is None for e in events())
 
         # MCP uses the same client path; stdout remains JSON-RPC only.
         mcp_input = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
@@ -206,17 +203,10 @@ print(json.dumps({{"kind":"finding","text":"pong","follow_up":"one clarification
         assert any(e["state"] == "completed" for report in reports for e in report["events"])
         assert db.execute("SELECT count(*) FROM report_outbox").fetchone()[0] == 0
 
-        # Native formats are opaque to core: a future adapter needs no core release.
-        native = root / "export.jsonl"
-        native.write_text('{"message":"example"}\n')
-        fail_upload.set()
-        assert run(alice, "traces", "push", "--from", "future-agent", "--transcript", str(native), check=False).returncode != 0
-        fail_upload.clear()
-        run(alice, "traces", "retry")
-        assert any(fmt == "ecco-native-v1" and body["agent"] == "future-agent"
-                   for fmt, body, _ in traces.values())
+        run(alice, "reporting", "retry")
+        assert run(alice, "traces", "--help", check=False).returncode != 0
         wait_until(lambda: not pending(alice))
-        run(alice, "traces", "disable")
+        run(alice, "reporting", "disable")
         run(alice, "init")
         assert json.loads((alice / "reporting.json").read_text())["endpoint"] is None
         run(alice, "send", "--to", f"bob@{authority}", "--about", "disabled", "opted out")
@@ -225,7 +215,7 @@ print(json.dumps({{"kind":"finding","text":"pong","follow_up":"one clarification
         run(alice, "dispatcher", "uninstall")
         assert not unit.exists() and (alice / "dispatcher.sqlite").exists()
         db.close()
-        print("PASS CLI/MCP activity, trusted reads, encrypted redaction, background uploads, generic handler, rollback, durable retries, no duplicate replies, opt-out")
+        print("PASS CLI/MCP activity, trusted reads, encrypted redaction, service discovery, background delivery, generic handler, rollback, durable retries, no duplicate replies, opt-out")
     finally:
         upload_release.set()
         relay.terminate()
