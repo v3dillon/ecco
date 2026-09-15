@@ -44,6 +44,10 @@ pub(crate) fn partition(
     let me = id.addr();
     let (mut visible, mut held, mut rejected) = (Vec::new(), Vec::new(), Vec::new());
     for stored in messages {
+        if stored.env.verify().is_err() {
+            rejected.push(stored);
+            continue;
+        }
         match identity::standing(&contacts, &me, &stored.env.from) {
             identity::Standing::Trusted => visible.push(stored),
             identity::Standing::Unknown => held.push(stored),
@@ -93,7 +97,16 @@ fn held_summaries(held: &[Stored]) -> Vec<Value> {
 fn rejected_summaries(rejected: &[Stored]) -> Vec<Value> {
     rejected
         .iter()
-        .map(|stored| json!({ "id": stored.env.id, "reason": "sender is blocked" }))
+        .map(|stored| {
+            json!({
+                "id": stored.env.id,
+                "reason": if stored.env.verify().is_err() {
+                    "invalid signature"
+                } else {
+                    "sender is blocked"
+                }
+            })
+        })
         .collect()
 }
 
@@ -179,11 +192,23 @@ mod tests {
                 json!({"text":"drop"}),
             ),
         ];
+        let mut forged = stored(
+            &id,
+            8,
+            "trusted@localhost:4200",
+            "request",
+            json!({"text":"ok"}),
+        );
+        forged.env.body = json!({"text":"forged"});
+        let mut with_forged = messages.clone();
+        with_forged.push(forged);
         assert_eq!(next_cursor(9, &messages), 9);
         assert_eq!(next_cursor(0, &messages), 7);
+        assert_eq!(next_cursor(0, &with_forged), 8);
 
         let inbox = inbox_json(&home, &id, 7, messages.clone());
         let log = log_json(&home, &id, messages);
+        let forged_inbox = inbox_json(&home, &id, 8, with_forged);
         assert_eq!(inbox["cursor"], "7");
         assert_eq!(inbox["messages"].as_array().unwrap().len(), 1);
         assert_eq!(
@@ -191,6 +216,10 @@ mod tests {
             json!([{"sender":"unknown@localhost:4200","kind":"request","count":2}])
         );
         assert_eq!(inbox["rejected"].as_array().unwrap().len(), 1);
+        assert_eq!(forged_inbox["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(forged_inbox["rejected"].as_array().unwrap().len(), 2);
+        assert!(forged_inbox.to_string().contains("invalid signature"));
+        assert!(!forged_inbox.to_string().contains("forged"));
         assert!(log.get("cursor").is_none());
         for output in [&inbox, &log] {
             let output = output.to_string();

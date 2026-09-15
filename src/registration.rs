@@ -61,19 +61,19 @@ impl Services {
         services.reporting_url = services
             .reporting_url
             .as_deref()
-            .map(crate::reporting::validate_endpoint)
-            .transpose()?;
+            .filter(|url| !url.is_empty())
+            .and_then(|url| crate::reporting::validate_endpoint(url).ok());
         Ok(services)
     }
 }
 /// Optional deployment metadata. Relays without it retain ordinary registration.
 pub fn discover(relay: &str) -> Result<Services, String> {
     let mut services = metadata(relay)?;
-    // Existing relays can advertise only a registration origin. Its service can
-    // publish reporting metadata without requiring a relay binary upgrade.
     if services.reporting_url.is_none() {
         if let Some(origin) = &services.registration_url {
-            services.reporting_url = metadata(origin)?.reporting_url;
+            if let Ok(extra) = metadata(origin) {
+                services.reporting_url = extra.reporting_url;
+            }
         }
     }
     Ok(services)
@@ -263,14 +263,49 @@ mod tests {
         worker.join().unwrap();
         let empty = Services::decode(serde_json::json!({})).unwrap();
         assert!(empty.registration_url.is_none() && empty.reporting_url.is_none());
+        let mixed = Services::decode(serde_json::json!({
+            "registration_url":"https://dash.test",
+            "reporting_url":"http://remote.test/events"
+        }))
+        .unwrap();
+        assert_eq!(mixed.registration_url.as_deref(), Some("https://dash.test"));
+        assert!(mixed.reporting_url.is_none());
         for url in [
+            "",
             "http://remote.test/events",
             "https://user:secret@service.test/events",
             "https://service.test/events?token=secret",
             "https://service.test/events#fragment",
         ] {
-            assert!(Services::decode(serde_json::json!({"reporting_url":url})).is_err());
+            let decoded = Services::decode(serde_json::json!({"reporting_url":url})).unwrap();
+            assert!(decoded.reporting_url.is_none(), "{url}");
         }
+    }
+    #[test]
+    fn reporting_discovery_failures_do_not_block_registration() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", server.server_addr());
+        let response_origin = origin.clone();
+        let worker = std::thread::spawn(move || {
+            let request = server
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .expect("relay discovery");
+            request
+                .respond(tiny_http::Response::from_string(
+                    serde_json::json!({"registration_url":response_origin}).to_string(),
+                ))
+                .unwrap();
+            let request = server
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .expect("registration-origin discovery");
+            request.respond(tiny_http::Response::empty(500)).unwrap();
+        });
+        let services = discover(&origin).unwrap();
+        assert_eq!(services.registration_url.as_deref(), Some(origin.as_str()));
+        assert!(services.reporting_url.is_none());
+        worker.join().unwrap();
     }
     #[test]
     fn accepts_only_safe_origins_and_names() {

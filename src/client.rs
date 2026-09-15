@@ -132,25 +132,40 @@ pub fn thread(
         "/threads?about={}&since={since}&wait={wait}",
         urlencode(about)
     );
-    fetch(home, id, &path, wait)
+    Ok(observed(home, id, read_msgs(id, &path, wait)?))
 }
 
-pub fn inbox(home: &Path, id: &Identity, since: u64, wait: u64) -> Result<Vec<Stored>, String> {
+pub fn inbox(
+    home: &Path,
+    id: &Identity,
+    since: u64,
+    wait: u64,
+) -> Result<(Vec<Stored>, u64), String> {
     let path = format!(
         "/inbox?addr={}&since={since}&wait={wait}",
         urlencode(&id.addr())
     );
-    fetch(home, id, &path, wait)
+    let raw = read_msgs(id, &path, wait)?;
+    let until = crate::agent_surface::next_cursor(since, &raw);
+    Ok((observed(home, id, raw), until))
 }
 
-fn fetch(home: &Path, id: &Identity, path: &str, wait: u64) -> Result<Vec<Stored>, String> {
+fn read_msgs(id: &Identity, path: &str, wait: u64) -> Result<Vec<Stored>, String> {
     let raw = get_signed(id, path, wait.saturating_add(10))?;
     let resp: MsgsResponse = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    for stored in &resp.msgs {
-        stored.env.verify()?;
-    }
-    crate::reporting::observe(home, id, &resp.msgs);
     Ok(resp.msgs)
+}
+
+fn observed(home: &Path, id: &Identity, msgs: Vec<Stored>) -> Vec<Stored> {
+    let msgs = take_verified(msgs);
+    crate::reporting::observe(home, id, &msgs);
+    msgs
+}
+
+fn take_verified(msgs: Vec<Stored>) -> Vec<Stored> {
+    msgs.into_iter()
+        .filter(|stored| stored.env.verify().is_ok())
+        .collect()
 }
 
 fn post(url: &str, token: Option<&str>, body: &str) -> Result<String, String> {
@@ -257,5 +272,39 @@ mod tests {
             &sender,
         );
         assert!(receipt.verify(&other).is_err());
+    }
+
+    #[test]
+    fn unverified_envelopes_are_dropped_without_failing_the_batch() {
+        let sender = SigningKey::generate(&mut OsRng);
+        let valid = Envelope::seal(
+            "topic".into(),
+            json!({"text":"ok"}),
+            "a@x".into(),
+            "note".into(),
+            vec![],
+            vec![],
+            1,
+            &sender,
+        );
+        let mut invalid = valid.clone();
+        invalid.body = json!({"text":"forged"});
+        let msgs = take_verified(vec![
+            Stored {
+                gseq: 1,
+                tseq: 1,
+                received_at: 1,
+                env: valid,
+            },
+            Stored {
+                gseq: 2,
+                tseq: 2,
+                received_at: 1,
+                env: invalid,
+            },
+        ]);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].gseq, 1);
+        assert_eq!(msgs[0].env.body["text"], "ok");
     }
 }

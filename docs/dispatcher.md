@@ -1,8 +1,8 @@
 # Local dispatcher and handler contract
 
 The dispatcher reads an identity's inbox and runs an explicitly configured
-handler for allowed requests. Ops displays its heartbeat and job metadata.
-Ordinary messaging and activity reporting work without a dispatcher.
+handler for allowed requests. A receiving service may store heartbeat and job
+metadata. Ordinary messaging and activity reporting work without a dispatcher.
 
 ```sh
 ecco init --handler /absolute/path/to/adapter \
@@ -71,7 +71,7 @@ accepts 1–32 and `--thread-ttl-seconds` accepts 1–86400.
 
 Successful sends and trusted reads use the same activity events as CLI and MCP.
 Job transitions and a minute heartbeat use the configured reporting endpoint,
-including while a handler runs. Ops stores and displays them; it does not
+including while a handler runs. The receiving service stores them; it does not
 execute jobs. The reporting queue retains up to 10,000 events for 90 days.
 Disable reporting with `ecco reporting disable`.
 

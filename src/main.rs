@@ -471,8 +471,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
         } => {
             let id = Identity::load(home)?;
             let start = if new { load_cursor(home) } else { since };
-            let msgs = client::inbox(home, &id, start, wait)?;
-            let max_gseq = agent_surface::next_cursor(start, &msgs);
+            let (msgs, max_gseq) = client::inbox(home, &id, start, wait)?;
             if as_json {
                 println!(
                     "{}",
@@ -504,8 +503,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                 id.addr()
             );
             loop {
-                let batch = client::inbox(home, &id, cursor, 25)?;
-                let max_gseq = batch.iter().map(|s| s.gseq).max();
+                let (batch, until) = client::inbox(home, &id, cursor, 25)?;
                 let (visible, held, _) = agent_surface::partition(home, &id, batch);
                 for s in &visible {
                     println!("{}", fmt(&id, s, false));
@@ -516,8 +514,8 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                         s.env.kind, s.env.from
                     );
                 }
-                if let Some(m) = max_gseq {
-                    cursor = cursor.max(m);
+                if until > cursor {
+                    cursor = until;
                     save_cursor(home, cursor)?;
                 }
             }
@@ -548,7 +546,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
         }
         Cmd::Requests => {
             let id = Identity::load(home)?;
-            let msgs = client::inbox(home, &id, 0, 0)?;
+            let (msgs, _) = client::inbox(home, &id, 0, 0)?;
             let (_, held, _) = agent_surface::partition(home, &id, msgs);
             if held.is_empty() {
                 println!("no pending contact requests");
@@ -564,7 +562,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             let id = Identity::load(home)?;
             identity::contacts_set(home, &addr, "approved")?;
             println!("trusted {addr}");
-            let msgs = client::inbox(home, &id, 0, 0)?;
+            let (msgs, _) = client::inbox(home, &id, 0, 0)?;
             for s in msgs.iter().filter(|s| s.env.from == addr) {
                 println!("{}", fmt(&id, s, false));
             }
@@ -869,7 +867,7 @@ fn decide(home: &Path, target: &str, verb: &str) -> Result<(), String> {
 
 /// Proposals from trusted senders whose thread does not yet contain a decision.
 fn pending_proposals(home: &Path, id: &Identity) -> Result<Vec<Stored>, String> {
-    let msgs = client::inbox(home, id, 0, 0)?;
+    let (msgs, _) = client::inbox(home, id, 0, 0)?;
     let (visible, _, _) = agent_surface::partition(home, id, msgs);
     let mut pending = Vec::new();
     for s in visible.into_iter().filter(|s| s.env.kind == "proposal") {

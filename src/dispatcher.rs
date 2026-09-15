@@ -208,17 +208,24 @@ fn event(
     .map_err(|e| e.to_string())?;
     Ok(())
 }
+fn request_text(id: &Identity, env: &crate::envelope::Envelope) -> Option<String> {
+    let body = if crate::envelope::is_encrypted(&env.body) {
+        crate::envelope::open_body(&env.body, &id.addr(), &id.root_key())?
+    } else {
+        env.body.clone()
+    };
+    let text = body.get("text")?.as_str()?;
+    (!text.is_empty() && text.len() <= 65536).then(|| text.to_owned())
+}
+
 fn ingest(
     db: &mut Connection,
     home: &Path,
     id: &Identity,
     cfg: &Config,
     messages: Vec<Stored>,
+    next: u64,
 ) -> Result<(), String> {
-    let cursor = state(db, "cursor")?
-        .parse::<u64>()
-        .map_err(|e| e.to_string())?;
-    let next = crate::agent_surface::next_cursor(cursor, &messages);
     let (visible, _, _) = crate::agent_surface::partition(home, id, messages);
     let tx = db.transaction().map_err(|e| e.to_string())?;
     for stored in visible {
@@ -226,20 +233,18 @@ fn ingest(
         if env.from == id.addr() || !env.to.contains(&id.addr()) {
             continue;
         }
-        let notification = env.kind == "proposal";
-        if !notification
-            && (env.kind != "request"
-                || !cfg.allow.contains(&env.from)
-                || env.body["text"]
-                    .as_str()
-                    .is_none_or(|s| s.is_empty() || s.len() > 65536))
-        {
+        let status = if env.kind == "proposal" {
+            "needs-human"
+        } else if env.kind != "request" || !cfg.allow.contains(&env.from) {
             continue;
-        }
-        let status = if notification {
+        } else if request_text(id, env).is_some() {
+            "received"
+        } else if crate::envelope::is_encrypted(&env.body)
+            && crate::envelope::open_body(&env.body, &id.addr(), &id.root_key()).is_none()
+        {
             "needs-human"
         } else {
-            "received"
+            continue;
         };
         if tx
             .execute(
@@ -390,7 +395,8 @@ fn execute(
     let result = if let Some(saved) = saved {
         ResultMessage::decode(serde_json::from_str(saved).map_err(|e| e.to_string())?)?
     } else {
-        let input = json!({"schema":"ecco-dispatch-v1","type":"request","untrusted":true,"envelope":{"id":request.env.id,"from":request.env.from,"about":request.env.about,"text":request.env.body["text"]}});
+        let text = request_text(id, &request.env).ok_or("request has no usable text")?;
+        let input = json!({"schema":"ecco-dispatch-v1","type":"request","untrusted":true,"envelope":{"id":request.env.id,"from":request.env.from,"about":request.env.about,"text":text}});
         let result = cfg.handler.run(&cfg.work_dir, &input)?;
         db.execute(
             "UPDATE jobs SET result=? WHERE id=?",
@@ -508,7 +514,7 @@ fn run(home: &Path, once: bool) -> Result<(), String> {
                 .parse()
                 .map_err(|e: std::num::ParseIntError| e.to_string())?;
             match client::inbox(home, &id, cursor, if once { 0 } else { 20 })
-                .and_then(|messages| ingest(&mut db, home, &id, &cfg, messages))
+                .and_then(|(messages, until)| ingest(&mut db, home, &id, &cfg, messages, until))
             {
                 Ok(()) => {}
                 Err(e) => {
@@ -519,7 +525,16 @@ fn run(home: &Path, once: bool) -> Result<(), String> {
                     std::thread::sleep(Duration::from_secs(2));
                 }
             }
-            process_ready(&mut db, home, &id, &cfg)?;
+            match process_ready(&mut db, home, &id, &cfg) {
+                Ok(()) => {}
+                Err(e) => {
+                    if once {
+                        return Err(e);
+                    }
+                    eprintln!("dispatcher job retry: {e}");
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
             if once {
                 break;
             }
@@ -624,6 +639,7 @@ mod tests {
             &id,
             &cfg,
             vec![make("peer@relay.test", 1), make("held@relay.test", 2)],
+            2,
         )
         .unwrap();
         assert_eq!(state(&db, "cursor").unwrap(), "2");
@@ -639,7 +655,94 @@ mod tests {
             1
         );
         db.execute_batch("CREATE TRIGGER stop_insert BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT,'stop'); END;").unwrap();
-        assert!(ingest(&mut db, &home, &id, &cfg, vec![make("peer@relay.test", 3)]).is_err());
+        assert!(ingest(
+            &mut db,
+            &home,
+            &id,
+            &cfg,
+            vec![make("peer@relay.test", 3)],
+            3
+        )
+        .is_err());
+        assert_eq!(state(&db, "cursor").unwrap(), "2");
+        drop(db);
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn encrypted_requests_are_decrypted_and_undecryptable_ones_need_a_human() {
+        let home =
+            std::env::temp_dir().join(format!("ecco-dispatch-enc-{}", rand::random::<u64>()));
+        let id = Identity::generate("me", "https://relay.test", None);
+        id.save(&home).unwrap();
+        identity::contacts_set(&home, "peer@relay.test", "approved").unwrap();
+        let cfg = Config {
+            version: 1,
+            allow: vec!["peer@relay.test".into()],
+            work_dir: home.clone(),
+            handler: Handler {
+                executable: "/bin/true".into(),
+                args: vec![],
+                env: vec![],
+            },
+            max_thread_requests: 8,
+            thread_ttl_seconds: 3600,
+        };
+        let envelope = |body| Stored {
+            gseq: 1,
+            tseq: 1,
+            received_at: 100,
+            env: crate::envelope::Envelope::seal(
+                "topic".into(),
+                body,
+                "peer@relay.test".into(),
+                "request".into(),
+                vec![],
+                vec![id.addr()],
+                100,
+                &id.agent_key(),
+            ),
+        };
+        let readable = crate::envelope::seal_body(
+            &json!({"text":"secret request"}),
+            &[(id.addr(), id.root_key().verifying_key())],
+        )
+        .unwrap();
+        let mut db = database(&home).unwrap();
+        ingest(&mut db, &home, &id, &cfg, vec![envelope(readable)], 1).unwrap();
+        assert_eq!(
+            db.query_row("SELECT status FROM jobs", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "received"
+        );
+        let payload: String = db
+            .query_row("SELECT payload FROM jobs", [], |r| r.get(0))
+            .unwrap();
+        let stored: Stored = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            request_text(&id, &stored.env).as_deref(),
+            Some("secret request")
+        );
+        db.execute("DELETE FROM jobs", []).unwrap();
+        let stranger = Identity::generate("other", "https://relay.test", None);
+        let sealed_elsewhere = crate::envelope::seal_body(
+            &json!({"text":"not for us"}),
+            &[(id.addr(), stranger.root_key().verifying_key())],
+        )
+        .unwrap();
+        ingest(
+            &mut db,
+            &home,
+            &id,
+            &cfg,
+            vec![envelope(sealed_elsewhere)],
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            db.query_row("SELECT status FROM jobs", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "needs-human"
+        );
         assert_eq!(state(&db, "cursor").unwrap(), "2");
         drop(db);
         fs::remove_dir_all(home).unwrap();

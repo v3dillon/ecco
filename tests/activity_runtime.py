@@ -202,6 +202,11 @@ print(json.dumps({{"kind":"finding","text":"pong","follow_up":"one clarification
                    for m in messages if m["env"]["from"].startswith("alice@"))
         assert any(e["state"] == "completed" for report in reports for e in report["events"])
         assert db.execute("SELECT count(*) FROM report_outbox").fetchone()[0] == 0
+        run(bob, "send", "--to", f"alice@{authority}", "--about", "smoke",
+            "--kind", "request", "--encrypt", "secret-dispatch")
+        run(alice, "dispatcher", "run", "--once")
+        assert calls.read_text() == "xx"
+        assert "secret-dispatch" not in json.dumps(activities)
 
         run(alice, "reporting", "retry")
         assert run(alice, "traces", "--help", check=False).returncode != 0

@@ -135,6 +135,7 @@ pub fn observe(home: &Path, id: &Identity, messages: &[Stored]) {
         };
         let contacts = identity::contacts_load(home);
         let queue = Outbox::open(home, api)?;
+        let mut queued = false;
         for stored in messages {
             if identity::standing(&contacts, &id.addr(), &stored.env.from)
                 != identity::Standing::Trusted
@@ -143,9 +144,9 @@ pub fn observe(home: &Path, id: &Identity, messages: &[Stored]) {
             {
                 continue;
             }
-            queue.enqueue(&message_activity(id, stored).to_string())?;
+            queued |= queue.enqueue(&message_activity(id, stored).to_string())?;
         }
-        if queue.dir.exists() {
+        if queued {
             start_upload(home)?;
         }
         Ok::<_, String>(())
@@ -158,7 +159,6 @@ pub fn observe(home: &Path, id: &Identity, messages: &[Stored]) {
 fn message_activity(id: &Identity, stored: &Stored) -> Value {
     let env = &stored.env;
     let encrypted = envelope::is_encrypted(&env.body);
-    // Observe the envelope without exporting ciphertext or decrypted contents.
     let text = if encrypted {
         None
     } else {
@@ -169,8 +169,6 @@ fn message_activity(id: &Identity, stored: &Stored) -> Value {
         "receipt":{"gseq":stored.gseq,"tseq":stored.tseq,"received_at":stored.received_at}})
 }
 
-// CLI processes can exit immediately. A detached core process owns network I/O;
-// a per-outbox lock serializes concurrent CLI/MCP readers and dispatcher retries.
 #[cfg(not(test))]
 fn start_upload(home: &Path) -> Result<(), String> {
     use std::{
@@ -184,6 +182,7 @@ fn start_upload(home: &Path) -> Result<(), String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // New session so CLI exit does not kill the uploader.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -193,14 +192,19 @@ fn start_upload(home: &Path) -> Result<(), String> {
         });
     }
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
-    // Reap children for long-lived MCP processes. On CLI exit init reaps them.
+    // Reap so long-lived MCP processes do not accumulate zombies.
     std::thread::spawn(move || {
         let _ = child.wait();
     });
     Ok(())
 }
 #[cfg(test)]
+thread_local! {
+    static UPLOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
 fn start_upload(_: &Path) -> Result<(), String> {
+    UPLOADS.with(|c| c.set(c.get() + 1));
     Ok(())
 }
 
@@ -260,16 +264,17 @@ impl Outbox {
             id,
         })
     }
-    pub fn enqueue(&self, body: &str) -> Result<(), String> {
+    pub fn enqueue(&self, body: &str) -> Result<bool, String> {
         if body.len() > MAX_EVENT_BYTES {
             return Err("event exceeds delivery size limit".into());
         }
         local::mkdir(&self.dir)?;
         let path = self.dir.join(format!("{}.json", local::sha256(body)));
         if path.exists() {
-            return Ok(());
+            return Ok(false);
         }
-        local::write(&path, body.as_bytes())
+        local::write(&path, body.as_bytes())?;
+        Ok(true)
     }
     pub fn flush(&self, limit: usize, background: bool) -> Result<usize, String> {
         if !self.dir.exists() {
@@ -407,6 +412,7 @@ mod tests {
     }
     #[test]
     fn records_only_trusted_verified_messages_and_redacts_encrypted_bodies() {
+        UPLOADS.with(|c| c.set(0));
         let home = home();
         let id = Identity::load(&home).unwrap();
         let make = |from: &str, text: &str| Stored {
@@ -427,6 +433,7 @@ mod tests {
         let own = make(&id.addr(), "hello");
         observe(&home, &id, std::slice::from_ref(&own));
         assert!(queued(&home).is_empty());
+        assert_eq!(UPLOADS.with(|c| c.get()), 0);
         configure(&home, Some("http://localhost:9")).unwrap();
         identity::contacts_set(&home, "trusted@relay.test", "approved").unwrap();
         identity::contacts_set(&home, "blocked@relay.test", "blocked").unwrap();
@@ -446,6 +453,7 @@ mod tests {
         observe(&home, &id, std::slice::from_ref(&own)); // same envelope, same bytes
         let events = queued(&home);
         assert_eq!(events.len(), 2);
+        assert_eq!(UPLOADS.with(|c| c.get()), 1);
         let all = events.join("\n");
         for secret in ["held-secret", "blocked-secret", "forged"] {
             assert!(!all.contains(secret));

@@ -144,7 +144,12 @@ pub fn run(
         token,
         registration_token,
         registration_url,
-        reporting_url: std::env::var("ECCO_REPORTING_URL").ok(),
+        reporting_url: match std::env::var("ECCO_REPORTING_URL") {
+            Ok(value) if !value.trim().is_empty() => {
+                Some(crate::reporting::validate_endpoint(&value)?)
+            }
+            _ => None,
+        },
         signed,
         authority,
         allow_roots,

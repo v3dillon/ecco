@@ -153,9 +153,9 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
             } else {
                 args.get("since").and_then(Value::as_u64).unwrap_or(0)
             };
-            let msgs = client::inbox(home, &id, since, 0)?;
+            let (msgs, until) = client::inbox(home, &id, since, 0)?;
             if new {
-                crate::save_cursor(home, crate::agent_surface::next_cursor(since, &msgs))?;
+                crate::save_cursor(home, until)?;
             }
             let (visible, held, _) = crate::agent_surface::partition(home, &id, msgs);
             let mut out = serde_json::Map::new();
