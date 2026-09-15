@@ -147,14 +147,11 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
             .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
         }
         "ecco_inbox" => {
-            let new = args.get("new").and_then(Value::as_bool).unwrap_or(false);
-            let since = if new {
-                crate::load_cursor(home)
-            } else {
-                args.get("since").and_then(Value::as_u64).unwrap_or(0)
-            };
-            let (msgs, until) = client::inbox(home, &id, since, 0)?;
-            if new {
+            let since = args.get("since").and_then(Value::as_u64);
+            let persist = since.is_none();
+            let start = since.unwrap_or_else(|| crate::load_cursor(home));
+            let (msgs, until) = client::inbox(home, &id, start, 0)?;
+            if persist {
                 crate::save_cursor(home, until)?;
             }
             let (visible, held, _) = crate::agent_surface::partition(home, &id, msgs);
@@ -260,12 +257,11 @@ fn tool_defs() -> Value {
         },
         {
             "name": "ecco_inbox",
-            "description": "Messages addressed to you. Pass new=true to get only unseen messages and advance the persisted cursor — recommended at session start. Messages from senders your human has not approved are withheld (sender summary only); admission is a human decision made outside this surface.",
+            "description": "Unread messages addressed to you, then save that place. Pass since to start after an explicit inbox sequence without saving. Messages from senders your human has not approved are withheld (sender summary only); admission is a human decision made outside this surface.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "new": { "type": "boolean" },
-                    "since": { "type": "integer", "description": "explicit gseq cursor; ignored when new=true" }
+                    "since": { "type": "integer", "description": "start after this inbox sequence instead of the saved cursor; does not save" }
                 }
             }
         },

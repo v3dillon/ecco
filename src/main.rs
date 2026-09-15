@@ -138,13 +138,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: WorkCmd,
     },
-    /// Show messages addressed to you
+    /// Show unread messages addressed to you, then save that place
     Inbox {
-        #[arg(long, default_value_t = 0, conflicts_with = "new")]
-        since: u64,
-        /// Only messages since the persisted cursor, then advance it (for agent session starts)
+        /// Start after this inbox sequence instead of the saved cursor (does not save)
         #[arg(long)]
-        new: bool,
+        since: Option<u64>,
         /// Return a stable machine-readable batch
         #[arg(long)]
         json: bool,
@@ -465,12 +463,12 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
         }
         Cmd::Inbox {
             since,
-            new,
             json: as_json,
             wait,
         } => {
             let id = Identity::load(home)?;
-            let start = if new { load_cursor(home) } else { since };
+            let persist = since.is_none();
+            let start = since.unwrap_or_else(|| load_cursor(home));
             let (msgs, max_gseq) = client::inbox(home, &id, start, wait)?;
             if as_json {
                 println!(
@@ -490,7 +488,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                     );
                 }
             }
-            if new {
+            if persist {
                 save_cursor(home, max_gseq)?;
             }
             Ok(())
@@ -1066,8 +1064,7 @@ mod tests {
         assert!(matches!(
             cli.cmd,
             Cmd::Inbox {
-                since: 9,
-                new: false,
+                since: Some(9),
                 json: true,
                 wait: 25
             }

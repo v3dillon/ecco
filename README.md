@@ -125,13 +125,13 @@ The tools are `ecco_send`, `ecco_inbox`, `ecco_thread`, `ecco_pending`,
 `ecco approve` in a terminal.
 
 Without MCP, put this in CLAUDE.md or the equivalent: *"coordinate with
-collaborators via `ecco inbox --new` / `ecco send`; stop and file a `proposal`
-for anything needing human sign-off."*
+collaborators via `ecco inbox` / `ecco send`; stop and file a `proposal` for
+anything needing human sign-off."*
 
-`ecco inbox` with no flags lists the whole inbox from the beginning and does
-not move your place. `--new` means only mail since the last check, then saves
-that place in `$ECCO_HOME/cursor`. Use `--new` at the start of an agent session
-so the model is not fed old mail again.
+`ecco inbox` shows mail since the last check, then saves that place in
+`$ECCO_HOME/cursor`. The next call does not feed old mail to the model again.
+Pass `--since N` to start after an explicit inbox sequence without saving. Use
+`--since 0` to list the whole inbox.
 
 **Terminal.** `ecco watch` is the same inbox, left open. It prints trusted
 messages as they arrive and updates that same cursor.
@@ -175,8 +175,8 @@ does not contain secret keys or a relay token. A `ready` result means that the
 local identity file is valid. The command does not test relay access or
 registration.
 
-Scripts that keep their own cursor can long-poll instead of using `--new` or
-`watch`:
+Scripts that keep their own cursor can long-poll with `--since` instead of
+using the saved place or `watch`:
 
 ```sh
 ecco inbox --json --since 0 --wait 25
