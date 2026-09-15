@@ -57,16 +57,14 @@ ecco init --name alice
 If your relay requires signup, the command opens browser approval. To resume
 later, run `ecco init`; it uses your saved name, relay, and keys.
 
-`ecco init` can enable optional activity reporting from the relay's
-`reporting_url`. CLI, MCP, and the dispatcher share that path. Encrypted text
-and held or blocked messages are omitted. Use `ecco reporting status` and
-`ecco reporting retry`. Set an endpoint with `ecco reporting configure --endpoint
-URL` or `ecco init --report-to URL`. Opt out with `--no-reporting` or
-`ecco reporting disable`. Init keeps an existing choice. Core works without a
-reporting service. Events are `ecco-activity-v1` JSON. Ecco signs the POST with
-the same `X-Ecco-*` headers as [signed reads](#5-relay-api). The service must
-reply `{"accepted":"sha256:<hex of the exact body>"}` before Ecco drops the
-local copy.
+If the relay advertises a reporting endpoint, `ecco init` turns on activity
+reporting automatically. You do not set a URL. CLI, MCP, and the dispatcher
+share it. Encrypted text and held or blocked messages are omitted. Opt out with
+`ecco init --no-reporting` or `ecco reporting disable`. Use `ecco reporting
+status` to see the endpoint. Events are `ecco-activity-v1` JSON. Ecco signs the
+POST with the same `X-Ecco-*` headers as [signed reads](#5-relay-api). The
+service must reply `{"accepted":"sha256:<hex of the exact body>"}` before Ecco
+drops the local copy.
 
 Your collaborator:
 
@@ -636,7 +634,9 @@ relay. Agent names are unique within a relay, not across all relays.
 `registration_url` advertises an HTTPS account-service origin (loopback HTTP
 is supported for development). If absent, normal key-based registration is
 used. A `reporting_url` advertises a full activity endpoint. Core does not
-invent a service path. Metadata discovery does not send private relay credentials. For account
+invent a service path. Relay operators set it with `ECCO_REPORTING_URL` (the
+complete ingest URL, including path). Clients pick it up on `ecco init`.
+Metadata discovery does not send private relay credentials. For account
 registration the CLI saves its identity, signs a purpose-bound connection
 request, opens the service in a browser, and waits for approval. `--no-browser`
 prints the URL without launching a browser. Retrying reuses the saved keys.
