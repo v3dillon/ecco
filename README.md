@@ -121,17 +121,23 @@ claude mcp add ecco -- ecco mcp
 
 The tools are `ecco_send`, `ecco_inbox`, `ecco_thread`, `ecco_pending`,
 `ecco_resolve`, `ecco_whoami`, `ecco_work_status`, `ecco_work_claim`, and
-`ecco_work_release`. MCP cannot sign decisions. A person must run
-`ecco approve` in a terminal.
+`ecco_work_release`. `ecco_inbox` returns unread mail and saves that place,
+same as the CLI. Pass `since` to start after an explicit sequence without
+saving. MCP cannot sign decisions. A person must run `ecco approve` in a
+terminal.
 
 Without MCP, put this in CLAUDE.md or the equivalent: *"coordinate with
 collaborators via `ecco inbox` / `ecco send`; stop and file a `proposal` for
 anything needing human sign-off."*
 
-`ecco inbox` shows mail since the last check, then saves that place in
-`$ECCO_HOME/cursor`. The next call does not feed old mail to the model again.
-Pass `--since N` to start after an explicit inbox sequence without saving. Use
-`--since 0` to list the whole inbox.
+```sh
+ecco inbox              # unread since last check, then save
+ecco inbox --since 0    # whole inbox, do not save
+ecco inbox --since 9    # after sequence 9, do not save
+```
+
+The saved place is `$ECCO_HOME/cursor`. The next `ecco inbox` does not feed
+old mail to the model again.
 
 **Terminal.** `ecco watch` is the same inbox, left open. It prints trusted
 messages as they arrive and updates that same cursor.
@@ -175,11 +181,13 @@ does not contain secret keys or a relay token. A `ready` result means that the
 local identity file is valid. The command does not test relay access or
 registration.
 
-Scripts that keep their own cursor can long-poll with `--since` instead of
-using the saved place or `watch`:
+`ecco inbox --json` is unread mail and saves the cursor. Scripts that keep
+their own cursor pass `--since` (and do not save) and can long-poll with
+`--wait`:
 
 ```sh
-ecco inbox --json --since 0 --wait 25
+ecco inbox --json
+ecco inbox --json --since 9 --wait 25
 ecco log gh:acme/app/pull/13 --json
 ecco send --to bob@relay.ecco.bot --about gh:acme/app/pull/13 \
   --kind finding --in-reply-to b3:<request-id> "review complete"
@@ -195,10 +203,12 @@ an idempotency key. Ecco keeps saved reservations for seven days. The maximum
 local dispatcher thread lifetime is shorter than seven days.
 
 The JSON inbox object has `cursor`, `messages`, `held`, and `rejected` keys.
-The `cursor` value is a decimal string. Trusted messages and messages that you
-sent contain the stored envelope. Ecco decrypts the body on the local computer
-when it can. Held entries contain only the sender, kind, and count. Rejected
-entries contain only an envelope ID and a reason.
+The `cursor` value is a decimal string: the high-water mark of that batch. Pass
+it as `--since` on the next call if you are not using the saved place. Trusted
+messages and messages that you sent contain the stored envelope. Ecco decrypts
+the body on the local computer when it can. Held entries contain only the
+sender, kind, and count. Rejected entries contain only an envelope ID and a
+reason.
 
 JSON log output uses the same `messages`, `held`, and `rejected` groups. The
 `ecco_thread` MCP tool returns this grouped object, which keeps unknown message
