@@ -201,6 +201,17 @@ pub fn run(
 }
 
 impl Relay {
+    /// Deployment metadata: the registration service, if any, and the key
+    /// this relay signs receipts and reports with, so a service can check
+    /// that a report naming this authority came from it.
+    fn well_known(&self) -> String {
+        serde_json::json!({
+            "registration_url": self.registration_url,
+            "relay_key": encode_key(&self.key.verifying_key()),
+        })
+        .to_string()
+    }
+
     fn handle(&self, mut req: tiny_http::Request) {
         let url = req.url().to_string();
         let (path, query) = match url.split_once('?') {
@@ -267,9 +278,7 @@ impl Relay {
                     self.post_registration(&body, authorization.as_deref(), true)
                 }
                 ("POST", "/addr/transfer") => self.post_name_transfer(&body),
-                ("GET", "/.well-known/ecco") => {
-                    Ok(serde_json::json!({"registration_url": self.registration_url}).to_string())
-                }
+                ("GET", "/.well-known/ecco") => Ok(self.well_known()),
                 ("GET", p) if p.starts_with("/addr/") => self.get_addr(&p["/addr/".len()..]),
                 ("POST", "/msgs") => self.post_msgs(&body),
                 ("GET", "/threads") => self
@@ -1110,6 +1119,10 @@ mod tests {
         let mut r = relay();
         r.reporting_url = Some(reporting_url(&url).unwrap());
         let relay_key = r.key.verifying_key();
+        // The service verifies reports against the key the relay publishes.
+        let published: serde_json::Value = serde_json::from_str(&r.well_known()).unwrap();
+        assert_eq!(published["relay_key"], encode_key(&relay_key));
+        assert!(published["registration_url"].is_null());
         let alice = Identity::generate("alice", "http://localhost:4200", None);
         let bob = Identity::generate("bob", "http://localhost:4200", None);
         r.store.register(alice.profile()).unwrap();

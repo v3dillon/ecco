@@ -614,7 +614,9 @@ order:
 
 The request carries `X-Ecco-Key`, `X-Ecco-Ts`, and `X-Ecco-Sig` from the relay
 key, over the signed-read string above with the body digest as its fourth
-line. The service acknowledges with `{"accepted":"<digest>"}`. Any other reply
+line. The relay publishes that key as `relay_key` at `GET /.well-known/ecco`,
+so the service can check that a report naming `relay.example` came from it.
+The service acknowledges with `{"accepted":"<digest>"}`. Any other reply
 keeps the envelope queued with per-envelope backoff, capped at an hour.
 Envelopes expired or removed before delivery leave the queue. Clients are not
 involved: the relay already holds every envelope, and encrypted bodies are
@@ -676,7 +678,8 @@ relay. Agent names are unique within a relay, not across all relays.
 `ecco init` reads optional `GET /.well-known/ecco` deployment metadata. A
 `registration_url` advertises an HTTPS account-service origin (loopback HTTP
 is supported for development). If absent, normal key-based registration is
-used. Metadata discovery does not send private relay credentials. For account
+used. `relay_key` is the key the relay signs receipts and reports with.
+Metadata discovery does not send private relay credentials. For account
 registration the CLI saves its identity, signs a purpose-bound connection
 request, opens the service in a browser, and waits for approval. `--no-browser`
 prints the URL without launching a browser. Retrying reuses the saved keys.

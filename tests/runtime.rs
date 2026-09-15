@@ -53,21 +53,29 @@ fn thread(home: &Path, about: &str) -> Vec<Value> {
     log["messages"].as_array().unwrap().clone()
 }
 
-/// The operator's endpoint: records each event and acknowledges by digest.
-fn collector() -> (String, Arc<Mutex<Vec<Value>>>) {
+/// What the collector saw, shared with the test thread.
+type Seen<T> = Arc<Mutex<Vec<T>>>;
+
+/// The operator's endpoint: records each event and the key that signed it, and acknowledges by digest.
+fn collector() -> (String, Seen<Value>, Seen<String>) {
     let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
     let url = format!("http://{}/collector", server.server_addr());
     let events = Arc::new(Mutex::new(Vec::new()));
-    let seen = Arc::clone(&events);
+    let keys = Arc::new(Mutex::new(Vec::new()));
+    let (seen, signers) = (Arc::clone(&events), Arc::clone(&keys));
     std::thread::spawn(move || {
         while let Ok(mut request) = server.recv() {
             let mut body = String::new();
             request.as_reader().read_to_string(&mut body).unwrap();
-            assert!(request.headers().iter().any(|h| h
-                .field
-                .as_str()
-                .as_str()
-                .eq_ignore_ascii_case("x-ecco-sig")));
+            let header = |name: &str| {
+                request
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+                    .map(|h| h.value.as_str().to_string())
+            };
+            assert!(header("x-ecco-sig").is_some());
+            signers.lock().unwrap().push(header("x-ecco-key").unwrap());
             seen.lock()
                 .unwrap()
                 .push(serde_json::from_str(&body).unwrap());
@@ -77,7 +85,7 @@ fn collector() -> (String, Arc<Mutex<Vec<Value>>>) {
                 .unwrap();
         }
     });
-    (url, events)
+    (url, events, keys)
 }
 
 fn handler(dir: &Path, calls: &Path) -> PathBuf {
@@ -106,7 +114,7 @@ printf '%s' '{{"kind":"finding","text":"pong","follow_up":"one clarification"}}'
 fn relay_reports_stored_envelopes_and_the_dispatcher_answers_trusted_requests() {
     let root = std::env::temp_dir().join(format!("ecco-runtime-{}", rand::random::<u64>()));
     fs::create_dir_all(&root).unwrap();
-    let (url, events) = collector();
+    let (url, events, keys) = collector();
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -163,6 +171,19 @@ fn relay_reports_stored_envelopes_and_the_dispatcher_answers_trusted_requests() 
             .count()
     };
     wait_until("report", || reported(request["id"].as_str().unwrap()) == 1);
+    // The reporting key is the one the relay publishes, so a service can verify the signature.
+    let metadata: Value = serde_json::from_str(
+        &ureq::get(&format!("{relay}/.well-known/ecco"))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        keys.lock().unwrap()[0],
+        metadata["relay_key"].as_str().unwrap()
+    );
     for _ in 0..3 {
         ecco(&alice, &[], &["log", "smoke", "--json"]).unwrap();
     }
