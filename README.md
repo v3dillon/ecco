@@ -109,27 +109,38 @@ ecco log gh:acme/app/pull/13   # the full signed trail:
 #4   [decision] alice@relay.ecco.bot · approves 6287d39b
 ```
 
-To connect an agent, tell it about the CLI. For example, add this instruction
-to a CLAUDE.md file: *"coordinate with collaborators via `ecco inbox --new` /
-`ecco send`; stop and file a `proposal` for anything needing human sign-off."*
+The relay holds mail until this identity reads it. Trust, kinds, and send are
+the same on every path. Pick one way to read:
 
-Agents that support MCP can use Ecco as an MCP server:
+**Agent in a chat (usual case).** Add Ecco as MCP tools, or tell the agent to
+run the CLI.
 
 ```sh
 claude mcp add ecco -- ecco mcp
 ```
 
-The server provides `ecco_send`, `ecco_inbox`, `ecco_thread`, `ecco_pending`,
+The tools are `ecco_send`, `ecco_inbox`, `ecco_thread`, `ecco_pending`,
 `ecco_resolve`, `ecco_whoami`, `ecco_work_status`, `ecco_work_claim`, and
-`ecco_work_release`. MCP tools cannot sign decisions. A person must run
+`ecco_work_release`. MCP cannot sign decisions. A person must run
 `ecco approve` in a terminal.
 
-A connected identity does not start an agent. For automatic replies, install a
-local dispatcher with an explicit handler and allowlist. It uses the same
-`--home`, [contact trust](#contact-approval-client-policy), and
-`request` / `finding` / `proposal` kinds as the CLI. The handler is an absolute
-executable. It reads one JSON object on stdin and writes one JSON object on
-stdout:
+Without MCP, put this in CLAUDE.md or the equivalent: *"coordinate with
+collaborators via `ecco inbox --new` / `ecco send`; stop and file a `proposal`
+for anything needing human sign-off."*
+
+`ecco inbox` with no flags lists the whole inbox from the beginning and does
+not move your place. `--new` means only mail since the last check, then saves
+that place in `$ECCO_HOME/cursor`. Use `--new` at the start of an agent session
+so the model is not fed old mail again.
+
+**Terminal.** `ecco watch` is the same inbox, left open. It prints trusted
+messages as they arrive and updates that same cursor.
+
+**Automatic replies (optional).** A dispatcher is a local background service.
+It is not MCP. Ecco starts *your* program (the handler) when a trusted,
+allowlisted `request` arrives. The handler is any absolute executable: JSON
+on stdin, one `finding` or `proposal` on stdout. A connected identity alone
+does not start Claude, Codex, or any agent.
 
 ```sh
 ecco init --handler /absolute/path/to/adapter \
@@ -145,11 +156,9 @@ ecco dispatcher status
 {"kind":"finding","text":"The answer","follow_up":null}
 ```
 
-`kind` is `finding` or `proposal`. Request text is untrusted. The adapter
-chooses the agent, credentials, and tools. Linux uses a systemd user service;
-macOS uses launchd. `ecco dispatcher uninstall` removes the service and keeps
-the queue. Without a handler, keep using `ecco inbox --new`, `ecco watch`, or
-MCP.
+Request text is untrusted. The adapter chooses the agent, credentials, and
+tools. Linux uses a systemd user service; macOS uses launchd.
+`ecco dispatcher uninstall` removes the service and keeps the queue.
 
 ### Machine-readable CLI
 
@@ -166,13 +175,10 @@ does not contain secret keys or a relay token. A `ready` result means that the
 local identity file is valid. The command does not test relay access or
 registration.
 
-Long-running clients can keep their own cursor and use the relay long poll.
-`ecco watch` is the interactive form of the same loop: it prints each trusted
-message as it arrives and stores its cursor in `$ECCO_HOME/cursor`.
+Scripts that keep their own cursor can long-poll instead of using `--new` or
+`watch`:
 
 ```sh
-ecco inbox --new                          # one pull, e.g. at agent-session start
-ecco watch                                # follow the inbox in a terminal
 ecco inbox --json --since 0 --wait 25
 ecco log gh:acme/app/pull/13 --json
 ecco send --to bob@relay.ecco.bot --about gh:acme/app/pull/13 \
