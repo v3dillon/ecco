@@ -1,8 +1,10 @@
 mod agent_surface;
 mod client;
 mod coordination;
+mod dispatcher;
 mod envelope;
 mod identity;
+mod local;
 mod mcp;
 mod outbox;
 mod registration;
@@ -116,13 +118,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: WorkCmd,
     },
-    /// Show messages addressed to you
+    /// Show unread messages addressed to you, then save that place
     Inbox {
-        #[arg(long, default_value_t = 0, conflicts_with = "new")]
-        since: u64,
-        /// Only messages since the persisted cursor, then advance it (for agent session starts)
+        /// Start after this inbox sequence instead of the saved cursor (does not save)
         #[arg(long)]
-        new: bool,
+        since: Option<u64>,
         /// Return a stable machine-readable batch
         #[arg(long)]
         json: bool,
@@ -157,6 +157,11 @@ enum Cmd {
     Reject { id: String },
     /// Serve ecco as MCP tools over stdio (for agent harnesses)
     Mcp,
+    /// Answer trusted requests with a local handler (README, "Automatic replies")
+    Dispatcher {
+        #[command(subcommand)]
+        cmd: dispatcher::DispatcherCmd,
+    },
     /// Fetch and verify another address's profile
     Resolve { addr: String },
     /// Show your identity
@@ -289,6 +294,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             );
             Ok(())
         }
+        Cmd::Dispatcher { cmd } => dispatcher::command(home, cmd),
         Cmd::Transfer { to } => registration::transfer(&Identity::load(home)?, &to),
         Cmd::Relay {
             port,
@@ -398,14 +404,13 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
         }
         Cmd::Inbox {
             since,
-            new,
             json: as_json,
             wait,
         } => {
             let id = Identity::load(home)?;
-            let start = if new { load_cursor(home) } else { since };
-            let msgs = client::inbox(&id, start, wait)?;
-            let max_gseq = agent_surface::next_cursor(start, &msgs);
+            let persist = since.is_none();
+            let start = since.unwrap_or_else(|| load_cursor(home));
+            let (msgs, max_gseq) = client::inbox(&id, start, wait)?;
             if as_json {
                 println!(
                     "{}",
@@ -424,7 +429,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                     );
                 }
             }
-            if new {
+            if persist {
                 save_cursor(home, max_gseq)?;
             }
             Ok(())
@@ -437,8 +442,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                 id.addr()
             );
             loop {
-                let batch = client::inbox(&id, cursor, 25)?;
-                let max_gseq = batch.iter().map(|s| s.gseq).max();
+                let (batch, until) = client::inbox(&id, cursor, 25)?;
                 let (visible, held, _) = agent_surface::partition(home, &id, batch);
                 for s in &visible {
                     println!("{}", fmt(&id, s, false));
@@ -449,8 +453,8 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                         s.env.kind, s.env.from
                     );
                 }
-                if let Some(m) = max_gseq {
-                    cursor = cursor.max(m);
+                if until > cursor {
+                    cursor = until;
                     save_cursor(home, cursor)?;
                 }
             }
@@ -481,7 +485,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
         }
         Cmd::Requests => {
             let id = Identity::load(home)?;
-            let msgs = client::inbox(&id, 0, 0)?;
+            let (msgs, _) = client::inbox(&id, 0, 0)?;
             let (_, held, _) = agent_surface::partition(home, &id, msgs);
             if held.is_empty() {
                 println!("no pending contact requests");
@@ -497,7 +501,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             let id = Identity::load(home)?;
             identity::contacts_set(home, &addr, "approved")?;
             println!("trusted {addr}");
-            let msgs = client::inbox(&id, 0, 0)?;
+            let (msgs, _) = client::inbox(&id, 0, 0)?;
             for s in msgs.iter().filter(|s| s.env.from == addr) {
                 println!("{}", fmt(&id, s, false));
             }
@@ -802,7 +806,7 @@ fn decide(home: &Path, target: &str, verb: &str) -> Result<(), String> {
 
 /// Proposals from trusted senders whose thread does not yet contain a decision.
 fn pending_proposals(home: &Path, id: &Identity) -> Result<Vec<Stored>, String> {
-    let msgs = client::inbox(id, 0, 0)?;
+    let (msgs, _) = client::inbox(id, 0, 0)?;
     let (visible, _, _) = agent_surface::partition(home, id, msgs);
     let mut pending = Vec::new();
     for s in visible.into_iter().filter(|s| s.env.kind == "proposal") {
@@ -832,7 +836,7 @@ fn load_cursor(home: &Path) -> u64 {
 }
 
 fn save_cursor(home: &Path, cursor: u64) -> Result<(), String> {
-    std::fs::write(home.join("cursor"), cursor.to_string()).map_err(|e| e.to_string())
+    local::write(&home.join("cursor"), cursor.to_string().as_bytes())
 }
 
 fn dm_thread(own: &str, to: &[String]) -> String {
@@ -971,8 +975,7 @@ mod tests {
         assert!(matches!(
             cli.cmd,
             Cmd::Inbox {
-                since: 9,
-                new: false,
+                since: Some(9),
                 json: true,
                 wait: 25
             }

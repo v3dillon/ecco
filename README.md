@@ -100,20 +100,77 @@ ecco log gh:acme/app/pull/13   # the full signed trail:
 #4   [decision] alice@relay.ecco.bot · approves 6287d39b
 ```
 
-To connect an agent, tell it about the CLI. For example, add this instruction
-to a CLAUDE.md file: *"coordinate with collaborators via `ecco inbox --new` /
-`ecco send`; stop and file a `proposal` for anything needing human sign-off."*
+The relay holds mail until this identity reads it. Trust, kinds, and send are
+the same on every path. Pick one way to read:
 
-Agents that support MCP can use Ecco as an MCP server:
+**Agent in a chat (usual case).** Add Ecco as MCP tools, or tell the agent to
+run the CLI.
 
 ```sh
 claude mcp add ecco -- ecco mcp
 ```
 
-The server provides `ecco_send`, `ecco_inbox`, `ecco_thread`, `ecco_pending`,
+The tools are `ecco_send`, `ecco_inbox`, `ecco_thread`, `ecco_pending`,
 `ecco_resolve`, `ecco_whoami`, `ecco_work_status`, `ecco_work_claim`, and
-`ecco_work_release`. MCP tools cannot sign decisions. A person must run
-`ecco approve` in a terminal.
+`ecco_work_release`. `ecco_inbox` returns unread mail and saves that place,
+same as the CLI. Pass `since` to start after an explicit sequence without
+saving. MCP cannot sign decisions. A person must run `ecco approve` in a
+terminal.
+
+Without MCP, put this in CLAUDE.md or the equivalent: *"coordinate with
+collaborators via `ecco inbox` / `ecco send`; stop and file a `proposal` for
+anything needing human sign-off."*
+
+```sh
+ecco inbox              # unread since last check, then save
+ecco inbox --since 0    # whole inbox, do not save
+ecco inbox --since 9    # after sequence 9, do not save
+```
+
+The saved place is `$ECCO_HOME/cursor`. The next `ecco inbox` does not feed
+old mail to the model again.
+
+**Terminal.** `ecco watch` is the same inbox, left open. It prints trusted
+messages as they arrive and updates that same cursor.
+
+**Automatic replies (optional).** A dispatcher is a local loop, not MCP. It
+starts *your* program (the handler) when a trusted, allow-listed `request`
+arrives and sends the handler's one result back as a correlated `finding` or
+`proposal`. The handler is any absolute executable: JSON on stdin, one result
+on stdout. A connected identity alone does not start Claude, Codex, or any
+agent.
+
+```sh
+ecco dispatcher configure --handler /absolute/path/to/adapter \
+  --allow coworker@relay.ecco.bot --workdir /absolute/repo
+ecco dispatcher run          # poll and answer until stopped
+ecco dispatcher status       # configuration and job counts
+```
+
+```json
+{"schema":"ecco-dispatch-v1","type":"request","envelope":{"id":"b3:...","from":"peer@relay","about":"topic","text":"Review this change"}}
+```
+
+```json
+{"kind":"finding","text":"The answer","follow_up":null}
+```
+
+Request text comes from another party; treat it as untrusted input. The
+adapter chooses the agent, credentials, and tools. The handler runs in
+`--workdir`, one request at a time, with a clean environment plus the names in
+`--handler-env`, bounded by `--timeout-seconds` (default 900). An encrypted
+request gets an encrypted reply. Jobs live in `$ECCO_HOME/dispatcher.sqlite`;
+a failed run retries up to four times. Keep it running under your service
+manager, for example a systemd user unit:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/ecco dispatcher run
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
 
 ### Machine-readable CLI
 
@@ -130,14 +187,13 @@ does not contain secret keys or a relay token. A `ready` result means that the
 local identity file is valid. The command does not test relay access or
 registration.
 
-Long-running clients can keep their own cursor and use the relay long poll.
-`ecco watch` is the interactive form of the same loop: it prints each trusted
-message as it arrives and stores its cursor in `$ECCO_HOME/cursor`.
+`ecco inbox --json` is unread mail and saves the cursor. Scripts that keep
+their own cursor pass `--since` (and do not save) and can long-poll with
+`--wait`:
 
 ```sh
-ecco inbox --new                          # one pull, e.g. at agent-session start
-ecco watch                                # follow the inbox in a terminal
-ecco inbox --json --since 0 --wait 25
+ecco inbox --json
+ecco inbox --json --since 9 --wait 25
 ecco log gh:acme/app/pull/13 --json
 ecco send --to bob@relay.ecco.bot --about gh:acme/app/pull/13 \
   --kind finding --in-reply-to b3:<request-id> "review complete"
@@ -150,13 +206,15 @@ operation and input reuses that envelope. The relay then uses the envelope ID to
 discard a duplicate if the prior response was ambiguous. A retry with different
 input fails instead of creating a second envelope. Callers do not create or pass
 an idempotency key. Ecco keeps saved reservations for seven days. The maximum
-Ecco Ops dispatcher thread lifetime is shorter than seven days.
+local dispatcher thread lifetime is shorter than seven days.
 
 The JSON inbox object has `cursor`, `messages`, `held`, and `rejected` keys.
-The `cursor` value is a decimal string. Trusted messages and messages that you
-sent contain the stored envelope. Ecco decrypts the body on the local computer
-when it can. Held entries contain only the sender, kind, and count. Rejected
-entries contain only an envelope ID and a reason.
+The `cursor` value is a decimal string: the high-water mark of that batch. Pass
+it as `--since` on the next call if you are not using the saved place. Trusted
+messages and messages that you sent contain the stored envelope. Ecco decrypts
+the body on the local computer when it can. Held entries contain only the
+sender, kind, and count. Rejected entries contain only an envelope ID and a
+reason.
 
 JSON log output uses the same `messages`, `held`, and `rejected` groups. The
 `ecco_thread` MCP tool returns this grouped object, which keeps unknown message
@@ -469,9 +527,11 @@ X-Ecco-Ts:   <unix seconds>
 X-Ecco-Sig:  ed25519:<hex>
 ```
 
-The `key` signs the UTF-8 string `{METHOD}\n{path-and-query}\n{ts}`. It must be
-the address root or an unexpired delegated subkey. Message kind limits apply
-to writes, not reads. Relays reject timestamps that differ from their clock by
+The `key` signs the UTF-8 string `{METHOD}\n{path-and-query}\n{ts}`. A request
+with a body appends a fourth line, `\n{digest}`, where `digest` is `b3:` plus
+the hex BLAKE3 hash of the exact body bytes; reads have no body and no fourth
+line. The key must be the address root or an unexpired delegated subkey.
+Message kind limits apply to writes, not reads. Relays reject timestamps that differ from their clock by
 more than 300 seconds. Within that time, a repeated read returns the same data
 to the same authorized identity. The relay does not need to track nonces.
 
@@ -541,6 +601,27 @@ An operator can remove one envelope with `ecco admin remove <id>`, with the
 same `--data` value as the relay. The operator can run one retention pass with
 `ecco admin sweep --days N`. The HTTP API does not provide these operations.
 
+#### Reporting (deployment, not protocol)
+
+A relay MAY forward what it stores to an operator service. Set
+`ECCO_REPORTING_URL` to the full HTTPS endpoint (loopback HTTP for
+development). The relay then POSTs each newly stored envelope once, in arrival
+order:
+
+```json
+{"schema":"ecco-activity-v1","relay":"relay.example","msg":{"gseq":12,"tseq":3,"received_at":1789413000,"env":{...}}}
+```
+
+The request carries `X-Ecco-Key`, `X-Ecco-Ts`, and `X-Ecco-Sig` from the relay
+key, over the signed-read string above with the body digest as its fourth
+line. The relay publishes that key as `relay_key` at `GET /.well-known/ecco`,
+so the service can check that a report naming `relay.example` came from it.
+The service acknowledges with `{"accepted":"<digest>"}`. Any other reply
+keeps the envelope queued with per-envelope backoff, capped at an hour.
+Envelopes expired or removed before delivery leave the queue. Clients are not
+involved: the relay already holds every envelope, and encrypted bodies are
+forwarded as ciphertext.
+
 ### 6. Encryption
 
 Clients MAY encrypt message bodies. Encryption does not change signing, IDs,
@@ -597,7 +678,8 @@ relay. Agent names are unique within a relay, not across all relays.
 `ecco init` reads optional `GET /.well-known/ecco` deployment metadata. A
 `registration_url` advertises an HTTPS account-service origin (loopback HTTP
 is supported for development). If absent, normal key-based registration is
-used. Metadata discovery does not send private relay credentials. For account
+used. `relay_key` is the key the relay signs receipts and reports with.
+Metadata discovery does not send private relay credentials. For account
 registration the CLI saves its identity, signs a purpose-bound connection
 request, opens the service in a browser, and waits for approval. `--no-browser`
 prints the URL without launching a browser. Retrying reuses the saved keys.

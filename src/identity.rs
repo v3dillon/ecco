@@ -129,9 +129,25 @@ impl Profile {
     }
 }
 
-/// auth-v0 canonical request string: `{METHOD}\n{path-and-query}\n{ts}`.
-pub fn request_signing_bytes(method: &str, path_query: &str, ts: u64) -> Vec<u8> {
-    format!("{method}\n{path_query}\n{ts}").into_bytes()
+/// auth-v0 canonical request string: `{METHOD}\n{path-and-query}\n{ts}`, with
+/// a fourth line `\n{body digest}` when the request carries a body (README §5).
+pub fn request_signing_bytes(
+    method: &str,
+    path_query: &str,
+    ts: u64,
+    body: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut canonical = format!("{method}\n{path_query}\n{ts}");
+    if let Some(body) = body {
+        canonical.push('\n');
+        canonical.push_str(&body_digest(body));
+    }
+    canonical.into_bytes()
+}
+
+/// Content digest in the envelope id format: `b3:<hex>`.
+pub fn body_digest(body: &[u8]) -> String {
+    format!("b3:{}", blake3::hash(body).to_hex())
 }
 
 /// Local identity file: both secrets in v0. The root secret should eventually
@@ -251,7 +267,7 @@ impl Identity {
             exp,
             key: agent_pub,
             kinds,
-            sig: format!("ed25519:{}", hex::encode(dsig.to_bytes())),
+            sig: envelope::encode_sig(&dsig),
         }
     }
 
@@ -266,20 +282,15 @@ impl Identity {
             v: 0,
         };
         let sig = root.sign(&profile.signing_bytes());
-        profile.sig = format!("ed25519:{}", hex::encode(sig.to_bytes()));
+        profile.sig = envelope::encode_sig(&sig);
         profile
     }
 
     pub fn save(&self, home: &Path) -> Result<(), String> {
-        fs::create_dir_all(home).map_err(|e| e.to_string())?;
-        let path = home.join("identity.json");
-        fs::write(&path, serde_json::to_string_pretty(self).unwrap()).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
-        }
-        Ok(())
+        crate::local::write(
+            &home.join("identity.json"),
+            serde_json::to_string_pretty(self).unwrap().as_bytes(),
+        )
     }
 
     pub fn load(home: &Path) -> Result<Identity, String> {
@@ -351,12 +362,10 @@ pub fn contacts_load(home: &Path) -> Contacts {
 pub fn contacts_set(home: &Path, addr: &str, status: &str) -> Result<(), String> {
     let mut contacts = contacts_load(home);
     contacts.insert(addr.to_string(), status.to_string());
-    fs::create_dir_all(home).map_err(|e| e.to_string())?;
-    fs::write(
-        home.join("contacts.json"),
-        serde_json::to_string_pretty(&contacts).unwrap(),
+    crate::local::write(
+        &home.join("contacts.json"),
+        serde_json::to_string_pretty(&contacts).unwrap().as_bytes(),
     )
-    .map_err(|e| e.to_string())
 }
 
 pub fn standing(contacts: &Contacts, self_addr: &str, from: &str) -> Standing {
@@ -493,16 +502,16 @@ mod tests {
         let path = "/inbox?addr=alice%40localhost%3A4200&since=0&wait=0";
         let sig = id
             .agent_key()
-            .sign(&request_signing_bytes("GET", path, now));
+            .sign(&request_signing_bytes("GET", path, now, None));
         let vk = id.agent_key().verifying_key();
-        vk.verify(&request_signing_bytes("GET", path, now), &sig)
+        vk.verify(&request_signing_bytes("GET", path, now, None), &sig)
             .unwrap();
         assert!(vk
-            .verify(&request_signing_bytes("GET", path, now + 1), &sig)
+            .verify(&request_signing_bytes("GET", path, now + 1, None), &sig)
             .is_err());
         assert!(vk
             .verify(
-                &request_signing_bytes("GET", "/inbox?addr=other", now),
+                &request_signing_bytes("GET", "/inbox?addr=other", now, None),
                 &sig
             )
             .is_err());

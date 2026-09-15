@@ -368,6 +368,7 @@ dependencies = [
  "crypto_box",
  "ed25519-dalek",
  "hex",
+ "libc",
  "rand",
  "rusqlite",
  "serde",
