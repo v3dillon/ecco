@@ -2,7 +2,7 @@
 
 use ed25519_dalek::{Signature, Signer, Verifier};
 use serde::{Deserialize, Serialize};
-use std::{path::Path, time::Duration};
+use std::time::Duration;
 
 use crate::envelope::{self, encode_key, Envelope};
 use crate::identity::{addr_relay_url, request_signing_bytes, Identity, Profile};
@@ -95,7 +95,7 @@ pub fn resolve(addr: &str, token: Option<&str>) -> Result<Profile, String> {
 
 /// Submit to own relay; best-effort dual-post to recipients on other relays
 /// (without a token — their relay is either open or unreachable to us).
-pub fn send(home: &Path, id: &Identity, env: &Envelope) -> Result<Receipt, String> {
+pub fn send(id: &Identity, env: &Envelope) -> Result<Receipt, String> {
     let body = serde_json::to_string(env).unwrap();
     let raw = post(&format!("{}/msgs", id.relay), id.token.as_deref(), &body)?;
     let receipt: Receipt =
@@ -108,60 +108,37 @@ pub fn send(home: &Path, id: &Identity, env: &Envelope) -> Result<Receipt, Strin
             }
         }
     }
-    crate::reporting::observe(
-        home,
-        id,
-        &[Stored {
-            env: env.clone(),
-            gseq: receipt.gseq,
-            tseq: receipt.tseq,
-            received_at: receipt.received_at,
-        }],
-    );
     Ok(receipt)
 }
 
-pub fn thread(
-    home: &Path,
-    id: &Identity,
-    about: &str,
-    since: u64,
-    wait: u64,
-) -> Result<Vec<Stored>, String> {
+pub fn thread(id: &Identity, about: &str, since: u64, wait: u64) -> Result<Vec<Stored>, String> {
     let path = format!(
         "/threads?about={}&since={since}&wait={wait}",
         urlencode(about)
     );
-    Ok(observed(home, id, read_msgs(id, &path, wait)?))
+    Ok(take_verified(fetch(id, &path, wait)?))
 }
 
-pub fn inbox(
-    home: &Path,
-    id: &Identity,
-    since: u64,
-    wait: u64,
-) -> Result<(Vec<Stored>, u64), String> {
+/// Messages plus the batch high-water mark. The mark is taken before dropping
+/// unverified envelopes so a forged message cannot stall the cursor.
+pub fn inbox(id: &Identity, since: u64, wait: u64) -> Result<(Vec<Stored>, u64), String> {
     let path = format!(
         "/inbox?addr={}&since={since}&wait={wait}",
         urlencode(&id.addr())
     );
-    let raw = read_msgs(id, &path, wait)?;
+    let raw = fetch(id, &path, wait)?;
     let until = crate::agent_surface::next_cursor(since, &raw);
-    Ok((observed(home, id, raw), until))
+    Ok((take_verified(raw), until))
 }
 
-fn read_msgs(id: &Identity, path: &str, wait: u64) -> Result<Vec<Stored>, String> {
+fn fetch(id: &Identity, path: &str, wait: u64) -> Result<Vec<Stored>, String> {
     let raw = get_signed(id, path, wait.saturating_add(10))?;
     let resp: MsgsResponse = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     Ok(resp.msgs)
 }
 
-fn observed(home: &Path, id: &Identity, msgs: Vec<Stored>) -> Vec<Stored> {
-    let msgs = take_verified(msgs);
-    crate::reporting::observe(home, id, &msgs);
-    msgs
-}
-
+/// The one place relay output is verified (README §2 steps 1–2). Everything
+/// downstream sees verified envelopes only.
 fn take_verified(msgs: Vec<Stored>) -> Vec<Stored> {
     msgs.into_iter()
         .filter(|stored| stored.env.verify().is_ok())
@@ -190,15 +167,14 @@ fn get_signed(id: &Identity, path: &str, timeout_secs: u64) -> Result<String, St
         req = req.set("authorization", &format!("Bearer {t}"));
     }
     let ts = envelope::now();
-    let sig = id.agent_key().sign(&request_signing_bytes("GET", path, ts));
+    let sig = id
+        .agent_key()
+        .sign(&request_signing_bytes("GET", path, ts, None));
     req = req
         .set("x-ecco-addr", &id.addr())
         .set("x-ecco-key", &encode_key(&id.agent_key().verifying_key()))
         .set("x-ecco-ts", &ts.to_string())
-        .set(
-            "x-ecco-sig",
-            &format!("ed25519:{}", hex::encode(sig.to_bytes())),
-        );
+        .set("x-ecco-sig", &envelope::encode_sig(&sig));
     req.call()
         .map_err(describe)?
         .into_string()

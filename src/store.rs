@@ -72,7 +72,16 @@ CREATE INDEX IF NOT EXISTS msgs_received ON msgs(received_at);
 CREATE TABLE IF NOT EXISTS msg_to (gseq INTEGER NOT NULL, addr TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS msg_to_addr ON msg_to(addr, gseq);
 CREATE TABLE IF NOT EXISTS retention (sender TEXT PRIMARY KEY, days INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS reports (gseq INTEGER PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0);
 ";
+
+/// Envelopes queued for the operator's reporting endpoint (README, "Run your
+/// own relay"). Rows whose envelope was swept or removed are dropped.
+const SQLITE_REPORTS_DUE: &str = "
+DELETE FROM reports WHERE gseq NOT IN (SELECT gseq FROM msgs);
+";
+const SQLITE_REPORTS_SELECT: &str = "SELECT m.gseq,m.tseq,m.received_at,m.env,r.attempts
+     FROM reports r JOIN msgs m ON m.gseq=r.gseq WHERE r.next_at<=?1 ORDER BY r.gseq LIMIT ?2";
 
 /// First-time `participants` table: CREATE plus backfill in one
 /// transaction so a crash leaves no committed table. Threads whose
@@ -381,8 +390,10 @@ impl Store {
         }
     }
 
-    /// Idempotent by envelope id: resubmission returns the stored copy.
-    pub fn append(&self, env: Envelope, received_at: u64) -> Res<Stored> {
+    /// Idempotent by envelope id: resubmission returns the stored copy. With
+    /// `report`, a newly stored envelope is also queued for the reporting
+    /// endpoint in the same transaction, so it is reported exactly once.
+    pub fn append(&self, env: Envelope, received_at: u64, report: bool) -> Res<Stored> {
         let mut conn = self.conn.lock().unwrap();
         let tx = sq(conn.transaction())?;
         if let Some(row) = sq(tx
@@ -415,6 +426,9 @@ impl Store {
             ],
         ))?;
         let gseq = tx.last_insert_rowid();
+        if report {
+            sq(tx.execute("INSERT INTO reports(gseq) VALUES(?1)", [gseq]))?;
+        }
         for addr in &env.to {
             sq(tx.execute(
                 "INSERT INTO msg_to(gseq,addr) VALUES(?1,?2)",
@@ -477,6 +491,38 @@ impl Store {
             (true, true) => ThreadAccess::Participant,
             (true, false) => ThreadAccess::NotParticipant,
         })
+    }
+
+    /// Queued envelopes due for reporting, oldest first, with their attempt count.
+    pub fn reports_due(&self, now: u64, limit: usize) -> Res<Vec<(Stored, u32)>> {
+        let conn = self.conn.lock().unwrap();
+        sq(conn.execute_batch(SQLITE_REPORTS_DUE))?;
+        let mut stmt = sq(conn.prepare(SQLITE_REPORTS_SELECT))?;
+        let rows = sq(stmt
+            .query_map(rusqlite::params![now as i64, limit as i64], |row| {
+                Ok((sqlite_row_to_stored(row)?, row.get::<_, u32>(4)?))
+            })
+            .and_then(|r| r.collect::<Result<Vec<_>, _>>()))?;
+        rows.into_iter()
+            .map(|(row, attempts)| Ok((build_stored(row)?, attempts)))
+            .collect()
+    }
+
+    /// Acknowledged: the endpoint has this envelope.
+    pub fn report_done(&self, gseq: u64) -> Res<()> {
+        let conn = self.conn.lock().unwrap();
+        sq(conn.execute("DELETE FROM reports WHERE gseq=?1", [gseq as i64]))?;
+        Ok(())
+    }
+
+    /// Delivery failed: try again at `next_at`.
+    pub fn report_retry(&self, gseq: u64, attempts: u32, next_at: u64) -> Res<()> {
+        let conn = self.conn.lock().unwrap();
+        sq(conn.execute(
+            "UPDATE reports SET attempts=?2,next_at=?3 WHERE gseq=?1",
+            rusqlite::params![gseq as i64, attempts, next_at as i64],
+        ))?;
+        Ok(())
     }
 
     /// Replaces the per-sender retention table. Days; 0 keeps forever.
@@ -594,13 +640,13 @@ mod tests {
         store.register(bob.profile()).unwrap();
         let now = 100 * DAY;
         store
-            .append(note(&alice, &bob, "a-old", 1), now - 20 * DAY)
+            .append(note(&alice, &bob, "a-old", 1), now - 20 * DAY, false)
             .unwrap();
         store
-            .append(note(&alice, &bob, "a-new", 2), now - DAY)
+            .append(note(&alice, &bob, "a-new", 2), now - DAY, false)
             .unwrap();
         store
-            .append(note(&bob, &alice, "b-old", 3), now - 20 * DAY)
+            .append(note(&bob, &alice, "b-old", 3), now - 20 * DAY, false)
             .unwrap();
 
         // Nothing configured for alice; default 0 keeps everything.
@@ -621,7 +667,9 @@ mod tests {
         assert_eq!(store.inbox(&bob.addr(), 0).unwrap().len(), 1);
 
         // Thread seq keeps counting; nothing is reused after a sweep.
-        let s = store.append(note(&alice, &bob, "a-next", 4), now).unwrap();
+        let s = store
+            .append(note(&alice, &bob, "a-next", 4), now, false)
+            .unwrap();
         assert_eq!(s.tseq, 4);
     }
 
@@ -647,11 +695,12 @@ mod tests {
                 .append(
                     note(&alice, &bob, &format!("old-{i}"), i as u64),
                     now - 10 * DAY,
+                    false,
                 )
                 .unwrap();
         }
         store
-            .append(note(&alice, &bob, "fresh", 9_999), now - DAY)
+            .append(note(&alice, &bob, "fresh", 9_999), now - DAY, false)
             .unwrap();
         assert_eq!(store.sweep(now, 7).unwrap(), old as u64);
         assert_eq!(store.sweep(now, 7).unwrap(), 0);
@@ -669,7 +718,7 @@ mod tests {
         let now = 100 * DAY;
         let about = "gh:acme/app/pull/1";
         store
-            .append(note(&alice, &bob, "old", 1), now - 20 * DAY)
+            .append(note(&alice, &bob, "old", 1), now - 20 * DAY, false)
             .unwrap();
         assert!(matches!(
             store.access(about, &alice.addr()).unwrap(),
@@ -703,7 +752,9 @@ mod tests {
             ThreadAccess::NotParticipant
         ));
 
-        let again = store.append(note(&alice, &bob, "again", 2), now).unwrap();
+        let again = store
+            .append(note(&alice, &bob, "again", 2), now, false)
+            .unwrap();
         assert_eq!(again.tseq, 2);
         assert!(store.remove(&again.env.id).unwrap());
         assert!(matches!(
@@ -722,7 +773,9 @@ mod tests {
         let store = Store::open(&dir).unwrap();
         let alice = Identity::generate("alice", "http://localhost:4200", None);
         let bob = Identity::generate("bob", "http://localhost:4200", None);
-        store.append(note(&alice, &bob, "hello", 1), 10).unwrap();
+        store
+            .append(note(&alice, &bob, "hello", 1), 10, false)
+            .unwrap();
         {
             let conn = store.conn.lock().unwrap();
             conn.execute("DELETE FROM participants", []).unwrap();
@@ -758,7 +811,7 @@ mod tests {
         let now = 100 * DAY;
         let about = "gh:acme/app/pull/1";
         store
-            .append(note(&alice, &bob, "old", 1), now - 20 * DAY)
+            .append(note(&alice, &bob, "old", 1), now - 20 * DAY, false)
             .unwrap();
         assert_eq!(store.sweep(now, 7).unwrap(), 1);
         assert!(store.thread(about, 0).unwrap().is_empty());
@@ -787,8 +840,12 @@ mod tests {
         let store = fresh();
         let alice = Identity::generate("alice", "http://localhost:4200", None);
         let bob = Identity::generate("bob", "http://localhost:4200", None);
-        let keep = store.append(note(&alice, &bob, "keep", 1), 10).unwrap();
-        let gone = store.append(note(&alice, &bob, "gone", 2), 11).unwrap();
+        let keep = store
+            .append(note(&alice, &bob, "keep", 1), 10, false)
+            .unwrap();
+        let gone = store
+            .append(note(&alice, &bob, "gone", 2), 11, false)
+            .unwrap();
         assert!(store.remove(&gone.env.id).unwrap());
         assert!(!store.remove(&gone.env.id).unwrap());
         let inbox = store.inbox(&bob.addr(), 0).unwrap();

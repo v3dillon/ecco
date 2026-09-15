@@ -150,7 +150,7 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
             let since = args.get("since").and_then(Value::as_u64);
             let persist = since.is_none();
             let start = since.unwrap_or_else(|| crate::load_cursor(home));
-            let (msgs, until) = client::inbox(home, &id, start, 0)?;
+            let (msgs, until) = client::inbox(&id, start, 0)?;
             if persist {
                 crate::save_cursor(home, until)?;
             }
@@ -177,7 +177,7 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
         }
         "ecco_thread" => {
             let about = str_arg("about").ok_or("'about' is required")?;
-            let mut msgs = client::thread(home, &id, &about, 0, 0)?;
+            let mut msgs = client::thread(&id, &about, 0, 0)?;
             msgs.sort_by_key(|s| s.tseq);
             Ok(pretty(&crate::agent_surface::log_json(home, &id, msgs)))
         }
@@ -192,7 +192,7 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
         "ecco_work_status" => {
             let about = str_arg("about").ok_or("'about' is required")?;
             Ok(pretty(
-                &serde_json::to_value(crate::coordination::status(home, &id, &about)?).unwrap(),
+                &serde_json::to_value(crate::coordination::status(&id, &about)?).unwrap(),
             ))
         }
         "ecco_work_claim" => {

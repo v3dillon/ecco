@@ -1,7 +1,7 @@
-//! Small shared local-runtime primitives. No shell interpretation of agent input.
-use sha2::{Digest, Sha256};
+//! Small local-runtime primitives: private atomic files, bounded reads, and a
+//! bounded child process. No shell interpretation of agent input.
 use std::os::unix::{
-    fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    fs::{MetadataExt, OpenOptionsExt},
     process::CommandExt,
 };
 use std::{
@@ -16,6 +16,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
 static CANCELLED: AtomicBool = AtomicBool::new(false);
 pub fn cancelled() -> bool {
     CANCELLED.load(Ordering::Relaxed)
@@ -30,13 +31,7 @@ pub fn install_signals() {
     }
 }
 
-pub fn sha256(bytes: impl AsRef<[u8]>) -> String {
-    hex::encode(Sha256::digest(bytes.as_ref()))
-}
-pub fn mkdir(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|e| e.to_string())?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())
-}
+/// Atomic private write: temp file with mode 0600, fsync, rename.
 pub fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("file needs a parent directory")?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -63,6 +58,8 @@ pub fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let _ = fs::remove_file(&temporary);
     result
 }
+
+/// Bounded read of a regular file; symlinks and special files are refused.
 pub fn read(path: &Path, maximum: usize) -> Result<String, String> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -82,21 +79,13 @@ pub fn read(path: &Path, maximum: usize) -> Result<String, String> {
     }
     String::from_utf8(bytes).map_err(|_| "file is not UTF-8".into())
 }
-pub fn home() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or("HOME is not set".into())
-}
+
+/// An executable this user may safely run: a regular file, executable, not
+/// writable by group or others, owned by root or the current user.
 pub fn executable(value: &str) -> Result<PathBuf, String> {
-    let path = if value.contains('/') {
-        PathBuf::from(value)
-    } else {
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .map(|dir| dir.join(value))
-            .find(|p| p.is_file())
-            .ok_or_else(|| format!("executable not found: {value}"))?
-    };
-    let path = path.canonicalize().map_err(|e| e.to_string())?;
+    let path = PathBuf::from(value)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
     let info = fs::metadata(&path).map_err(|e| e.to_string())?;
     let uid = unsafe { libc::geteuid() };
     if !info.is_file()
@@ -108,32 +97,15 @@ pub fn executable(value: &str) -> Result<PathBuf, String> {
     }
     Ok(path)
 }
-pub fn timestamp() -> String {
-    timestamp_at(crate::envelope::now())
-}
-pub fn timestamp_at(seconds: u64) -> String {
-    let seconds = seconds as libc::time_t;
-    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
-    unsafe {
-        libc::gmtime_r(&seconds, tm.as_mut_ptr());
-        let tm = tm.assume_init();
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
-        )
-    }
-}
+
 pub fn environment(keys: &[String]) -> BTreeMap<String, String> {
     keys.iter()
         .filter_map(|key| std::env::var(key).ok().map(|v| (key.clone(), v)))
         .collect()
 }
 
+/// Run a child with a clean environment, bounded output, and a deadline. The
+/// child gets its own session so its whole process group can be killed.
 pub fn process(
     argv: &[String],
     input: Option<&str>,
@@ -259,7 +231,6 @@ mod tests {
     #[test]
     fn files_are_private_bounded_and_reject_symlinks() {
         let root = std::env::temp_dir().join(format!("ecco-local-{}", rand::random::<u64>()));
-        mkdir(&root).unwrap();
         let path = root.join("data");
         write(&path, b"test").unwrap();
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);

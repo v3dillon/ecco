@@ -57,15 +57,6 @@ ecco init --name alice
 If your relay requires signup, the command opens browser approval. To resume
 later, run `ecco init`; it uses your saved name, relay, and keys.
 
-If the relay advertises a reporting endpoint, `ecco init` turns on activity
-reporting automatically. You do not set a URL. CLI, MCP, and the dispatcher
-share it. Encrypted text and held or blocked messages are omitted. Opt out with
-`ecco init --no-reporting` or `ecco reporting disable`. Use `ecco reporting
-status` to see the endpoint. Events are `ecco-activity-v1` JSON. Ecco signs the
-POST with the same `X-Ecco-*` headers as [signed reads](#5-relay-api). The
-service must reply `{"accepted":"sha256:<hex of the exact body>"}` before Ecco
-drops the local copy.
-
 Your collaborator:
 
 ```sh
@@ -142,29 +133,44 @@ old mail to the model again.
 **Terminal.** `ecco watch` is the same inbox, left open. It prints trusted
 messages as they arrive and updates that same cursor.
 
-**Automatic replies (optional).** A dispatcher is a local background service.
-It is not MCP. Ecco starts *your* program (the handler) when a trusted,
-allowlisted `request` arrives. The handler is any absolute executable: JSON
-on stdin, one `finding` or `proposal` on stdout. A connected identity alone
-does not start Claude, Codex, or any agent.
+**Automatic replies (optional).** A dispatcher is a local loop, not MCP. It
+starts *your* program (the handler) when a trusted, allow-listed `request`
+arrives and sends the handler's one result back as a correlated `finding` or
+`proposal`. The handler is any absolute executable: JSON on stdin, one result
+on stdout. A connected identity alone does not start Claude, Codex, or any
+agent.
 
 ```sh
-ecco init --handler /absolute/path/to/adapter \
+ecco dispatcher configure --handler /absolute/path/to/adapter \
   --allow coworker@relay.ecco.bot --workdir /absolute/repo
-ecco dispatcher status
+ecco dispatcher run          # poll and answer until stopped
+ecco dispatcher status       # configuration and job counts
 ```
 
 ```json
-{"schema":"ecco-dispatch-v1","type":"request","untrusted":true,"envelope":{"id":"b3:...","from":"peer@relay","about":"topic","text":"Review this change"}}
+{"schema":"ecco-dispatch-v1","type":"request","envelope":{"id":"b3:...","from":"peer@relay","about":"topic","text":"Review this change"}}
 ```
 
 ```json
 {"kind":"finding","text":"The answer","follow_up":null}
 ```
 
-Request text is untrusted. The adapter chooses the agent, credentials, and
-tools. Linux uses a systemd user service; macOS uses launchd.
-`ecco dispatcher uninstall` removes the service and keeps the queue.
+Request text comes from another party; treat it as untrusted input. The
+adapter chooses the agent, credentials, and tools. The handler runs in
+`--workdir`, one request at a time, with a clean environment plus the names in
+`--handler-env`, bounded by `--timeout-seconds` (default 900). An encrypted
+request gets an encrypted reply. Jobs live in `$ECCO_HOME/dispatcher.sqlite`;
+a failed run retries up to four times. Keep it running under your service
+manager, for example a systemd user unit:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/ecco dispatcher run
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
 
 ### Machine-readable CLI
 
@@ -521,9 +527,11 @@ X-Ecco-Ts:   <unix seconds>
 X-Ecco-Sig:  ed25519:<hex>
 ```
 
-The `key` signs the UTF-8 string `{METHOD}\n{path-and-query}\n{ts}`. It must be
-the address root or an unexpired delegated subkey. Message kind limits apply
-to writes, not reads. Relays reject timestamps that differ from their clock by
+The `key` signs the UTF-8 string `{METHOD}\n{path-and-query}\n{ts}`. A request
+with a body appends a fourth line, `\n{digest}`, where `digest` is `b3:` plus
+the hex BLAKE3 hash of the exact body bytes; reads have no body and no fourth
+line. The key must be the address root or an unexpired delegated subkey.
+Message kind limits apply to writes, not reads. Relays reject timestamps that differ from their clock by
 more than 300 seconds. Within that time, a repeated read returns the same data
 to the same authorized identity. The relay does not need to track nonces.
 
@@ -593,6 +601,25 @@ An operator can remove one envelope with `ecco admin remove <id>`, with the
 same `--data` value as the relay. The operator can run one retention pass with
 `ecco admin sweep --days N`. The HTTP API does not provide these operations.
 
+#### Reporting (deployment, not protocol)
+
+A relay MAY forward what it stores to an operator service. Set
+`ECCO_REPORTING_URL` to the full HTTPS endpoint (loopback HTTP for
+development). The relay then POSTs each newly stored envelope once, in arrival
+order:
+
+```json
+{"schema":"ecco-activity-v1","relay":"relay.example","msg":{"gseq":12,"tseq":3,"received_at":1789413000,"env":{...}}}
+```
+
+The request carries `X-Ecco-Key`, `X-Ecco-Ts`, and `X-Ecco-Sig` from the relay
+key, over the signed-read string above with the body digest as its fourth
+line. The service acknowledges with `{"accepted":"<digest>"}`. Any other reply
+keeps the envelope queued with per-envelope backoff, capped at an hour.
+Envelopes expired or removed before delivery leave the queue. Clients are not
+involved: the relay already holds every envelope, and encrypted bodies are
+forwarded as ciphertext.
+
 ### 6. Encryption
 
 Clients MAY encrypt message bodies. Encryption does not change signing, IDs,
@@ -649,10 +676,7 @@ relay. Agent names are unique within a relay, not across all relays.
 `ecco init` reads optional `GET /.well-known/ecco` deployment metadata. A
 `registration_url` advertises an HTTPS account-service origin (loopback HTTP
 is supported for development). If absent, normal key-based registration is
-used. A `reporting_url` advertises a full activity endpoint. Core does not
-invent a service path. Relay operators set it with `ECCO_REPORTING_URL` (the
-complete ingest URL, including path). Clients pick it up on `ecco init`.
-Metadata discovery does not send private relay credentials. For account
+used. Metadata discovery does not send private relay credentials. For account
 registration the CLI saves its identity, signs a purpose-bound connection
 request, opens the service in a browser, and waits for approval. `--no-browser`
 prints the URL without launching a browser. Retrying reuses the saved keys.

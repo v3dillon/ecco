@@ -9,7 +9,6 @@ mod mcp;
 mod outbox;
 mod registration;
 mod relay;
-mod reporting;
 mod store;
 
 use clap::{Parser, Subcommand};
@@ -57,25 +56,6 @@ enum Cmd {
         /// Save local keys and print their public keys without registering yet
         #[arg(long)]
         prepare: bool,
-        /// Activity endpoint URL (otherwise use the relay's reporting metadata)
-        #[arg(long, conflicts_with_all = ["prepare", "no_reporting"])]
-        report_to: Option<String>,
-        /// Disable activity uploads for this identity
-        #[arg(long, conflicts_with = "prepare")]
-        no_reporting: bool,
-        /// JSON stdin/stdout handler for automatic replies
-        #[arg(long, conflicts_with = "prepare", requires_all = ["allow", "workdir"])]
-        handler: Option<PathBuf>,
-        #[arg(long, requires = "handler")]
-        handler_arg: Vec<String>,
-        /// Environment variable names to retain for the handler
-        #[arg(long, requires = "handler")]
-        handler_env: Vec<String>,
-        /// Trust these senders and allow automatic replies
-        #[arg(long, requires = "handler")]
-        allow: Vec<String>,
-        #[arg(long, requires = "handler")]
-        workdir: Option<PathBuf>,
     },
     /// Offer an unmanaged relay name to another root key; recipient accepts with init
     Transfer {
@@ -177,12 +157,7 @@ enum Cmd {
     Reject { id: String },
     /// Serve ecco as MCP tools over stdio (for agent harnesses)
     Mcp,
-    /// Configure or retry optional Ecco activity reporting
-    Reporting {
-        #[command(subcommand)]
-        cmd: reporting::ReportingCmd,
-    },
-    /// Install and control the local automatic-reply dispatcher
+    /// Answer trusted requests with a local handler (README, "Automatic replies")
     Dispatcher {
         #[command(subcommand)]
         cmd: dispatcher::DispatcherCmd,
@@ -295,20 +270,10 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             token,
             no_browser,
             prepare,
-            report_to,
-            no_reporting,
-            handler,
-            handler_arg,
-            handler_env,
-            allow,
-            workdir,
         } => {
             let id = init_identity(home, name.as_deref(), relay.as_deref(), token)?;
-            let mut service_endpoint = None;
             if !prepare {
-                let services = registration::discover(&id.relay)?;
-                service_endpoint = services.reporting_url;
-                if let Some(service) = services.registration_url {
+                if let Some(service) = registration::discover(&id.relay)? {
                     registration::authorize(&id, &service, no_browser)?;
                 } else {
                     client::register(&id)?;
@@ -327,32 +292,8 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                 "agent key (bot):   {}",
                 envelope::encode_key(&id.agent_key().verifying_key())
             );
-            if !prepare {
-                reporting::setup(
-                    home,
-                    report_to.as_deref(),
-                    service_endpoint.as_deref(),
-                    no_reporting,
-                )?;
-                reporting::status(home)?;
-                if let Some(handler) = handler {
-                    dispatcher::command(
-                        home,
-                        dispatcher::DispatcherCmd::Install {
-                            allow,
-                            workdir: workdir.ok_or("--workdir is required")?,
-                            handler,
-                            handler_arg,
-                            handler_env,
-                            max_thread_requests: 8,
-                            thread_ttl_seconds: 3600,
-                        },
-                    )?;
-                }
-            }
             Ok(())
         }
-        Cmd::Reporting { cmd } => reporting::command(home, cmd),
         Cmd::Dispatcher { cmd } => dispatcher::command(home, cmd),
         Cmd::Transfer { to } => registration::transfer(&Identity::load(home)?, &to),
         Cmd::Relay {
@@ -436,7 +377,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             let id = Identity::load(home)?;
             let value = match cmd {
                 WorkCmd::Status { about } => {
-                    serde_json::to_value(coordination::status(home, &id, &about)?).unwrap()
+                    serde_json::to_value(coordination::status(&id, &about)?).unwrap()
                 }
                 WorkCmd::Claim {
                     about,
@@ -469,7 +410,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             let id = Identity::load(home)?;
             let persist = since.is_none();
             let start = since.unwrap_or_else(|| load_cursor(home));
-            let (msgs, max_gseq) = client::inbox(home, &id, start, wait)?;
+            let (msgs, max_gseq) = client::inbox(&id, start, wait)?;
             if as_json {
                 println!(
                     "{}",
@@ -501,7 +442,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                 id.addr()
             );
             loop {
-                let (batch, until) = client::inbox(home, &id, cursor, 25)?;
+                let (batch, until) = client::inbox(&id, cursor, 25)?;
                 let (visible, held, _) = agent_surface::partition(home, &id, batch);
                 for s in &visible {
                     println!("{}", fmt(&id, s, false));
@@ -523,7 +464,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             json: as_json,
         } => {
             let id = Identity::load(home)?;
-            let mut msgs = client::thread(home, &id, &about, 0, 0)?;
+            let mut msgs = client::thread(&id, &about, 0, 0)?;
             msgs.sort_by_key(|s| s.tseq);
             if as_json {
                 println!(
@@ -544,7 +485,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
         }
         Cmd::Requests => {
             let id = Identity::load(home)?;
-            let (msgs, _) = client::inbox(home, &id, 0, 0)?;
+            let (msgs, _) = client::inbox(&id, 0, 0)?;
             let (_, held, _) = agent_surface::partition(home, &id, msgs);
             if held.is_empty() {
                 println!("no pending contact requests");
@@ -560,7 +501,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             let id = Identity::load(home)?;
             identity::contacts_set(home, &addr, "approved")?;
             println!("trusted {addr}");
-            let (msgs, _) = client::inbox(home, &id, 0, 0)?;
+            let (msgs, _) = client::inbox(&id, 0, 0)?;
             for s in msgs.iter().filter(|s| s.env.from == addr) {
                 println!("{}", fmt(&id, s, false));
             }
@@ -667,7 +608,7 @@ fn post_idempotent(
     idempotency_key: Option<&str>,
 ) -> Result<client::Receipt, String> {
     let env = prepare_envelope(home, id, input, idempotency_key)?;
-    client::send(home, id, &env)
+    client::send(id, &env)
 }
 
 fn prepare_envelope(
@@ -725,7 +666,7 @@ fn post_envelope(
             encrypt,
         },
     )?;
-    let receipt = client::send(home, id, &env)?;
+    let receipt = client::send(id, &env)?;
     Ok((env, receipt))
 }
 
@@ -761,7 +702,7 @@ fn build_envelope(home: &Path, id: &Identity, input: SendInput) -> Result<Envelo
     };
     // An unreadable thread (auth-v0 non-participant) yields empty prev. The
     // relay then refuses the post unless the anchor is still empty (README §5).
-    let prev = client::thread(home, id, &about, 0, 0)
+    let prev = client::thread(id, &about, 0, 0)
         .unwrap_or_default()
         .iter()
         .max_by_key(|s| s.tseq)
@@ -865,21 +806,19 @@ fn decide(home: &Path, target: &str, verb: &str) -> Result<(), String> {
 
 /// Proposals from trusted senders whose thread does not yet contain a decision.
 fn pending_proposals(home: &Path, id: &Identity) -> Result<Vec<Stored>, String> {
-    let (msgs, _) = client::inbox(home, id, 0, 0)?;
+    let (msgs, _) = client::inbox(id, 0, 0)?;
     let (visible, _, _) = agent_surface::partition(home, id, msgs);
     let mut pending = Vec::new();
     for s in visible.into_iter().filter(|s| s.env.kind == "proposal") {
-        let decided = client::thread(home, id, &s.env.about, 0, 0)?
-            .iter()
-            .any(|t| {
-                t.env.kind == "decision"
-                    && t.env
-                        .body
-                        .get("approves")
-                        .or(t.env.body.get("rejects"))
-                        .and_then(|v| v.as_str())
-                        == Some(s.env.id.as_str())
-            });
+        let decided = client::thread(id, &s.env.about, 0, 0)?.iter().any(|t| {
+            t.env.kind == "decision"
+                && t.env
+                    .body
+                    .get("approves")
+                    .or(t.env.body.get("rejects"))
+                    .and_then(|v| v.as_str())
+                    == Some(s.env.id.as_str())
+        });
         if !decided {
             pending.push(s);
         }
@@ -897,7 +836,7 @@ fn load_cursor(home: &Path) -> u64 {
 }
 
 fn save_cursor(home: &Path, cursor: u64) -> Result<(), String> {
-    std::fs::write(home.join("cursor"), cursor.to_string()).map_err(|e| e.to_string())
+    local::write(&home.join("cursor"), cursor.to_string().as_bytes())
 }
 
 fn dm_thread(own: &str, to: &[String]) -> String {
@@ -948,34 +887,6 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("ecco-main-test-{}-{nonce}", std::process::id()))
-    }
-
-    #[test]
-    fn init_dispatcher_requires_handler_allowlist_and_workdir() {
-        assert!(Cli::try_parse_from(["ecco", "init", "--allow", "peer@relay"]).is_err());
-        assert!(
-            Cli::try_parse_from(["ecco", "init", "--handler", "/worker", "--prepare"]).is_err()
-        );
-        assert!(Cli::try_parse_from([
-            "ecco",
-            "init",
-            "--report-to",
-            "https://ops.test",
-            "--no-reporting"
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from([
-            "ecco",
-            "init",
-            "--handler",
-            "/worker",
-            "--allow",
-            "peer@relay",
-            "--workdir",
-            "/repo"
-        ])
-        .is_ok());
-        assert!(Cli::try_parse_from(["ecco", "init", "--agent", "codex"]).is_err());
     }
 
     #[test]

@@ -1,8 +1,27 @@
-//! Versioned JSON handler boundary. Adapters own agent launch and permissions.
+//! The handler boundary: `ecco-dispatch-v1` JSON on stdin, one result on
+//! stdout. Adapters own agent launch, credentials, and permissions.
 use crate::local;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path, time::Duration};
+
+/// Result text limit; the process output limit leaves room for JSON framing.
+const MAX_TEXT_BYTES: usize = 64 * 1024;
+const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+/// Environment always passed through; `--handler-env` adds to it.
+const INHERITED_ENV: &[&str] = &[
+    "HOME",
+    "PATH",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+];
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,33 +49,24 @@ impl Handler {
         }
         Ok(())
     }
-    pub fn environment(&self) -> BTreeMap<String, String> {
-        let mut keys = [
-            "HOME",
-            "PATH",
-            "XDG_CONFIG_HOME",
-            "XDG_DATA_HOME",
-            "XDG_STATE_HOME",
-            "HTTPS_PROXY",
-            "HTTP_PROXY",
-            "ALL_PROXY",
-            "NO_PROXY",
-            "SSL_CERT_FILE",
-            "SSL_CERT_DIR",
-        ]
-        .map(str::to_string)
-        .to_vec();
+    fn environment(&self) -> BTreeMap<String, String> {
+        let mut keys: Vec<String> = INHERITED_ENV.iter().map(|s| s.to_string()).collect();
         keys.extend(self.env.clone());
         local::environment(&keys)
     }
-    pub fn run(&self, cwd: &Path, input: &Value) -> Result<ResultMessage, String> {
+    pub fn run(
+        &self,
+        cwd: &Path,
+        input: &Value,
+        timeout: Duration,
+    ) -> Result<ResultMessage, String> {
         let output = local::process(
             &[vec![self.executable.clone()], self.args.clone()].concat(),
             Some(&input.to_string()),
             cwd,
             &self.environment(),
-            Duration::from_secs(300),
-            65536,
+            timeout,
+            MAX_OUTPUT_BYTES,
         )?;
         ResultMessage::decode(serde_json::from_str(&output).map_err(|e| e.to_string())?)
     }
@@ -72,13 +82,10 @@ pub struct ResultMessage {
 impl ResultMessage {
     pub fn decode(value: Value) -> Result<Self, String> {
         let result: Self = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let usable = |s: &str| !s.trim().is_empty() && s.len() <= MAX_TEXT_BYTES;
         if !["finding", "proposal"].contains(&result.kind.as_str())
-            || result.text.trim().is_empty()
-            || result.text.len() > 65536
-            || result
-                .follow_up
-                .as_ref()
-                .is_some_and(|s| s.trim().is_empty() || s.len() > 65536)
+            || !usable(&result.text)
+            || result.follow_up.as_deref().is_some_and(|s| !usable(s))
             || (result.kind == "proposal" && result.follow_up.is_some())
         {
             return Err("invalid dispatcher result".into());

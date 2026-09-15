@@ -1,93 +1,108 @@
-//! Local durable dispatch. Agent launch details are separate from queue policy.
+//! Local durable dispatch: a trusted, allow-listed `request` starts your
+//! handler, and its one result goes back as a correlated `finding` or
+//! `proposal`. Agent launch, credentials, and permissions live in the handler.
 use crate::{
     client::{self, Stored},
+    envelope,
     identity::{self, Identity},
-    local, reporting,
+    local,
 };
 use clap::Subcommand;
 use handler::{Handler, ResultMessage};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     os::{fd::AsRawFd, unix::fs::PermissionsExt},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
     time::Duration,
 };
 mod handler;
-mod service;
+
+pub const DISPATCH_SCHEMA: &str = "ecco-dispatch-v1";
+const MAX_ATTEMPTS: i64 = 4;
+const MAX_REQUEST_TEXT_BYTES: usize = 64 * 1024;
+const SQLITE_SCHEMA: &str = "
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT OR IGNORE INTO state VALUES ('cursor','0');
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY,
+  payload TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'received',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  result TEXT,
+  next_at INTEGER NOT NULL DEFAULT 0
+);";
+/// Jobs ready to run: new, or retrying and past their backoff.
+const SQLITE_READY: &str = "SELECT payload,result,attempts FROM jobs
+     WHERE status IN ('received','retrying') AND next_at<=unixepoch() ORDER BY rowid LIMIT 20";
 
 #[derive(Subcommand)]
 pub enum DispatcherCmd {
-    /// Trust allowed senders and start a local dispatcher on the same relay.
-    Install {
+    /// Trust the allowed senders and save the handler configuration
+    Configure {
+        /// Senders whose requests start the handler (same relay as you)
         #[arg(long, required = true)]
         allow: Vec<String>,
+        /// Absolute directory the handler runs in
         #[arg(long)]
         workdir: PathBuf,
+        /// Absolute path of the handler executable
         #[arg(long)]
         handler: PathBuf,
         #[arg(long)]
         handler_arg: Vec<String>,
-        /// Environment variable names to retain for the handler
+        /// Environment variable names passed through to the handler
         #[arg(long)]
         handler_env: Vec<String>,
-        #[arg(long,default_value_t=8,value_parser=clap::value_parser!(u32).range(1..=32))]
+        /// Seconds one handler run may take
+        #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u32).range(1..=86400))]
+        timeout_seconds: u32,
+        /// Requests per conversation before follow-ups stop
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=32))]
         max_thread_requests: u32,
-        #[arg(long,default_value_t=3600,value_parser=clap::value_parser!(u32).range(1..=86400))]
+        /// Conversation age in seconds after which follow-ups stop
+        #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u32).range(1..=86400))]
         thread_ttl_seconds: u32,
     },
-    Start,
-    Restart,
-    Stop,
-    Status,
-    Logs,
-    Uninstall,
-    /// Run the installed dispatcher in the foreground
+    /// Poll the inbox and run the handler; --once does a single pass
     Run {
         #[arg(long)]
         once: bool,
     },
+    /// Show the configuration and job counts
+    Status,
 }
+
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    version: u32,
     allow: Vec<String>,
     work_dir: PathBuf,
     handler: Handler,
+    timeout_seconds: u32,
     max_thread_requests: u32,
     thread_ttl_seconds: u32,
 }
-impl Config {
-    fn handler_name(&self) -> &str {
-        Path::new(&self.handler.executable)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("handler")
-    }
-}
-pub fn config_path(home: &Path) -> PathBuf {
-    home.join("dispatcher/config.json")
+
+fn config_path(home: &Path) -> PathBuf {
+    home.join("dispatcher.json")
 }
 fn config(home: &Path) -> Result<Config, String> {
-    let cfg: Config = serde_json::from_str(&local::read(&config_path(home), 65536)?)
-        .map_err(|e| format!("invalid dispatcher config: {e}"))?;
-    if cfg.version != 1 {
-        return Err("unsupported dispatcher config; reinstall with ecco dispatcher install".into());
+    let path = config_path(home);
+    if !path.exists() {
+        return Err("dispatcher is not configured; run ecco dispatcher configure".into());
     }
+    let cfg: Config = serde_json::from_str(&local::read(&path, 65536)?)
+        .map_err(|e| format!("invalid dispatcher config: {e}"))?;
     validate(home, &cfg)?;
     Ok(cfg)
 }
 fn validate(home: &Path, cfg: &Config) -> Result<(), String> {
-    let id = Identity::load(home)?;
-    let authority = identity::authority(&id.relay);
+    let authority = identity::authority(&Identity::load(home)?.relay);
     if cfg.allow.is_empty()
         || cfg.allow.iter().any(|a| {
             a.rsplit_once('@')
@@ -96,128 +111,109 @@ fn validate(home: &Path, cfg: &Config) -> Result<(), String> {
     {
         return Err("dispatcher needs same-relay --allow addresses".into());
     }
-    if !cfg.work_dir.is_absolute()
-        || !cfg.work_dir.is_dir()
-        || cfg.work_dir.parent().is_none()
-        || cfg.work_dir.to_string_lossy().contains(['\n', '\r'])
-    {
+    if !cfg.work_dir.is_absolute() || !cfg.work_dir.is_dir() || cfg.work_dir.parent().is_none() {
         return Err("--workdir must be an existing absolute directory other than /".into());
     }
-    if !(1..=32).contains(&cfg.max_thread_requests)
+    if !(1..=86400).contains(&cfg.timeout_seconds)
+        || !(1..=32).contains(&cfg.max_thread_requests)
         || !(1..=86400).contains(&cfg.thread_ttl_seconds)
     {
-        return Err("invalid dispatcher conversation limits".into());
+        return Err("invalid dispatcher limits".into());
     }
     cfg.handler.validate()
 }
-fn install_config(home: &Path, cfg: Config) -> Result<(), String> {
-    validate(home, &cfg)?;
-    service::install(home, &cfg)?;
-    println!("Dispatcher installed and started.");
-    Ok(())
-}
+
 pub fn command(home: &Path, cmd: DispatcherCmd) -> Result<(), String> {
     match cmd {
-        DispatcherCmd::Install {
+        DispatcherCmd::Configure {
             allow,
             workdir,
             handler,
             handler_arg,
             handler_env,
+            timeout_seconds,
             max_thread_requests,
             thread_ttl_seconds,
         } => {
-            let handler = Handler {
-                executable: handler.to_string_lossy().into_owned(),
-                args: handler_arg,
-                env: handler_env,
-            };
-            install_config(
-                home,
-                Config {
-                    version: 1,
-                    allow,
-                    work_dir: workdir,
-                    handler,
-                    max_thread_requests,
-                    thread_ttl_seconds,
+            let cfg = Config {
+                allow,
+                work_dir: workdir,
+                handler: Handler {
+                    executable: handler.to_string_lossy().into_owned(),
+                    args: handler_arg,
+                    env: handler_env,
                 },
-            )
+                timeout_seconds,
+                max_thread_requests,
+                thread_ttl_seconds,
+            };
+            validate(home, &cfg)?;
+            for addr in &cfg.allow {
+                identity::contacts_set(home, addr, "approved")?;
+            }
+            local::write(
+                &config_path(home),
+                serde_json::to_string_pretty(&cfg).unwrap().as_bytes(),
+            )?;
+            println!(
+                "dispatcher configured for {}; start it with ecco dispatcher run",
+                cfg.allow.join(", ")
+            );
+            Ok(())
         }
         DispatcherCmd::Run { once } => run(home, once),
-        other => service::command(home, other),
+        DispatcherCmd::Status => {
+            let cfg = config(home)?;
+            println!("handler: {}", cfg.handler.executable);
+            println!("allow:   {}", cfg.allow.join(", "));
+            let db = database(home)?;
+            let mut rows = db
+                .prepare("SELECT status,count(*) FROM jobs GROUP BY status ORDER BY status")
+                .map_err(|e| e.to_string())?;
+            let counts = rows
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            for (status, count) in counts {
+                println!("{status}: {count}");
+            }
+            Ok(())
+        }
     }
 }
+
 fn database(home: &Path) -> Result<Connection, String> {
     let path = home.join("dispatcher.sqlite");
     let db = Connection::open(&path).map_err(|e| e.to_string())?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
     db.busy_timeout(Duration::from_secs(5))
         .map_err(|e| e.to_string())?;
-    let exists: i64 = db
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='jobs'",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    if exists > 0 {
-        let columns: Vec<String> = db
-            .prepare("PRAGMA table_info(jobs)")
-            .map_err(|e| e.to_string())?
-            .query_map([], |r| r.get(1))
-            .map_err(|e| e.to_string())?
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.to_string())?;
-        if !columns.iter().any(|s| s == "payload") {
-            return Err("existing dispatcher database uses an unsupported format; preserved without changes".into());
-        }
-    }
-    db.execute_batch("PRAGMA journal_mode=WAL;CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT NOT NULL);INSERT OR IGNORE INTO state VALUES ('cursor','0'),('sequence','0');CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'received',attempts INTEGER NOT NULL DEFAULT 0,result TEXT,next_at INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS report_outbox(sequence INTEGER PRIMARY KEY,payload TEXT NOT NULL,created_at INTEGER NOT NULL DEFAULT (unixepoch()));").map_err(|e|e.to_string())?;
-    let id = Identity::load(home)?;
-    let candidate = format!(
-        "disp:{:032x}@{}",
-        rand::random::<u128>(),
-        identity::authority(&id.relay)
-    );
-    db.execute(
-        "INSERT OR IGNORE INTO state VALUES ('dispatcher_id',?)",
-        [candidate],
-    )
-    .map_err(|e| e.to_string())?;
+    db.execute_batch(SQLITE_SCHEMA).map_err(|e| e.to_string())?;
     Ok(db)
 }
-fn state(db: &Connection, key: &str) -> Result<String, String> {
-    db.query_row("SELECT value FROM state WHERE key=?", [key], |r| r.get(0))
-        .map_err(|e| e.to_string())
+fn cursor(db: &Connection) -> Result<u64, String> {
+    db.query_row("SELECT value FROM state WHERE key='cursor'", [], |r| {
+        r.get::<_, String>(0)
+    })
+    .map_err(|e| e.to_string())?
+    .parse()
+    .map_err(|e: std::num::ParseIntError| e.to_string())
 }
-fn event(
-    db: &Connection,
-    cfg: &Config,
-    job: &Stored,
-    status: &str,
-    attempt: i64,
-) -> Result<(), String> {
-    let sequence:i64=db.query_row("UPDATE state SET value=CAST(value AS INTEGER)+1 WHERE key='sequence' RETURNING CAST(value AS INTEGER)",[],|r|r.get(0)).map_err(|e|e.to_string())?;
-    let dispatcher = state(db, "dispatcher_id")?;
-    let payload = json!({"v":1,"eventId":format!("{dispatcher}/{sequence}"),"dispatcherId":dispatcher,"jobId":job.env.id,"sequence":sequence,"state":status,"provider":cfg.handler_name(),"attempt":attempt,"at":local::timestamp(),"about":job.env.about});
-    db.execute(
-        "INSERT INTO report_outbox(sequence,payload) VALUES (?,?)",
-        rusqlite::params![sequence, payload.to_string()],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-fn request_text(id: &Identity, env: &crate::envelope::Envelope) -> Option<String> {
-    let body = if crate::envelope::is_encrypted(&env.body) {
-        crate::envelope::open_body(&env.body, &id.addr(), &id.root_key())?
+
+/// The request text as the handler will see it: decrypted when sealed to us.
+fn request_text(id: &Identity, env: &envelope::Envelope) -> Option<String> {
+    let body = if envelope::is_encrypted(&env.body) {
+        envelope::open_body(&env.body, &id.addr(), &id.root_key())?
     } else {
         env.body.clone()
     };
     let text = body.get("text")?.as_str()?;
-    (!text.is_empty() && text.len() <= 65536).then(|| text.to_owned())
+    (!text.is_empty() && text.len() <= MAX_REQUEST_TEXT_BYTES).then(|| text.to_owned())
 }
 
+/// Record allow-listed requests as jobs and advance the cursor in one
+/// transaction, so a crash never skips or double-counts a request.
 fn ingest(
     db: &mut Connection,
     home: &Path,
@@ -230,32 +226,22 @@ fn ingest(
     let tx = db.transaction().map_err(|e| e.to_string())?;
     for stored in visible {
         let env = &stored.env;
-        if env.from == id.addr() || !env.to.contains(&id.addr()) {
+        if env.kind != "request" || !env.to.contains(&id.addr()) || !cfg.allow.contains(&env.from) {
             continue;
         }
-        let status = if env.kind == "proposal" {
-            "needs-human"
-        } else if env.kind != "request" || !cfg.allow.contains(&env.from) {
-            continue;
-        } else if request_text(id, env).is_some() {
+        // A request sealed to someone else cannot be handled automatically.
+        let status = if request_text(id, env).is_some() {
             "received"
-        } else if crate::envelope::is_encrypted(&env.body)
-            && crate::envelope::open_body(&env.body, &id.addr(), &id.root_key()).is_none()
-        {
+        } else if envelope::is_encrypted(&env.body) {
             "needs-human"
         } else {
             continue;
         };
-        if tx
-            .execute(
-                "INSERT OR IGNORE INTO jobs(id,payload,status) VALUES (?,?,?)",
-                rusqlite::params![env.id, serde_json::to_string(&stored).unwrap(), status],
-            )
-            .map_err(|e| e.to_string())?
-            > 0
-        {
-            event(&tx, cfg, &stored, status, 0)?;
-        }
+        tx.execute(
+            "INSERT OR IGNORE INTO jobs(id,payload,status) VALUES (?,?,?)",
+            rusqlite::params![env.id, serde_json::to_string(&stored).unwrap(), status],
+        )
+        .map_err(|e| e.to_string())?;
     }
     tx.execute(
         "UPDATE state SET value=? WHERE key='cursor'",
@@ -264,33 +250,9 @@ fn ingest(
     .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
 }
-fn report(db: &Connection, id: &Identity, api: &str, cfg: &Config) -> Result<(), String> {
-    db.execute_batch("DELETE FROM report_outbox WHERE created_at < unixepoch()-7776000; DELETE FROM report_outbox WHERE sequence IN (SELECT sequence FROM report_outbox ORDER BY sequence DESC LIMIT -1 OFFSET 10000);").map_err(|e|e.to_string())?;
-    let rows: Vec<(i64, String)> = db
-        .prepare("SELECT sequence,payload FROM report_outbox ORDER BY sequence LIMIT 100")
-        .map_err(|e| e.to_string())?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<_, _>>()
-        .map_err(|e| e.to_string())?;
-    let events: Vec<Value> = rows
-        .iter()
-        .map(|(_, s)| serde_json::from_str(s))
-        .collect::<Result<_, _>>()
-        .map_err(|e| e.to_string())?;
-    let body = json!({"v":1,"events":events,"heartbeat":{"v":1,"dispatcherId":state(db,"dispatcher_id")?,"provider":cfg.handler_name(),"at":local::timestamp()}});
-    let activity = json!({"schema":reporting::ACTIVITY_SCHEMA,"type":"dispatcher","observer":id.addr(),"report":body});
-    reporting::post(id, api, &activity.to_string())?;
-    for (sequence, _) in rows {
-        db.execute("DELETE FROM report_outbox WHERE sequence=?", [sequence])
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-fn correlated(thread: &[Stored], self_addr: &str, request: &str, follow: bool) -> bool {
-    correlated_message(thread, self_addr, request, follow).is_some()
-}
-fn correlated_message<'a>(
+
+/// Our reply (or, with `follow`, our follow-up request) to `request`, if sent.
+fn correlated<'a>(
     thread: &'a [Stored],
     self_addr: &str,
     request: &str,
@@ -306,6 +268,9 @@ fn correlated_message<'a>(
             }
     })
 }
+
+/// A follow-up is allowed while the reply chain stays between the two
+/// parties, is complete, and is within the configured count and age.
 fn follow_allowed(
     thread: &[Stored],
     request: &Stored,
@@ -330,26 +295,28 @@ fn follow_allowed(
             count += 1;
             first = first.min(stored.received_at);
         }
-        current = if let Some(parent) = env.body["in_reply_to"].as_str() {
-            match by_id.get(parent) {
+        current = match env.body["in_reply_to"].as_str() {
+            Some(parent) => match by_id.get(parent) {
                 Some(s) => Some(*s),
                 None => return false,
-            }
-        } else {
-            None
+            },
+            None => None,
         };
     }
     count > 0
         && count < cfg.max_thread_requests
         && now < first.saturating_add(cfg.thread_ttl_seconds as u64)
 }
+
+/// A correlated send that mirrors the request's encryption. The reply is
+/// idempotent per request (main.rs `automatic_idempotency_key`).
 fn send(
     home: &Path,
     id: &Identity,
     request: &Stored,
     kind: &str,
     text: &str,
-) -> Result<Stored, String> {
+) -> Result<(), String> {
     let env = crate::prepare_envelope(
         home,
         id,
@@ -358,18 +325,13 @@ fn send(
             kind: kind.into(),
             body: crate::message_body(text.into(), Some(request.env.id.clone())),
             to: vec![request.env.from.clone()],
-            encrypt: false,
+            encrypt: envelope::is_encrypted(&request.env.body),
         },
         None,
     )?;
-    let receipt = client::send(home, id, &env)?;
-    Ok(Stored {
-        env,
-        gseq: receipt.gseq,
-        tseq: receipt.tseq,
-        received_at: receipt.received_at,
-    })
+    client::send(id, &env).map(|_| ())
 }
+
 fn execute(
     db: &Connection,
     home: &Path,
@@ -387,8 +349,8 @@ fn execute(
     {
         return Err("request sender is no longer trusted and allowed".into());
     }
-    let thread = client::thread(home, id, &request.env.about, 0, 0)?;
-    let replied = correlated(&thread, &id.addr(), &request.env.id, false);
+    let thread = client::thread(id, &request.env.about, 0, 0)?;
+    let replied = correlated(&thread, &id.addr(), &request.env.id, false).is_some();
     if replied && saved.is_none() {
         return Ok("completed");
     }
@@ -396,8 +358,21 @@ fn execute(
         ResultMessage::decode(serde_json::from_str(saved).map_err(|e| e.to_string())?)?
     } else {
         let text = request_text(id, &request.env).ok_or("request has no usable text")?;
-        let input = json!({"schema":"ecco-dispatch-v1","type":"request","untrusted":true,"envelope":{"id":request.env.id,"from":request.env.from,"about":request.env.about,"text":text}});
-        let result = cfg.handler.run(&cfg.work_dir, &input)?;
+        let input = json!({
+            "schema": DISPATCH_SCHEMA,
+            "type": "request",
+            "envelope": {
+                "id": request.env.id,
+                "from": request.env.from,
+                "about": request.env.about,
+                "text": text,
+            },
+        });
+        let result = cfg.handler.run(
+            &cfg.work_dir,
+            &input,
+            Duration::from_secs(cfg.timeout_seconds as u64),
+        )?;
         db.execute(
             "UPDATE jobs SET result=? WHERE id=?",
             rusqlite::params![serde_json::to_string(&result).unwrap(), request.env.id],
@@ -409,8 +384,8 @@ fn execute(
         send(home, id, request, &result.kind, &result.text)?;
     }
     if let Some(text) = &result.follow_up {
-        if !correlated(&thread, &id.addr(), &request.env.id, true)
-            && follow_allowed(&thread, request, id, cfg, crate::envelope::now())
+        if correlated(&thread, &id.addr(), &request.env.id, true).is_none()
+            && follow_allowed(&thread, request, id, cfg, envelope::now())
         {
             send(home, id, request, "request", text)?;
         }
@@ -421,48 +396,51 @@ fn execute(
         "completed"
     })
 }
+
 fn process_ready(
     db: &mut Connection,
     home: &Path,
     id: &Identity,
     cfg: &Config,
 ) -> Result<(), String> {
-    let jobs:Vec<(String,Option<String>,i64)>=db.prepare("SELECT payload,result,attempts FROM jobs WHERE status IN ('received','retrying') AND next_at<=unixepoch() ORDER BY rowid LIMIT 20").map_err(|e|e.to_string())?.query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e|e.to_string())?.collect::<Result<_,_>>().map_err(|e|e.to_string())?;
+    let jobs: Vec<(String, Option<String>, i64)> = db
+        .prepare(SQLITE_READY)
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
     for (payload, saved, attempts) in jobs {
         if local::cancelled() {
             break;
         }
         let request: Stored = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
         let attempt = attempts + 1;
-        let tx = db.transaction().map_err(|e| e.to_string())?;
-        tx.execute(
+        db.execute(
             "UPDATE jobs SET status='running',attempts=? WHERE id=?",
             rusqlite::params![attempt, request.env.id],
         )
         .map_err(|e| e.to_string())?;
-        event(&tx, cfg, &request, "running", attempt)?;
-        tx.commit().map_err(|e| e.to_string())?;
         let (status, delay) = match execute(db, home, id, cfg, &request, saved.as_deref()) {
             Ok(status) => (status, 0),
             Err(e) => {
                 eprintln!("dispatcher request {}: {e}", request.env.id);
-                (
-                    if attempt >= 4 { "failed" } else { "retrying" },
-                    (1i64 << attempt.min(8)) * 2,
-                )
+                if attempt >= MAX_ATTEMPTS {
+                    ("failed", 0)
+                } else {
+                    ("retrying", 2i64 << attempt)
+                }
             }
         };
-        let tx = db.transaction().map_err(|e| e.to_string())?;
-        tx.execute(
+        db.execute(
             "UPDATE jobs SET status=?,next_at=unixepoch()+? WHERE id=?",
             rusqlite::params![status, delay, request.env.id],
         )
         .map_err(|e| e.to_string())?;
-        event(&tx, cfg, &request, status, attempt)?;
-        tx.commit().map_err(|e| e.to_string())?;
     }
     Ok(())
 }
+
 fn run(home: &Path, once: bool) -> Result<(), String> {
     let cfg = config(home)?;
     let id = Identity::load(home)?;
@@ -477,102 +455,119 @@ fn run(home: &Path, once: bool) -> Result<(), String> {
     }
     local::install_signals();
     let mut db = database(home)?;
+    // Jobs left running by a previous process are retried; a saved result is reused.
     db.execute(
         "UPDATE jobs SET status='retrying',next_at=0 WHERE status='running'",
         [],
     )
     .map_err(|e| e.to_string())?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker_stop = Arc::clone(&stop);
-    let worker_home = home.to_path_buf();
-    let worker_cfg = cfg.clone();
-    let reporter = std::thread::spawn(move || {
-        if let (Ok(db), Ok(id)) = (database(&worker_home), Identity::load(&worker_home)) {
-            loop {
-                if let Ok(api) = reporting::destination(&worker_home) {
-                    if let Err(e) = report(&db, &id, &api, &worker_cfg) {
-                        eprintln!("dispatcher reporting retained: {e}");
-                    }
-                    let _ =
-                        reporting::Outbox::open(&worker_home, api).and_then(|q| q.flush(3, true));
-                }
-                for _ in 0..60 {
-                    if worker_stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_secs(1));
-                }
+    loop {
+        if local::cancelled() {
+            return Ok(());
+        }
+        let step = cursor(&db).and_then(|cursor| {
+            let (messages, until) = client::inbox(&id, cursor, if once { 0 } else { 20 })?;
+            ingest(&mut db, home, &id, &cfg, messages, until)?;
+            process_ready(&mut db, home, &id, &cfg)
+        });
+        match step {
+            Ok(()) if once => return Ok(()),
+            Ok(()) => {}
+            Err(e) if once => return Err(e),
+            Err(e) => {
+                eprintln!("dispatcher retry: {e}");
+                std::thread::sleep(Duration::from_secs(2));
             }
         }
-    });
-    let result = (|| {
-        loop {
-            if local::cancelled() {
-                break;
-            }
-            let cursor = state(&db, "cursor")?
-                .parse()
-                .map_err(|e: std::num::ParseIntError| e.to_string())?;
-            match client::inbox(home, &id, cursor, if once { 0 } else { 20 })
-                .and_then(|(messages, until)| ingest(&mut db, home, &id, &cfg, messages, until))
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    if once {
-                        return Err(e);
-                    }
-                    eprintln!("dispatcher inbox retry: {e}");
-                    std::thread::sleep(Duration::from_secs(2));
-                }
-            }
-            match process_ready(&mut db, home, &id, &cfg) {
-                Ok(()) => {}
-                Err(e) => {
-                    if once {
-                        return Err(e);
-                    }
-                    eprintln!("dispatcher job retry: {e}");
-                    std::thread::sleep(Duration::from_secs(2));
-                }
-            }
-            if once {
-                break;
-            }
-        }
-        Ok(())
-    })();
-    stop.store(true, Ordering::Relaxed);
-    let _ = reporter.join();
-    if let Ok(api) = reporting::destination(home) {
-        let _ = report(&db, &id, &api, &cfg);
-        let _ = reporting::Outbox::open(home, api).and_then(|q| q.flush(3, true));
     }
-    result
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn follow_ups_stop_at_count_age_and_incomplete_chains() {
-        let id = Identity::generate("me", "https://relay.test", None);
-        let peer = "peer@relay.test";
-        let cfg = Config {
-            version: 1,
+    fn config(home: &Path, peer: &str) -> Config {
+        Config {
             allow: vec![peer.into()],
-            work_dir: PathBuf::from("/tmp"),
+            work_dir: home.to_path_buf(),
             handler: Handler {
                 executable: "/bin/true".into(),
                 args: vec![],
                 env: vec![],
             },
+            timeout_seconds: 900,
+            max_thread_requests: 8,
+            thread_ttl_seconds: 3600,
+        }
+    }
+    fn home(tag: &str) -> (PathBuf, Identity) {
+        let home =
+            std::env::temp_dir().join(format!("ecco-dispatch-{tag}-{}", rand::random::<u64>()));
+        let id = Identity::generate("me", "https://relay.test", None);
+        id.save(&home).unwrap();
+        identity::contacts_set(&home, "peer@relay.test", "approved").unwrap();
+        (home, id)
+    }
+    fn request(id: &Identity, from: &str, n: u64, body: serde_json::Value) -> Stored {
+        Stored {
+            gseq: n,
+            tseq: n,
+            received_at: 100,
+            env: envelope::Envelope::seal(
+                "topic".into(),
+                body,
+                from.into(),
+                "request".into(),
+                vec![],
+                vec![id.addr()],
+                100,
+                &id.agent_key(),
+            ),
+        }
+    }
+
+    #[test]
+    fn configuration_is_validated_against_the_identity_and_filesystem() {
+        let (home, _) = home("validate");
+        let good = config(&home, "peer@relay.test");
+        validate(&home, &good).unwrap();
+        let foreign = Config {
+            allow: vec!["peer@other.test".into()],
+            ..good.clone()
+        };
+        assert!(validate(&home, &foreign).is_err());
+        let relative = Config {
+            work_dir: PathBuf::from("repo"),
+            ..good.clone()
+        };
+        assert!(validate(&home, &relative).is_err());
+        let root = Config {
+            work_dir: PathBuf::from("/"),
+            ..good.clone()
+        };
+        assert!(validate(&home, &root).is_err());
+        let limits = Config {
+            timeout_seconds: 0,
+            ..good.clone()
+        };
+        assert!(validate(&home, &limits).is_err());
+        assert!(serde_json::from_str::<Config>(r#"{"allow":[],"extra":1}"#).is_err());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn follow_ups_stop_at_count_age_and_incomplete_chains() {
+        let id = Identity::generate("me", "https://relay.test", None);
+        let peer = "peer@relay.test";
+        let cfg = Config {
             max_thread_requests: 3,
             thread_ttl_seconds: 300,
+            ..config(Path::new("/tmp"), peer)
         };
         let make = |from: &str, to: &str, kind: &str, parent: Option<&str>, time: u64| Stored {
             gseq: time,
             tseq: time,
             received_at: time,
-            env: crate::envelope::Envelope::seal(
+            env: envelope::Envelope::seal(
                 "topic".into(),
                 crate::message_body("request".into(), parent.map(str::to_string)),
                 from.into(),
@@ -599,132 +594,70 @@ mod tests {
         foreign[0].env.from = "stranger@relay.test".into();
         assert!(!follow_allowed(&foreign, &next, &id, &cfg, 200));
     }
+
     #[test]
     fn contact_policy_and_job_cursor_commit_together() {
-        let home = std::env::temp_dir().join(format!("ecco-dispatch-{}", rand::random::<u64>()));
-        let id = Identity::generate("me", "https://relay.test", None);
-        id.save(&home).unwrap();
-        identity::contacts_set(&home, "peer@relay.test", "approved").unwrap();
-        let cfg = Config {
-            version: 1,
-            allow: vec!["peer@relay.test".into()],
-            work_dir: home.clone(),
-            handler: Handler {
-                executable: "/bin/true".into(),
-                args: vec![],
-                env: vec![],
-            },
-            max_thread_requests: 8,
-            thread_ttl_seconds: 3600,
-        };
-        let make = |from: &str, n: u64| Stored {
-            gseq: n,
-            tseq: n,
-            received_at: 100,
-            env: crate::envelope::Envelope::seal(
-                "topic".into(),
-                json!({"text":"request"}),
-                from.into(),
-                "request".into(),
-                vec![],
-                vec![id.addr()],
-                100,
-                &id.agent_key(),
-            ),
-        };
+        let (home, id) = home("cursor");
+        let cfg = config(&home, "peer@relay.test");
+        let text = json!({"text":"request"});
         let mut db = database(&home).unwrap();
         ingest(
             &mut db,
             &home,
             &id,
             &cfg,
-            vec![make("peer@relay.test", 1), make("held@relay.test", 2)],
+            vec![
+                request(&id, "peer@relay.test", 1, text.clone()),
+                request(&id, "held@relay.test", 2, text.clone()),
+            ],
             2,
         )
         .unwrap();
-        assert_eq!(state(&db, "cursor").unwrap(), "2");
-        assert_eq!(
+        assert_eq!(cursor(&db).unwrap(), 2);
+        let jobs = || {
             db.query_row("SELECT count(*) FROM jobs", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            db.query_row("SELECT count(*) FROM report_outbox", [], |r| r
-                .get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
+                .unwrap()
+        };
+        assert_eq!(jobs(), 1);
         db.execute_batch("CREATE TRIGGER stop_insert BEFORE INSERT ON jobs BEGIN SELECT RAISE(ABORT,'stop'); END;").unwrap();
         assert!(ingest(
             &mut db,
             &home,
             &id,
             &cfg,
-            vec![make("peer@relay.test", 3)],
+            vec![request(&id, "peer@relay.test", 3, text)],
             3
         )
         .is_err());
-        assert_eq!(state(&db, "cursor").unwrap(), "2");
+        assert_eq!(cursor(&db).unwrap(), 2);
         drop(db);
         fs::remove_dir_all(home).unwrap();
     }
+
     #[test]
     fn encrypted_requests_are_decrypted_and_undecryptable_ones_need_a_human() {
-        let home =
-            std::env::temp_dir().join(format!("ecco-dispatch-enc-{}", rand::random::<u64>()));
-        let id = Identity::generate("me", "https://relay.test", None);
-        id.save(&home).unwrap();
-        identity::contacts_set(&home, "peer@relay.test", "approved").unwrap();
-        let cfg = Config {
-            version: 1,
-            allow: vec!["peer@relay.test".into()],
-            work_dir: home.clone(),
-            handler: Handler {
-                executable: "/bin/true".into(),
-                args: vec![],
-                env: vec![],
-            },
-            max_thread_requests: 8,
-            thread_ttl_seconds: 3600,
+        let (home, id) = home("enc");
+        let cfg = config(&home, "peer@relay.test");
+        let status = |db: &Connection| {
+            db.query_row("SELECT status FROM jobs", [], |r| r.get::<_, String>(0))
+                .unwrap()
         };
-        let envelope = |body| Stored {
-            gseq: 1,
-            tseq: 1,
-            received_at: 100,
-            env: crate::envelope::Envelope::seal(
-                "topic".into(),
-                body,
-                "peer@relay.test".into(),
-                "request".into(),
-                vec![],
-                vec![id.addr()],
-                100,
-                &id.agent_key(),
-            ),
-        };
-        let readable = crate::envelope::seal_body(
+        let readable = envelope::seal_body(
             &json!({"text":"secret request"}),
             &[(id.addr(), id.root_key().verifying_key())],
         )
         .unwrap();
         let mut db = database(&home).unwrap();
-        ingest(&mut db, &home, &id, &cfg, vec![envelope(readable)], 1).unwrap();
+        let sealed = request(&id, "peer@relay.test", 1, readable);
+        ingest(&mut db, &home, &id, &cfg, vec![sealed.clone()], 1).unwrap();
+        assert_eq!(status(&db), "received");
         assert_eq!(
-            db.query_row("SELECT status FROM jobs", [], |r| r.get::<_, String>(0))
-                .unwrap(),
-            "received"
-        );
-        let payload: String = db
-            .query_row("SELECT payload FROM jobs", [], |r| r.get(0))
-            .unwrap();
-        let stored: Stored = serde_json::from_str(&payload).unwrap();
-        assert_eq!(
-            request_text(&id, &stored.env).as_deref(),
+            request_text(&id, &sealed.env).as_deref(),
             Some("secret request")
         );
         db.execute("DELETE FROM jobs", []).unwrap();
         let stranger = Identity::generate("other", "https://relay.test", None);
-        let sealed_elsewhere = crate::envelope::seal_body(
+        let sealed_elsewhere = envelope::seal_body(
             &json!({"text":"not for us"}),
             &[(id.addr(), stranger.root_key().verifying_key())],
         )
@@ -734,16 +667,12 @@ mod tests {
             &home,
             &id,
             &cfg,
-            vec![envelope(sealed_elsewhere)],
+            vec![request(&id, "peer@relay.test", 2, sealed_elsewhere)],
             2,
         )
         .unwrap();
-        assert_eq!(
-            db.query_row("SELECT status FROM jobs", [], |r| r.get::<_, String>(0))
-                .unwrap(),
-            "needs-human"
-        );
-        assert_eq!(state(&db, "cursor").unwrap(), "2");
+        assert_eq!(status(&db), "needs-human");
+        assert_eq!(cursor(&db).unwrap(), 2);
         drop(db);
         fs::remove_dir_all(home).unwrap();
     }

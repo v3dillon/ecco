@@ -44,41 +44,9 @@ fn validate_origin(value: &str, secure: bool) -> Result<String, String> {
     Ok(value.trim_end_matches('/').into())
 }
 
-#[derive(Default, Deserialize)]
-pub struct Services {
-    pub registration_url: Option<String>,
-    pub reporting_url: Option<String>,
-}
-impl Services {
-    fn decode(value: serde_json::Value) -> Result<Self, String> {
-        let mut services: Self =
-            serde_json::from_value(value).map_err(|_| "invalid relay service metadata")?;
-        services.registration_url = services
-            .registration_url
-            .as_deref()
-            .map(origin)
-            .transpose()?;
-        services.reporting_url = services
-            .reporting_url
-            .as_deref()
-            .filter(|url| !url.is_empty())
-            .and_then(|url| crate::reporting::validate_endpoint(url).ok());
-        Ok(services)
-    }
-}
-/// Optional deployment metadata. Relays without it retain ordinary registration.
-pub fn discover(relay: &str) -> Result<Services, String> {
-    let mut services = metadata(relay)?;
-    if services.reporting_url.is_none() {
-        if let Some(origin) = &services.registration_url {
-            if let Ok(extra) = metadata(origin) {
-                services.reporting_url = extra.reporting_url;
-            }
-        }
-    }
-    Ok(services)
-}
-fn metadata(relay: &str) -> Result<Services, String> {
+/// Optional deployment metadata, not part of the signed messaging protocol.
+/// Relays without this extension keep ordinary key-based registration.
+pub fn discover(relay: &str) -> Result<Option<String>, String> {
     let relay = validate_origin(relay, false)?;
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
@@ -86,12 +54,20 @@ fn metadata(relay: &str) -> Result<Services, String> {
         .build();
     let response = match agent.get(&format!("{relay}/.well-known/ecco")).call() {
         Ok(r) => r,
-        Err(ureq::Error::Status(404 | 401, _)) => return Ok(Services::default()),
-        Err(e) => return Err(format!("could not discover relay services: {e}")),
+        Err(ureq::Error::Status(404 | 401, _)) => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "could not discover relay registration service: {e}"
+            ))
+        }
     };
-    let metadata = serde_json::from_reader(response.into_reader())
-        .map_err(|_| "invalid relay service metadata")?;
-    Services::decode(metadata)
+    let metadata: serde_json::Value = serde_json::from_reader(response.into_reader())
+        .map_err(|_| "invalid relay registration metadata")?;
+    match metadata.get("registration_url") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(url)) => origin(url).map(Some),
+        _ => Err("invalid relay registration URL".into()),
+    }
 }
 
 #[derive(Serialize)]
@@ -234,79 +210,6 @@ pub fn transfer(id: &Identity, to: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn discovers_a_service_defined_reporting_path_through_an_existing_relay() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let origin = format!("http://{}", server.server_addr());
-        let response_origin = origin.clone();
-        let worker = std::thread::spawn(move || {
-            for body in [
-                serde_json::json!({"registration_url":response_origin}),
-                serde_json::json!({"reporting_url":format!("{response_origin}/custom/events")}),
-            ] {
-                let request = server
-                    .recv_timeout(Duration::from_secs(5))
-                    .unwrap()
-                    .expect("discovery request");
-                assert_eq!(request.url(), "/.well-known/ecco");
-                request
-                    .respond(tiny_http::Response::from_string(body.to_string()))
-                    .unwrap();
-            }
-        });
-        let services = discover(&origin).unwrap();
-        assert_eq!(services.registration_url.as_deref(), Some(origin.as_str()));
-        assert_eq!(
-            services.reporting_url,
-            Some(format!("{origin}/custom/events"))
-        );
-        worker.join().unwrap();
-        let empty = Services::decode(serde_json::json!({})).unwrap();
-        assert!(empty.registration_url.is_none() && empty.reporting_url.is_none());
-        let mixed = Services::decode(serde_json::json!({
-            "registration_url":"https://dash.test",
-            "reporting_url":"http://remote.test/events"
-        }))
-        .unwrap();
-        assert_eq!(mixed.registration_url.as_deref(), Some("https://dash.test"));
-        assert!(mixed.reporting_url.is_none());
-        for url in [
-            "",
-            "http://remote.test/events",
-            "https://user:secret@service.test/events",
-            "https://service.test/events?token=secret",
-            "https://service.test/events#fragment",
-        ] {
-            let decoded = Services::decode(serde_json::json!({"reporting_url":url})).unwrap();
-            assert!(decoded.reporting_url.is_none(), "{url}");
-        }
-    }
-    #[test]
-    fn reporting_discovery_failures_do_not_block_registration() {
-        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
-        let origin = format!("http://{}", server.server_addr());
-        let response_origin = origin.clone();
-        let worker = std::thread::spawn(move || {
-            let request = server
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .expect("relay discovery");
-            request
-                .respond(tiny_http::Response::from_string(
-                    serde_json::json!({"registration_url":response_origin}).to_string(),
-                ))
-                .unwrap();
-            let request = server
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap()
-                .expect("registration-origin discovery");
-            request.respond(tiny_http::Response::empty(500)).unwrap();
-        });
-        let services = discover(&origin).unwrap();
-        assert_eq!(services.registration_url.as_deref(), Some(origin.as_str()));
-        assert!(services.reporting_url.is_none());
-        worker.join().unwrap();
-    }
     #[test]
     fn accepts_only_safe_origins_and_names() {
         for name in ["alice", "agent-1", &"a".repeat(31)] {

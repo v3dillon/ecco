@@ -1,1 +1,0 @@
-{"envelope":{"about":"topic","encrypted":false,"from":"alice@relay.test","id":"b3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","kind":"note","text":"hello","to":["bob@relay.test"]},"observer":"alice@relay.test","receipt":{"gseq":10,"received_at":1789413000,"tseq":1},"schema":"ecco-activity-v1","type":"message"}
