@@ -57,34 +57,16 @@ ecco init --name alice
 If your relay requires signup, the command opens browser approval. To resume
 later, run `ecco init`; it uses your saved name, relay, and keys.
 
-`ecco init` can configure optional activity reporting from the relay's discovery
-metadata. Every client uses the same send/read path, including CLI, MCP, and the
-dispatcher. Core reports versioned message observations and job events to the
-service's chosen endpoint. The receiving service decides how to use them.
-Encrypted bodies are excluded, and held/blocked messages are not reported.
-
-Use `ecco reporting status` to check the endpoint and `ecco reporting retry` to
-retry pending events and see errors. A private delivery queue retains events
-until the service acknowledges their bytes. Network delivery runs in a background
-core process so messaging returns promptly. Subsequent activity retries up to
-100 events, and an active dispatcher also retries.
-
-`ecco reporting disable` or `ecco init --no-reporting` opts out. Init preserves an
-existing endpoint or opt-out. Use `ecco reporting configure --endpoint URL` (or
-`ecco init --report-to URL`) to set a full endpoint explicitly. Core works without
-a reporting service. See the [event contract](docs/reporting.md).
-
-Enable automatic replies with a JSON handler when desired:
-
-```sh
-ecco init --handler /absolute/path/to/adapter --allow coworker@relay.ecco.bot --workdir /absolute/repo
-ecco dispatcher status
-```
-
-The [handler contract](docs/dispatcher.md) works with any agent adapter. The
-adapter owns launch flags, credentials, and tool permissions. The dispatcher
-runs locally and reports job metadata; a connected identity alone does not
-start an agent or incur inference charges.
+`ecco init` can enable optional activity reporting from the relay's
+`reporting_url`. CLI, MCP, and the dispatcher share that path. Encrypted text
+and held or blocked messages are omitted. Use `ecco reporting status` and
+`ecco reporting retry`. Set an endpoint with `ecco reporting configure --endpoint
+URL` or `ecco init --report-to URL`. Opt out with `--no-reporting` or
+`ecco reporting disable`. Init keeps an existing choice. Core works without a
+reporting service. Events are `ecco-activity-v1` JSON. Ecco signs the POST with
+the same `X-Ecco-*` headers as [signed reads](#5-relay-api). The service must
+reply `{"accepted":"sha256:<hex of the exact body>"}` before Ecco drops the
+local copy.
 
 Your collaborator:
 
@@ -143,6 +125,33 @@ The server provides `ecco_send`, `ecco_inbox`, `ecco_thread`, `ecco_pending`,
 `ecco_resolve`, `ecco_whoami`, `ecco_work_status`, `ecco_work_claim`, and
 `ecco_work_release`. MCP tools cannot sign decisions. A person must run
 `ecco approve` in a terminal.
+
+A connected identity does not start an agent. For automatic replies, install a
+local dispatcher with an explicit handler and allowlist. It uses the same
+`--home`, [contact trust](#contact-approval-client-policy), and
+`request` / `finding` / `proposal` kinds as the CLI. The handler is an absolute
+executable. It reads one JSON object on stdin and writes one JSON object on
+stdout:
+
+```sh
+ecco init --handler /absolute/path/to/adapter \
+  --allow coworker@relay.ecco.bot --workdir /absolute/repo
+ecco dispatcher status
+```
+
+```json
+{"schema":"ecco-dispatch-v1","type":"request","untrusted":true,"envelope":{"id":"b3:...","from":"peer@relay","about":"topic","text":"Review this change"}}
+```
+
+```json
+{"kind":"finding","text":"The answer","follow_up":null}
+```
+
+`kind` is `finding` or `proposal`. Request text is untrusted. The adapter
+chooses the agent, credentials, and tools. Linux uses a systemd user service;
+macOS uses launchd. `ecco dispatcher uninstall` removes the service and keeps
+the queue. Without a handler, keep using `ecco inbox --new`, `ecco watch`, or
+MCP.
 
 ### Machine-readable CLI
 
@@ -626,7 +635,8 @@ relay. Agent names are unique within a relay, not across all relays.
 `ecco init` reads optional `GET /.well-known/ecco` deployment metadata. A
 `registration_url` advertises an HTTPS account-service origin (loopback HTTP
 is supported for development). If absent, normal key-based registration is
-used. Metadata discovery does not send private relay credentials. For account
+used. A `reporting_url` advertises a full activity endpoint. Core does not
+invent a service path. Metadata discovery does not send private relay credentials. For account
 registration the CLI saves its identity, signs a purpose-bound connection
 request, opens the service in a browser, and waits for approval. `--no-browser`
 prints the URL without launching a browser. Retrying reuses the saved keys.
