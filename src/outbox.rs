@@ -10,42 +10,17 @@ use std::time::{Duration, Instant};
 use crate::envelope::Envelope;
 
 const RETENTION_SECONDS: u64 = 7 * 24 * 60 * 60;
-const MAX_KEY_BYTES: usize = 128;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// Bumped when the table changes. Keys never match across versions, so an
+/// older table is dropped rather than migrated.
+const SCHEMA_VERSION: i64 = 1;
 
-pub(crate) fn validate_key(key: &str) -> Result<(), String> {
-    if key.is_empty() || key.len() > MAX_KEY_BYTES {
-        return Err(format!(
-            "idempotency key must contain 1 to {MAX_KEY_BYTES} bytes"
-        ));
-    }
-    if !key
-        .bytes()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b':'))
-    {
-        return Err(
-            "idempotency key can contain only ASCII letters, digits, '-', '_', '.', and ':'".into(),
-        );
-    }
-    Ok(())
-}
-
-pub(crate) fn parse_key(key: &str) -> Result<String, String> {
-    validate_key(key)?;
-    Ok(key.to_owned())
-}
-
-pub(crate) fn reserve<F>(
-    home: &Path,
-    key: &str,
-    input_hash: &str,
-    build: F,
-) -> Result<Envelope, String>
+/// The envelope saved under `key`, or the one `build` makes, saved first.
+pub(crate) fn reserve<F>(home: &Path, key: &str, build: F) -> Result<Envelope, String>
 where
     F: FnOnce() -> Result<Envelope, String>,
 {
-    validate_key(key)?;
     std::fs::create_dir_all(home).map_err(|e| e.to_string())?;
     let path = home.join("outbox.sqlite3");
     let deadline = Instant::now() + LOCK_TIMEOUT;
@@ -55,15 +30,6 @@ where
             db.busy_timeout(LOCK_TIMEOUT).map_err(|e| e.to_string())?;
             db.pragma_update(None, "journal_mode", "WAL")
                 .map_err(|e| e.to_string())?;
-            db.execute_batch(
-                "CREATE TABLE IF NOT EXISTS sends (
-           key TEXT PRIMARY KEY,
-           input_hash TEXT NOT NULL,
-           envelope TEXT NOT NULL,
-           created_at INTEGER NOT NULL
-         );",
-            )
-            .map_err(|e| e.to_string())?;
             Ok::<_, String>(db)
         })();
         match result {
@@ -78,34 +44,49 @@ where
     let tx = db
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
+    let version: i64 = tx
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version != SCHEMA_VERSION {
+        tx.execute_batch(&format!(
+            "DROP TABLE IF EXISTS sends;
+             CREATE TABLE sends (
+               key TEXT PRIMARY KEY,
+               envelope TEXT NOT NULL,
+               created_at INTEGER NOT NULL
+             );
+             PRAGMA user_version = {SCHEMA_VERSION};"
+        ))
+        .map_err(|e| e.to_string())?;
+    }
     let now = crate::envelope::now();
     tx.execute(
         "DELETE FROM sends WHERE created_at < ?1",
         params![now.saturating_sub(RETENTION_SECONDS) as i64],
     )
     .map_err(|e| e.to_string())?;
-    let found: Option<(String, String)> = tx
+    let saved: Option<String> = tx
         .query_row(
-            "SELECT input_hash, envelope FROM sends WHERE key = ?1",
+            "SELECT envelope FROM sends WHERE key = ?1",
             params![key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    let envelope = if let Some((saved_hash, raw)) = found {
-        if saved_hash != input_hash {
-            return Err("idempotency key was already used with different send input".into());
+    let envelope = match saved {
+        Some(raw) => {
+            serde_json::from_str(&raw).map_err(|e| format!("invalid saved outbox envelope: {e}"))?
         }
-        serde_json::from_str(&raw).map_err(|e| format!("invalid saved outbox envelope: {e}"))?
-    } else {
-        let envelope = build()?;
-        let raw = serde_json::to_string(&envelope).map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO sends(key,input_hash,envelope,created_at) VALUES(?1,?2,?3,?4)",
-            params![key, input_hash, raw, now as i64],
-        )
-        .map_err(|e| e.to_string())?;
-        envelope
+        None => {
+            let envelope = build()?;
+            let raw = serde_json::to_string(&envelope).map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO sends(key,envelope,created_at) VALUES(?1,?2,?3)",
+                params![key, raw, now as i64],
+            )
+            .map_err(|e| e.to_string())?;
+            envelope
+        }
     };
     tx.commit().map_err(|e| e.to_string())?;
     Ok(envelope)
@@ -140,20 +121,41 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_keys_and_mismatched_reuse() {
-        assert!(validate_key("").is_err());
-        assert!(validate_key("has space").is_err());
-        assert!(validate_key(&"x".repeat(129)).is_err());
+    fn a_retry_reuses_the_saved_envelope() {
         let home = temp_home();
-        let first = reserve(&home, "dispatch:1", "one", || Ok(envelope())).unwrap();
-        let retry = reserve(&home, "dispatch:1", "one", || {
+        let first = reserve(&home, "one", || Ok(envelope())).unwrap();
+        let retry = reserve(&home, "one", || {
             Err("retry must not rebuild the envelope".into())
         })
         .unwrap();
         assert_eq!(first.id, retry.id);
-        assert!(reserve(&home, "dispatch:1", "two", || Ok(envelope()))
-            .unwrap_err()
-            .contains("different send input"));
+        let other = reserve(&home, "two", || Ok(envelope())).unwrap();
+        assert_ne!(first.id, other.id);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn an_older_table_is_replaced() {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).unwrap();
+        Connection::open(home.join("outbox.sqlite3"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE sends (
+                   key TEXT PRIMARY KEY,
+                   input_hash TEXT NOT NULL,
+                   envelope TEXT NOT NULL,
+                   created_at INTEGER NOT NULL
+                 );
+                 INSERT INTO sends VALUES ('old', 'hash', 'not an envelope', strftime('%s', 'now'));",
+            )
+            .unwrap();
+        let first = reserve(&home, "old", || Ok(envelope())).unwrap();
+        let retry = reserve(&home, "old", || {
+            Err("retry must not rebuild the envelope".into())
+        })
+        .unwrap();
+        assert_eq!(first.id, retry.id);
         let _ = std::fs::remove_dir_all(home);
     }
 
@@ -167,7 +169,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
-                reserve(&home, "dispatch:2", "same", || Ok(envelope())).unwrap()
+                reserve(&home, "same", || Ok(envelope())).unwrap()
             }));
         }
         let first = threads.remove(0).join().unwrap();

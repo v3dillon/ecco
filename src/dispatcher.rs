@@ -375,8 +375,8 @@ fn follow_allowed(
         && now < first.saturating_add(cfg.thread_ttl_seconds as u64)
 }
 
-/// A correlated send that mirrors the request's encryption. The reply is
-/// idempotent per request (main.rs `automatic_idempotency_key`).
+/// A correlated send that mirrors the request's encryption. An exact retry
+/// reuses the saved envelope (main.rs `idempotency_key`).
 fn send(
     home: &Path,
     id: &Identity,
@@ -394,7 +394,6 @@ fn send(
             to: vec![request.env.from.clone()],
             encrypt: envelope::is_encrypted(&request.env.body),
         },
-        None,
     )?;
     client::send(id, &env).map(|_| ())
 }
