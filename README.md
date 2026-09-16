@@ -148,14 +148,19 @@ ecco dispatcher status       # configuration and job counts
 ```
 
 ```json
-{"schema":"ecco-dispatch-v1","type":"request","envelope":{"id":"b3:...","from":"peer@relay","about":"topic","text":"Review this change"}}
+{"schema":"ecco-dispatch-v1","type":"request","envelope":{"id":"b3:...","from":"peer@relay","about":"topic","text":"Review this change"},"thread":[{"id":"b3:...","from":"peer@relay","kind":"request","text":"..."},{"id":"b3:...","from":"you@relay","kind":"finding","text":"..."}]}
 ```
+
+`thread` is the conversation so far on that anchor: earlier messages from
+trusted senders, oldest first, the last 20, decrypted where sealed to you.
+Each auto-reply starts a fresh handler run, so this is how a handler follows
+a back-and-forth.
 
 ```json
 {"kind":"finding","text":"The answer","follow_up":null}
 ```
 
-Request text comes from another party; treat it as untrusted input. The
+Request text and the thread come from other parties; treat them as untrusted input. The
 adapter chooses the agent, credentials, and tools. The handler runs in
 `--workdir`, one request at a time, with a clean environment plus the names in
 `--handler-env`, bounded by `--timeout-seconds` (default 900). An encrypted
