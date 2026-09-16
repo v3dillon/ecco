@@ -116,21 +116,33 @@ pub fn thread(id: &Identity, about: &str, since: u64, wait: u64) -> Result<Vec<S
         "/threads?about={}&since={since}&wait={wait}",
         urlencode(about)
     );
-    fetch(id, &path, wait)
+    Ok(take_verified(fetch(id, &path, wait)?))
 }
 
-pub fn inbox(id: &Identity, since: u64, wait: u64) -> Result<Vec<Stored>, String> {
+/// Messages plus the batch high-water mark. The mark is taken before dropping
+/// unverified envelopes so a forged message cannot stall the cursor.
+pub fn inbox(id: &Identity, since: u64, wait: u64) -> Result<(Vec<Stored>, u64), String> {
     let path = format!(
         "/inbox?addr={}&since={since}&wait={wait}",
         urlencode(&id.addr())
     );
-    fetch(id, &path, wait)
+    let raw = fetch(id, &path, wait)?;
+    let until = crate::agent_surface::next_cursor(since, &raw);
+    Ok((take_verified(raw), until))
 }
 
 fn fetch(id: &Identity, path: &str, wait: u64) -> Result<Vec<Stored>, String> {
     let raw = get_signed(id, path, wait.saturating_add(10))?;
     let resp: MsgsResponse = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
     Ok(resp.msgs)
+}
+
+/// The one place relay output is verified (README §2 steps 1–2). Everything
+/// downstream sees verified envelopes only.
+fn take_verified(msgs: Vec<Stored>) -> Vec<Stored> {
+    msgs.into_iter()
+        .filter(|stored| stored.env.verify().is_ok())
+        .collect()
 }
 
 fn post(url: &str, token: Option<&str>, body: &str) -> Result<String, String> {
@@ -155,15 +167,14 @@ fn get_signed(id: &Identity, path: &str, timeout_secs: u64) -> Result<String, St
         req = req.set("authorization", &format!("Bearer {t}"));
     }
     let ts = envelope::now();
-    let sig = id.agent_key().sign(&request_signing_bytes("GET", path, ts));
+    let sig = id
+        .agent_key()
+        .sign(&request_signing_bytes("GET", path, ts, None));
     req = req
         .set("x-ecco-addr", &id.addr())
         .set("x-ecco-key", &encode_key(&id.agent_key().verifying_key()))
         .set("x-ecco-ts", &ts.to_string())
-        .set(
-            "x-ecco-sig",
-            &format!("ed25519:{}", hex::encode(sig.to_bytes())),
-        );
+        .set("x-ecco-sig", &envelope::encode_sig(&sig));
     req.call()
         .map_err(describe)?
         .into_string()
@@ -237,5 +248,39 @@ mod tests {
             &sender,
         );
         assert!(receipt.verify(&other).is_err());
+    }
+
+    #[test]
+    fn unverified_envelopes_are_dropped_without_failing_the_batch() {
+        let sender = SigningKey::generate(&mut OsRng);
+        let valid = Envelope::seal(
+            "topic".into(),
+            json!({"text":"ok"}),
+            "a@x".into(),
+            "note".into(),
+            vec![],
+            vec![],
+            1,
+            &sender,
+        );
+        let mut invalid = valid.clone();
+        invalid.body = json!({"text":"forged"});
+        let msgs = take_verified(vec![
+            Stored {
+                gseq: 1,
+                tseq: 1,
+                received_at: 1,
+                env: valid,
+            },
+            Stored {
+                gseq: 2,
+                tseq: 2,
+                received_at: 1,
+                env: invalid,
+            },
+        ]);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].gseq, 1);
+        assert_eq!(msgs[0].env.body["text"], "ok");
     }
 }

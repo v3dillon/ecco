@@ -109,10 +109,10 @@ impl Envelope {
             sig: String::new(),
             to,
             ts,
-            v: 0,
+            v: crate::wire::ENVELOPE_V,
         };
         let sig: Signature = signing_key.sign(&env.signing_bytes());
-        env.sig = format!("ed25519:{}", hex::encode(sig.to_bytes()));
+        env.sig = encode_sig(&sig);
         env.id = env.computed_id();
         env
     }
@@ -140,6 +140,10 @@ impl Envelope {
 
 pub fn encode_key(key: &VerifyingKey) -> String {
     format!("ed25519:{}", hex::encode(key.to_bytes()))
+}
+
+pub fn encode_sig(sig: &Signature) -> String {
+    format!("ed25519:{}", hex::encode(sig.to_bytes()))
 }
 
 pub fn decode_key(s: &str) -> Result<VerifyingKey, String> {

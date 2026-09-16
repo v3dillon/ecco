@@ -20,6 +20,11 @@ const POLL_STEP: Duration = Duration::from_millis(300);
 const MAX_BODY_BYTES: u64 = 64 * 1024;
 const MSGS_PER_MIN_PER_SENDER: u32 = 120;
 const REGISTRATIONS_PER_MIN_PER_IP: u32 = 10;
+/// Reporting (deployment, not protocol): each stored envelope is POSTed once
+/// to the operator's `ECCO_REPORTING_URL`, signed by the relay key.
+const REPORT_BATCH: usize = 100;
+const REPORT_IDLE: Duration = Duration::from_secs(2);
+const REPORT_MAX_BACKOFF_SECS: u64 = 3600;
 
 #[derive(Serialize)]
 struct Receipt<'a> {
@@ -67,6 +72,7 @@ pub struct Relay {
     token: Option<String>,
     registration_token: Option<String>,
     registration_url: Option<String>,
+    reporting_url: Option<String>,
     signed: bool,
     authority: String,
     allow_roots: bool,
@@ -143,6 +149,10 @@ pub fn run(
         token,
         registration_token,
         registration_url,
+        reporting_url: match std::env::var("ECCO_REPORTING_URL") {
+            Ok(value) if !value.trim().is_empty() => Some(reporting_url(&value)?),
+            _ => None,
+        },
         signed,
         authority,
         allow_roots,
@@ -165,6 +175,14 @@ pub fn run(
         let relay = relay.clone();
         std::thread::spawn(move || sweeper(relay, retention));
     }
+    if relay.reporting_url.is_some() {
+        let relay = relay.clone();
+        std::thread::spawn(move || loop {
+            if !report_pass(&relay, envelope::now()) {
+                std::thread::sleep(REPORT_IDLE);
+            }
+        });
+    }
     let mut workers = Vec::new();
     for _ in 0..16 {
         let server = server.clone();
@@ -182,6 +200,17 @@ pub fn run(
 }
 
 impl Relay {
+    /// Deployment metadata: the registration service, if any, and the key
+    /// this relay signs receipts and reports with, so a service can check
+    /// that a report naming this authority came from it.
+    fn well_known(&self) -> String {
+        serde_json::json!({
+            "registration_url": self.registration_url,
+            "relay_key": encode_key(&self.key.verifying_key()),
+        })
+        .to_string()
+    }
+
     fn handle(&self, mut req: tiny_http::Request) {
         let url = req.url().to_string();
         let (path, query) = match url.split_once('?') {
@@ -248,9 +277,7 @@ impl Relay {
                     self.post_registration(&body, authorization.as_deref(), true)
                 }
                 ("POST", "/addr/transfer") => self.post_name_transfer(&body),
-                ("GET", "/.well-known/ecco") => {
-                    Ok(serde_json::json!({"registration_url": self.registration_url}).to_string())
-                }
+                ("GET", "/.well-known/ecco") => Ok(self.well_known()),
                 ("GET", p) if p.starts_with("/addr/") => self.get_addr(&p["/addr/".len()..]),
                 ("POST", "/msgs") => self.post_msgs(&body),
                 ("GET", "/threads") => self
@@ -340,7 +367,7 @@ impl Relay {
         }
         if let Some(profile) = &request.profile {
             profile.verify().map_err(|e| (400, e))?;
-            if profile.v != 0 || profile.name != request.name {
+            if profile.v != crate::wire::PROFILE_V || profile.name != request.name {
                 return Err((400, "profile does not match registration".into()));
             }
             for delegation in &profile.delegations {
@@ -424,8 +451,12 @@ impl Relay {
             .try_into()
             .map_err(|_| (400, "invalid transfer signature".into()))?;
         let message = format!(
-            "ecco-transfer-v1\n{}@{}\n{}\n{}",
-            t.name, self.authority, t.to, t.ts
+            "{}\n{}@{}\n{}\n{}",
+            crate::wire::TRANSFER,
+            t.name,
+            self.authority,
+            t.to,
+            t.ts
         );
         key.verify(
             message.as_bytes(),
@@ -477,7 +508,7 @@ impl Relay {
                 ),
             ));
         }
-        let stored = self.store.append(env, now)?;
+        let stored = self.store.append(env, now, self.reporting_url.is_some())?;
 
         let relay_key = encode_key(&self.key.verifying_key());
         let signing = serde_json::to_vec(&ReceiptSigningView {
@@ -494,10 +525,46 @@ impl Relay {
             id: &stored.env.id,
             received_at: stored.received_at,
             relay: &relay_key,
-            sig: format!("ed25519:{}", hex::encode(sig.to_bytes())),
+            sig: envelope::encode_sig(&sig),
             tseq: stored.tseq,
         };
         Ok(serde_json::to_string(&receipt).unwrap())
+    }
+
+    /// One signed POST of a stored envelope. The endpoint acknowledges by
+    /// echoing the body digest; anything else keeps the envelope queued.
+    fn report(&self, url: &str, stored: &Stored) -> Result<(), String> {
+        let path = url::Url::parse(url).map_err(|e| e.to_string())?;
+        let body = serde_json::json!({
+            "schema": crate::wire::ACTIVITY,
+            "relay": self.authority,
+            "msg": stored,
+        })
+        .to_string();
+        let ts = envelope::now();
+        let sig = self.key.sign(&crate::identity::request_signing_bytes(
+            "POST",
+            path.path(),
+            ts,
+            Some(body.as_bytes()),
+        ));
+        let response = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout(Duration::from_secs(10))
+            .build()
+            .post(url)
+            .set("content-type", "application/json")
+            .set("x-ecco-key", &encode_key(&self.key.verifying_key()))
+            .set("x-ecco-ts", &ts.to_string())
+            .set("x-ecco-sig", &envelope::encode_sig(&sig))
+            .send_string(&body)
+            .map_err(|e| e.to_string())?;
+        let ack: serde_json::Value =
+            serde_json::from_reader(response.into_reader()).map_err(|e| e.to_string())?;
+        if ack["accepted"].as_str() != Some(&crate::identity::body_digest(body.as_bytes())) {
+            return Err("endpoint did not acknowledge the body digest".into());
+        }
+        Ok(())
     }
 
     /// `name` from `name@authority` when the authority is this relay.
@@ -559,7 +626,7 @@ impl Relay {
             .try_into()
             .map_err(|_| (401, "bad signature length".into()))?;
         vk.verify(
-            &crate::identity::request_signing_bytes("GET", path_query, ts),
+            &crate::identity::request_signing_bytes("GET", path_query, ts, None),
             &ed25519_dalek::Signature::from_bytes(&sig_bytes),
         )
         .map_err(|_| (401, "bad request signature".into()))?;
@@ -609,6 +676,52 @@ impl Relay {
             std::thread::sleep(POLL_STEP);
         }
     }
+}
+
+/// HTTPS, or loopback HTTP for development; no credentials, query, or fragment.
+fn reporting_url(value: &str) -> Result<String, String> {
+    let url = url::Url::parse(value).map_err(|_| "ECCO_REPORTING_URL is not a URL")?;
+    crate::registration::origin(&url.origin().ascii_serialization())?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err("ECCO_REPORTING_URL cannot contain credentials, query, or fragment".into());
+    }
+    Ok(url.to_string())
+}
+
+/// Deliver due envelopes oldest first. Returns whether a full batch was
+/// taken, so the caller polls again without sleeping. A failed delivery backs
+/// off per envelope: 2, 4, 8 ... seconds, capped at an hour.
+fn report_pass(relay: &Relay, now: u64) -> bool {
+    let Some(url) = &relay.reporting_url else {
+        return false;
+    };
+    let due = match relay.store.reports_due(now, REPORT_BATCH) {
+        Ok(due) => due,
+        Err((_, e)) => {
+            eprintln!("relay: reporting queue: {e}");
+            return false;
+        }
+    };
+    let full = due.len() == REPORT_BATCH;
+    for (stored, attempts) in due {
+        let outcome = match relay.report(url, &stored) {
+            Ok(()) => relay.store.report_done(stored.gseq),
+            Err(e) => {
+                eprintln!("relay: report of {} retained: {e}", stored.env.id);
+                let attempts = attempts + 1;
+                let delay = (1u64 << attempts.min(12)).min(REPORT_MAX_BACKOFF_SECS);
+                relay.store.report_retry(stored.gseq, attempts, now + delay)
+            }
+        };
+        if let Err((_, e)) = outcome {
+            eprintln!("relay: reporting queue: {e}");
+        }
+    }
+    full
 }
 
 fn describe_retention(r: &Retention) -> String {
@@ -834,7 +947,8 @@ mod tests {
         r.store.register(old.profile()).unwrap();
         let ts = envelope::now();
         let message = format!(
-            "ecco-transfer-v1\n{}\n{}\n{ts}",
+            "{}\n{}\n{}\n{ts}",
+            crate::wire::TRANSFER,
             old.addr(),
             new.profile().root
         );
@@ -991,6 +1105,7 @@ mod tests {
             token: None,
             registration_token: None,
             registration_url: None,
+            reporting_url: None,
             signed: true,
             authority: "localhost:4200".into(),
             allow_roots: false,
@@ -999,6 +1114,116 @@ mod tests {
                 buckets: Mutex::new(HashMap::new()),
             },
         }
+    }
+
+    #[test]
+    fn stored_envelopes_are_reported_once_with_a_relay_signature_and_an_ack() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/collector", server.server_addr());
+        let mut r = relay();
+        r.reporting_url = Some(reporting_url(&url).unwrap());
+        let relay_key = r.key.verifying_key();
+        // The service verifies reports against the key the relay publishes.
+        let published: serde_json::Value = serde_json::from_str(&r.well_known()).unwrap();
+        assert_eq!(published["relay_key"], encode_key(&relay_key));
+        assert!(published["registration_url"].is_null());
+        let alice = Identity::generate("alice", "http://localhost:4200", None);
+        let bob = Identity::generate("bob", "http://localhost:4200", None);
+        r.store.register(alice.profile()).unwrap();
+        r.store.register(bob.profile()).unwrap();
+        let collector = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for reply in ["503", "wrong", "ack"] {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .expect("report");
+                let header = |name: &str| {
+                    request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+                        .map(|h| h.value.as_str().to_string())
+                        .unwrap()
+                };
+                assert_eq!(request.url(), "/collector");
+                assert_eq!(header("x-ecco-key"), encode_key(&relay_key));
+                let ts: u64 = header("x-ecco-ts").parse().unwrap();
+                let sig: [u8; 64] = envelope::decode_prefixed(&header("x-ecco-sig"), "ed25519:")
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let mut body = String::new();
+                std::io::Read::read_to_string(request.as_reader(), &mut body).unwrap();
+                relay_key
+                    .verify(
+                        &crate::identity::request_signing_bytes(
+                            "POST",
+                            "/collector",
+                            ts,
+                            Some(body.as_bytes()),
+                        ),
+                        &ed25519_dalek::Signature::from_bytes(&sig),
+                    )
+                    .unwrap();
+                let event: serde_json::Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(event["schema"], crate::wire::ACTIVITY);
+                assert_eq!(event["relay"], "localhost:4200");
+                seen.push(event["msg"]["env"]["id"].as_str().unwrap().to_string());
+                let (code, text) = match reply {
+                    "503" => (503, "{}".to_string()),
+                    "wrong" => (200, json!({"accepted":"b3:wrong"}).to_string()),
+                    _ => (
+                        200,
+                        json!({"accepted": crate::identity::body_digest(body.as_bytes())})
+                            .to_string(),
+                    ),
+                };
+                request
+                    .respond(tiny_http::Response::from_string(text).with_status_code(code))
+                    .unwrap();
+            }
+            assert!(server
+                .recv_timeout(Duration::from_millis(300))
+                .unwrap()
+                .is_none());
+            seen
+        });
+        let env = Envelope::seal(
+            "reported".into(),
+            json!({"text":"hello"}),
+            alice.addr(),
+            "note".into(),
+            vec![],
+            vec![bob.addr()],
+            envelope::now(),
+            &alice.agent_key(),
+        );
+        let body = serde_json::to_string(&env).unwrap();
+        r.post_msgs(&body).unwrap();
+        r.post_msgs(&body).unwrap(); // idempotent resubmission: still one queued report
+        let id = env.id.clone();
+        assert_eq!(r.store.reports_due(envelope::now(), 10).unwrap().len(), 1);
+        let now = envelope::now();
+        assert!(!report_pass(&r, now)); // 503: retained, backs off 2s
+        assert!(r.store.reports_due(now, 10).unwrap().is_empty());
+        assert!(!report_pass(&r, now + 2)); // wrong digest: retained, backs off 4s
+        assert!(!report_pass(&r, now + 6)); // acknowledged
+        assert!(r.store.reports_due(now + 3600, 10).unwrap().is_empty());
+        assert_eq!(collector.join().unwrap(), vec![id.clone(), id.clone(), id]);
+        for bad in [
+            "http://remote.test/events",
+            "https://user:pw@service.test/events",
+            "https://service.test/events?token=x",
+            "https://service.test/events#f",
+            "not a url",
+        ] {
+            assert!(reporting_url(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            reporting_url("https://service.test/events").unwrap(),
+            "https://service.test/events"
+        );
     }
 
     fn post(
@@ -1067,18 +1292,15 @@ mod tests {
     fn signed_get(port: u16, path: &str, id: &Identity) -> u16 {
         use ed25519_dalek::Signer;
         let ts = envelope::now();
-        let sig = id
-            .agent_key()
-            .sign(&crate::identity::request_signing_bytes("GET", path, ts));
+        let sig = id.agent_key().sign(&crate::identity::request_signing_bytes(
+            "GET", path, ts, None,
+        ));
         match ureq::get(&format!("http://127.0.0.1:{port}{path}"))
             .timeout(Duration::from_secs(2))
             .set("x-ecco-addr", &id.addr())
             .set("x-ecco-key", &encode_key(&id.agent_key().verifying_key()))
             .set("x-ecco-ts", &ts.to_string())
-            .set(
-                "x-ecco-sig",
-                &format!("ed25519:{}", hex::encode(sig.to_bytes())),
-            )
+            .set("x-ecco-sig", &envelope::encode_sig(&sig))
             .call()
         {
             Ok(resp) => resp.status(),

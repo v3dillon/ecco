@@ -16,7 +16,7 @@ pub fn valid_name(name: &str) -> bool {
         && name.as_bytes()[0] != b'-'
 }
 
-fn origin(value: &str) -> Result<String, String> {
+pub(crate) fn origin(value: &str) -> Result<String, String> {
     validate_origin(value, true)
 }
 
@@ -86,7 +86,8 @@ fn request(id: &Identity) -> ConnectionRequest {
     let ts = envelope::now();
     let profile = id.profile();
     let message = format!(
-        "ecco-connect-v1\n{}\n{}\n{nonce}\n{ts}\n{}",
+        "{}\n{}\n{}\n{nonce}\n{ts}\n{}",
+        crate::wire::CONNECT,
         id.addr(),
         profile.root,
         profile.sig
@@ -186,7 +187,7 @@ pub fn authorize(id: &Identity, api: &str, no_browser: bool) -> Result<(), Strin
 pub fn transfer(id: &Identity, to: &str) -> Result<(), String> {
     envelope::decode_key(to)?;
     let ts = envelope::now();
-    let message = format!("ecco-transfer-v1\n{}\n{to}\n{ts}", id.addr());
+    let message = format!("{}\n{}\n{to}\n{ts}", crate::wire::TRANSFER, id.addr());
     let sig = format!(
         "ed25519:{}",
         hex::encode(id.root_key().sign(message.as_bytes()).to_bytes())

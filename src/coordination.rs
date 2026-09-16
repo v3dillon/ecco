@@ -300,7 +300,6 @@ pub fn release(
 fn verified_thread(id: &Identity, about: &str) -> Result<Vec<Stored>, String> {
     let messages = client::thread(id, about, 0, 0)?;
     for stored in &messages {
-        stored.env.verify()?;
         if stored.env.about != about {
             return Err("relay returned an envelope from a different thread".into());
         }
