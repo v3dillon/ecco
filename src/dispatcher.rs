@@ -21,7 +21,6 @@ use std::{
 };
 mod handler;
 
-pub const DISPATCH_SCHEMA: &str = "ecco-dispatch-v1";
 const MAX_ATTEMPTS: i64 = 4;
 const MAX_REQUEST_TEXT_BYTES: usize = 64 * 1024;
 const SQLITE_SCHEMA: &str = "
@@ -359,7 +358,7 @@ fn execute(
     } else {
         let text = request_text(id, &request.env).ok_or("request has no usable text")?;
         let input = json!({
-            "schema": DISPATCH_SCHEMA,
+            "schema": crate::wire::DISPATCH,
             "type": "request",
             "envelope": {
                 "id": request.env.id,

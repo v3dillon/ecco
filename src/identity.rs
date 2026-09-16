@@ -279,7 +279,7 @@ impl Identity {
             name: self.name.clone(),
             root: encode_key(&root.verifying_key()),
             sig: String::new(),
-            v: 0,
+            v: crate::wire::PROFILE_V,
         };
         let sig = root.sign(&profile.signing_bytes());
         profile.sig = envelope::encode_sig(&sig);
@@ -379,12 +379,15 @@ pub fn standing(contacts: &Contacts, self_addr: &str, from: &str) -> Standing {
     }
 }
 
-pub fn default_home() -> PathBuf {
-    if let Ok(h) = std::env::var("ECCO_HOME") {
-        return PathBuf::from(h);
+/// `ECCO_HOME`, else `~/.ecco`. With neither set, a command that needs an
+/// identity says so rather than guessing a directory.
+pub fn default_home() -> Result<PathBuf, String> {
+    if let Some(home) = std::env::var_os("ECCO_HOME") {
+        return Ok(PathBuf::from(home));
     }
-    let home = std::env::var("HOME").expect("HOME not set");
-    PathBuf::from(home).join(".ecco")
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join(".ecco"))
+        .ok_or("no identity directory: set --home, ECCO_HOME, or HOME".into())
 }
 
 #[cfg(test)]

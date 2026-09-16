@@ -10,6 +10,7 @@ mod outbox;
 mod registration;
 mod relay;
 mod store;
+mod wire;
 
 use clap::{Parser, Subcommand};
 use serde::Serialize;
@@ -20,8 +21,7 @@ use client::Stored;
 use envelope::Envelope;
 use identity::Identity;
 
-const DURABLE_CORRELATED_SEND_CAPABILITY: &str = "durable-correlated-send-v1";
-const CAPABILITIES: &[&str] = &[DURABLE_CORRELATED_SEND_CAPABILITY];
+const CAPABILITIES: &[&str] = &[wire::DURABLE_CORRELATED_SEND];
 
 #[derive(Parser)]
 #[command(
@@ -223,15 +223,45 @@ enum AdminCmd {
 
 fn main() {
     let cli = Cli::parse();
-    let home = cli.home.clone().unwrap_or_else(identity::default_home);
+    // The relay and its admin tools store under --data and never open an
+    // identity, so with --data they run without a home (containers, service
+    // units). Those arms never read the home then; the data dir stands in so
+    // nothing can resolve to the working directory. Everything else needs one.
+    let home = match cli
+        .home
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(identity::default_home)
+    {
+        Ok(home) => home,
+        Err(e) => match &cli.cmd {
+            Cmd::Relay {
+                data: Some(data), ..
+            }
+            | Cmd::Admin {
+                cmd:
+                    AdminCmd::Remove {
+                        data: Some(data), ..
+                    }
+                    | AdminCmd::Sweep {
+                        data: Some(data), ..
+                    },
+            } => data.clone(),
+            _ => fail(&e),
+        },
+    };
     if let Err(e) = run(cli.cmd, &home) {
-        if let Some(json) = coordination::claim_lost_json(&e) {
-            println!("{json}");
-            std::process::exit(2);
-        }
-        eprintln!("error: {e}");
-        std::process::exit(1);
+        fail(&e);
     }
+}
+
+fn fail(e: &str) -> ! {
+    if let Some(json) = coordination::claim_lost_json(e) {
+        println!("{json}");
+        std::process::exit(2);
+    }
+    eprintln!("error: {e}");
+    std::process::exit(1);
 }
 
 fn init_identity(
@@ -637,7 +667,7 @@ fn prepare_envelope(
 fn automatic_idempotency_key(id: &Identity, input: &SendInput) -> Option<String> {
     let in_reply_to = input.body.get("in_reply_to")?.as_str()?;
     let operation = serde_json::to_vec(&json!({
-        "schema": DURABLE_CORRELATED_SEND_CAPABILITY,
+        "schema": wire::DURABLE_CORRELATED_SEND,
         "from": id.addr(),
         "kind": &input.kind,
         "in_reply_to": in_reply_to,
@@ -771,7 +801,7 @@ fn local_status(home: &Path) -> LocalStatus {
         }
     };
     LocalStatus {
-        schema: "ecco-status-v1",
+        schema: wire::STATUS,
         capabilities: CAPABILITIES,
         ready: identity.state == "ready",
         identity,
@@ -1016,10 +1046,10 @@ mod tests {
     fn status_is_local_stable_and_redacted() {
         let home = temp_home();
         let missing = serde_json::to_value(local_status(&home)).unwrap();
-        assert_eq!(missing["schema"], "ecco-status-v1");
+        assert_eq!(missing["schema"], wire::STATUS);
         assert_eq!(
             missing["capabilities"],
-            json!([DURABLE_CORRELATED_SEND_CAPABILITY])
+            json!([wire::DURABLE_CORRELATED_SEND])
         );
         assert_eq!(missing["ready"], false);
         assert_eq!(missing["identity"]["state"], "missing");

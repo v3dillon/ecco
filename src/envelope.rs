@@ -109,7 +109,7 @@ impl Envelope {
             sig: String::new(),
             to,
             ts,
-            v: 0,
+            v: crate::wire::ENVELOPE_V,
         };
         let sig: Signature = signing_key.sign(&env.signing_bytes());
         env.sig = encode_sig(&sig);

@@ -22,7 +22,6 @@ const MSGS_PER_MIN_PER_SENDER: u32 = 120;
 const REGISTRATIONS_PER_MIN_PER_IP: u32 = 10;
 /// Reporting (deployment, not protocol): each stored envelope is POSTed once
 /// to the operator's `ECCO_REPORTING_URL`, signed by the relay key.
-pub const ACTIVITY_SCHEMA: &str = "ecco-activity-v1";
 const REPORT_BATCH: usize = 100;
 const REPORT_IDLE: Duration = Duration::from_secs(2);
 const REPORT_MAX_BACKOFF_SECS: u64 = 3600;
@@ -368,7 +367,7 @@ impl Relay {
         }
         if let Some(profile) = &request.profile {
             profile.verify().map_err(|e| (400, e))?;
-            if profile.v != 0 || profile.name != request.name {
+            if profile.v != crate::wire::PROFILE_V || profile.name != request.name {
                 return Err((400, "profile does not match registration".into()));
             }
             for delegation in &profile.delegations {
@@ -452,8 +451,12 @@ impl Relay {
             .try_into()
             .map_err(|_| (400, "invalid transfer signature".into()))?;
         let message = format!(
-            "ecco-transfer-v1\n{}@{}\n{}\n{}",
-            t.name, self.authority, t.to, t.ts
+            "{}\n{}@{}\n{}\n{}",
+            crate::wire::TRANSFER,
+            t.name,
+            self.authority,
+            t.to,
+            t.ts
         );
         key.verify(
             message.as_bytes(),
@@ -533,7 +536,7 @@ impl Relay {
     fn report(&self, url: &str, stored: &Stored) -> Result<(), String> {
         let path = url::Url::parse(url).map_err(|e| e.to_string())?;
         let body = serde_json::json!({
-            "schema": ACTIVITY_SCHEMA,
+            "schema": crate::wire::ACTIVITY,
             "relay": self.authority,
             "msg": stored,
         })
@@ -944,7 +947,8 @@ mod tests {
         r.store.register(old.profile()).unwrap();
         let ts = envelope::now();
         let message = format!(
-            "ecco-transfer-v1\n{}\n{}\n{ts}",
+            "{}\n{}\n{}\n{ts}",
+            crate::wire::TRANSFER,
             old.addr(),
             new.profile().root
         );
@@ -1163,7 +1167,7 @@ mod tests {
                     )
                     .unwrap();
                 let event: serde_json::Value = serde_json::from_str(&body).unwrap();
-                assert_eq!(event["schema"], ACTIVITY_SCHEMA);
+                assert_eq!(event["schema"], crate::wire::ACTIVITY);
                 assert_eq!(event["relay"], "localhost:4200");
                 seen.push(event["msg"]["env"]["id"].as_str().unwrap().to_string());
                 let (code, text) = match reply {

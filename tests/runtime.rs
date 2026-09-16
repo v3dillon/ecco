@@ -12,6 +12,10 @@ use std::{
 };
 
 const ECCO: &str = env!("CARGO_BIN_EXE_ecco");
+// The binary's wire constants, shared so this test never spells a version out.
+#[path = "../src/wire.rs"]
+#[allow(dead_code)]
+mod wire;
 
 struct Relay(Child);
 impl Drop for Relay {
@@ -65,6 +69,11 @@ fn collector() -> (String, Seen<Value>, Seen<String>) {
     let (seen, signers) = (Arc::clone(&events), Arc::clone(&keys));
     std::thread::spawn(move || {
         while let Ok(mut request) = server.recv() {
+            // Anything else on this loopback port (a local port prober, say) is not the relay.
+            if request.method().as_str() != "POST" || request.url() != "/collector" {
+                let _ = request.respond(tiny_http::Response::empty(404));
+                continue;
+            }
             let mut body = String::new();
             request.as_reader().read_to_string(&mut body).unwrap();
             let header = |name: &str| {
@@ -96,13 +105,14 @@ fn handler(dir: &Path, calls: &Path) -> PathBuf {
             r#"#!/bin/sh
 set -e
 input=$(cat)
-case "$input" in *'"schema":"ecco-dispatch-v1"'*) ;; *) echo "bad input: $input" >&2; exit 1;; esac
+case "$input" in *'"schema":"{dispatch}"'*) ;; *) echo "bad input: $input" >&2; exit 1;; esac
 [ "$WORKER_TEST_SETTING" = configured ] || {{ echo "missing env" >&2; exit 1; }}
 [ -z "$UNRELATED_SECRET" ] || {{ echo "leaked env" >&2; exit 1; }}
 printf x >> {calls}
 printf '%s' '{{"kind":"finding","text":"pong","follow_up":"one clarification"}}'
 "#,
-            calls = calls.display()
+            calls = calls.display(),
+            dispatch = wire::DISPATCH,
         ),
     )
     .unwrap();
@@ -124,6 +134,9 @@ fn relay_reports_stored_envelopes_and_the_dispatcher_answers_trusted_requests() 
         Command::new(ECCO)
             .args(["relay", "--port", &port.to_string(), "--signed", "--data"])
             .arg(root.join("relay"))
+            // A relay with --data needs no identity home (service units often have no HOME).
+            .env_remove("HOME")
+            .env_remove("ECCO_HOME")
             .env("ECCO_REPORTING_URL", &url)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -137,6 +150,14 @@ fn relay_reports_stored_envelopes_and_the_dispatcher_answers_trusted_requests() 
     for (home, name) in [(&alice, "alice"), (&bob, "bob")] {
         ecco(home, &[], &["init", "--name", name, "--relay", &relay]).unwrap();
     }
+    // Without --home, ECCO_HOME, or HOME, an identity command fails with a message, not a panic.
+    let no_home = Command::new(ECCO)
+        .arg("status")
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(!no_home.status.success());
+    assert!(String::from_utf8_lossy(&no_home.stderr).contains("set --home, ECCO_HOME, or HOME"));
     let before = fs::read(alice.join("identity.json")).unwrap();
     ecco(&alice, &[], &["init"]).unwrap();
     assert_eq!(fs::read(alice.join("identity.json")).unwrap(), before);
@@ -190,7 +211,7 @@ fn relay_reports_stored_envelopes_and_the_dispatcher_answers_trusted_requests() 
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(reported(request["id"].as_str().unwrap()), 1);
     let event = events.lock().unwrap()[0].clone();
-    assert_eq!(event["schema"], "ecco-activity-v1");
+    assert_eq!(event["schema"], wire::ACTIVITY);
     assert_eq!(event["relay"], authority);
     assert_eq!(event["msg"]["env"]["from"], bob_addr);
 
