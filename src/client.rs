@@ -158,6 +158,24 @@ fn post(url: &str, token: Option<&str>, body: &str) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+/// The auth-v0 headers (README §5) on a request made as this identity.
+fn signed(
+    req: ureq::Request,
+    id: &Identity,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+) -> ureq::Request {
+    let ts = envelope::now();
+    let sig = id
+        .agent_key()
+        .sign(&request_signing_bytes(method, path, ts, body));
+    req.set("x-ecco-addr", &id.addr())
+        .set("x-ecco-key", &encode_key(&id.agent_key().verifying_key()))
+        .set("x-ecco-ts", &ts.to_string())
+        .set("x-ecco-sig", &envelope::encode_sig(&sig))
+}
+
 /// Own-relay GET with auth-v0 headers (README §5) — signed reads are
 /// required on multi-tenant relays and harmlessly ignored on open ones.
 fn get_signed(id: &Identity, path: &str, timeout_secs: u64) -> Result<String, String> {
@@ -166,17 +184,42 @@ fn get_signed(id: &Identity, path: &str, timeout_secs: u64) -> Result<String, St
     if let Some(t) = id.token.as_deref() {
         req = req.set("authorization", &format!("Bearer {t}"));
     }
-    let ts = envelope::now();
-    let sig = id
-        .agent_key()
-        .sign(&request_signing_bytes("GET", path, ts, None));
-    req = req
-        .set("x-ecco-addr", &id.addr())
-        .set("x-ecco-key", &encode_key(&id.agent_key().verifying_key()))
-        .set("x-ecco-ts", &ts.to_string())
-        .set("x-ecco-sig", &envelope::encode_sig(&sig));
-    req.call()
+    signed(req, id, "GET", path, None)
+        .call()
         .map_err(describe)?
+        .into_string()
+        .map_err(|e| e.to_string())
+}
+
+/// A signed POST as this identity (README §5): the caller's JSON body to any
+/// service that verifies those headers. The reply body comes back as is; a
+/// non-2xx status is an error carrying the service's reply. Core does not
+/// know what the body means.
+pub fn call(id: &Identity, url: &str, body: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(url).map_err(|_| format!("not a URL: {url}"))?;
+    crate::registration::origin(&parsed.origin().ascii_serialization())?;
+    if parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("ecco call takes a URL without query, fragment, or credentials".into());
+    }
+    let req = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(Duration::from_secs(60))
+        .build()
+        .post(url)
+        .set("content-type", "application/json");
+    signed(req, id, "POST", parsed.path(), Some(body.as_bytes()))
+        .send_string(body)
+        .map_err(|e| match e {
+            ureq::Error::Status(code, resp) => format!(
+                "service returned {code}: {}",
+                resp.into_string().unwrap_or_default().trim()
+            ),
+            other => other.to_string(),
+        })?
         .into_string()
         .map_err(|e| e.to_string())
 }
@@ -248,6 +291,59 @@ mod tests {
             &sender,
         );
         assert!(receipt.verify(&other).is_err());
+    }
+
+    #[test]
+    fn call_signs_the_body_and_returns_the_reply_or_the_error() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/hook", server.server_addr());
+        let id = Identity::generate("alice", "https://relay.test", None);
+        let key = id.agent_key().verifying_key();
+        let worker = std::thread::spawn(move || {
+            for (code, reply) in [(200, r#"{"ok":true}"#), (400, "bad body")] {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .expect("request");
+                let header = |name: &str| {
+                    request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+                        .map(|h| h.value.as_str().to_string())
+                        .unwrap()
+                };
+                assert_eq!(request.url(), "/hook");
+                assert_eq!(header("x-ecco-addr"), "alice@relay.test");
+                assert_eq!(header("x-ecco-key"), encode_key(&key));
+                let ts: u64 = header("x-ecco-ts").parse().unwrap();
+                let sig: [u8; 64] = envelope::decode_prefixed(&header("x-ecco-sig"), "ed25519:")
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let mut body = String::new();
+                std::io::Read::read_to_string(request.as_reader(), &mut body).unwrap();
+                key.verify(
+                    &request_signing_bytes("POST", "/hook", ts, Some(body.as_bytes())),
+                    &Signature::from_bytes(&sig),
+                )
+                .unwrap();
+                request
+                    .respond(tiny_http::Response::from_string(reply).with_status_code(code))
+                    .unwrap();
+            }
+        });
+        assert_eq!(call(&id, &url, r#"{"x":1}"#).unwrap(), r#"{"ok":true}"#);
+        let err = call(&id, &url, "{}").unwrap_err();
+        assert!(err.contains("400") && err.contains("bad body"), "{err}");
+        worker.join().unwrap();
+        for bad in [
+            format!("{url}?token=x"),
+            "http://remote.test/hook".to_string(),
+            "not a url".to_string(),
+        ] {
+            assert!(call(&id, &bad, "{}").is_err(), "{bad}");
+        }
     }
 
     #[test]
