@@ -109,7 +109,8 @@ input=$(cat)
 case "$input" in *'"schema":"{dispatch}"'*) ;; *) echo "bad input: $input" >&2; exit 1;; esac
 [ "$WORKER_TEST_SETTING" = configured ] || {{ echo "missing env" >&2; exit 1; }}
 [ -z "$UNRELATED_SECRET" ] || {{ echo "leaked env" >&2; exit 1; }}
-printf x >> {calls}
+# One mark per run: the number of earlier messages the dispatcher passed along.
+printf '%s' "$(printf '%s' "$input" | jq '.thread | length')" >> {calls}
 printf '%s' '{{"kind":"finding","text":"pong","follow_up":"one clarification"}}'
 "#,
             calls = calls.display(),
@@ -345,7 +346,7 @@ fn relay_reports_stored_envelopes_and_the_dispatcher_answers_trusted_requests() 
     assert_eq!(status(), vec![("retrying".to_string(), 1)]);
     db.execute("UPDATE jobs SET next_at=0", []).unwrap();
     ecco(&alice, &worker, &["dispatcher", "run", "--once"]).unwrap();
-    assert_eq!(fs::read_to_string(&calls).unwrap(), "x");
+    assert_eq!(fs::read_to_string(&calls).unwrap(), "0"); // first request: nothing before it
     assert_eq!(status(), vec![("completed".to_string(), 2)]);
     let messages = thread(&bob, "smoke");
     let replies: Vec<&Value> = messages
@@ -363,8 +364,27 @@ fn relay_reports_stored_envelopes_and_the_dispatcher_answers_trusted_requests() 
     // A restart after a crash reuses the saved result and never replies twice.
     db.execute("UPDATE jobs SET status='running'", []).unwrap();
     ecco(&alice, &worker, &["dispatcher", "run", "--once"]).unwrap();
-    assert_eq!(fs::read_to_string(&calls).unwrap(), "x");
+    assert_eq!(fs::read_to_string(&calls).unwrap(), "0");
     assert_eq!(thread(&bob, "smoke").len(), 3);
+
+    // A second request on the thread arrives with the three earlier messages as context.
+    ecco(
+        &bob,
+        &[],
+        &[
+            "send",
+            "--to",
+            &alice_addr,
+            "--about",
+            "smoke",
+            "--kind",
+            "request",
+            "ping again",
+        ],
+    )
+    .unwrap();
+    ecco(&alice, &worker, &["dispatcher", "run", "--once"]).unwrap();
+    assert_eq!(fs::read_to_string(&calls).unwrap(), "03");
 
     // An encrypted request gets an encrypted reply; the endpoint sees ciphertext only.
     ecco(
@@ -384,7 +404,7 @@ fn relay_reports_stored_envelopes_and_the_dispatcher_answers_trusted_requests() 
     )
     .unwrap();
     ecco(&alice, &worker, &["dispatcher", "run", "--once"]).unwrap();
-    assert_eq!(fs::read_to_string(&calls).unwrap(), "xx");
+    assert_eq!(fs::read_to_string(&calls).unwrap(), "030");
     let private = thread(&bob, "private");
     let reply = private
         .iter()
@@ -412,7 +432,7 @@ fn relay_reports_stored_envelopes_and_the_dispatcher_answers_trusted_requests() 
     assert!(!seen.contains("secret-dispatch") && !seen.contains("pong"));
 
     let status_text = ecco(&alice, &[], &["dispatcher", "status"]).unwrap();
-    assert!(status_text.contains("completed: 2"), "{status_text}");
+    assert!(status_text.contains("completed: 3"), "{status_text}");
     drop(db);
     fs::remove_dir_all(root).unwrap();
 }

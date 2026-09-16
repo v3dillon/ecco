@@ -11,7 +11,7 @@ use clap::Subcommand;
 use handler::{Handler, ResultMessage};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
@@ -23,6 +23,8 @@ mod handler;
 
 const MAX_ATTEMPTS: i64 = 4;
 const MAX_REQUEST_TEXT_BYTES: usize = 64 * 1024;
+/// Earlier messages a handler sees alongside a request.
+const THREAD_CONTEXT: usize = 20;
 const SQLITE_SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -250,6 +252,24 @@ fn ingest(
     tx.commit().map_err(|e| e.to_string())
 }
 
+/// The conversation before `request`, as the handler sees it: trusted senders
+/// only, oldest first, decrypted where sealed to us, the last `THREAD_CONTEXT`.
+fn context(home: &Path, id: &Identity, thread: &[Stored], request: &Stored) -> Vec<Value> {
+    let (visible, _, _) = crate::agent_surface::partition(home, id, thread.to_vec());
+    let mut prior: Vec<&Stored> = visible.iter().filter(|s| s.tseq < request.tseq).collect();
+    prior.sort_by_key(|s| s.tseq);
+    prior
+        .iter()
+        .rev()
+        .take(THREAD_CONTEXT)
+        .rev()
+        .map(|s| {
+            let (body, _) = crate::agent_surface::resolved_body(id, s);
+            json!({ "id": s.env.id, "from": s.env.from, "kind": s.env.kind, "text": body["text"] })
+        })
+        .collect()
+}
+
 /// Our reply (or, with `follow`, our follow-up request) to `request`, if sent.
 fn correlated<'a>(
     thread: &'a [Stored],
@@ -366,6 +386,7 @@ fn execute(
                 "about": request.env.about,
                 "text": text,
             },
+            "thread": context(home, id, &thread, request),
         });
         let result = cfg.handler.run(
             &cfg.work_dir,
@@ -550,6 +571,83 @@ mod tests {
         };
         assert!(validate(&home, &limits).is_err());
         assert!(serde_json::from_str::<Config>(r#"{"allow":[],"extra":1}"#).is_err());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn handler_context_is_the_trusted_conversation_before_the_request() {
+        let (home, id) = home("context");
+        let peer = "peer@relay.test";
+        let make = |from: &str, kind: &str, text: &str, n: u64| Stored {
+            gseq: n,
+            tseq: n,
+            received_at: n,
+            env: envelope::Envelope::seal(
+                "topic".into(),
+                json!({"text": text}),
+                from.into(),
+                kind.into(),
+                vec![],
+                vec![id.addr()],
+                n,
+                &id.agent_key(),
+            ),
+        };
+        let sealed = envelope::seal_body(
+            &json!({"text":"sealed to me"}),
+            &[(id.addr(), id.root_key().verifying_key())],
+        )
+        .unwrap();
+        let mut thread = vec![
+            make(peer, "request", "first", 1),
+            make(&id.addr(), "finding", "answer", 2),
+            make("stranger@relay.test", "note", "held", 3),
+            make(peer, "request", "second", 5),
+            make(peer, "note", "after", 6),
+        ];
+        thread.insert(
+            3,
+            Stored {
+                gseq: 4,
+                tseq: 4,
+                received_at: 4,
+                env: envelope::Envelope::seal(
+                    "topic".into(),
+                    sealed,
+                    peer.into(),
+                    "note".into(),
+                    vec![],
+                    vec![id.addr()],
+                    4,
+                    &id.agent_key(),
+                ),
+            },
+        );
+        let request = thread[4].clone();
+        let seen: Vec<(String, String)> = context(&home, &id, &thread, &request)
+            .iter()
+            .map(|m| {
+                (
+                    m["from"].as_str().unwrap().to_string(),
+                    m["text"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (peer.to_string(), "first".to_string()),
+                (id.addr(), "answer".to_string()),
+                (peer.to_string(), "sealed to me".to_string()),
+            ]
+        );
+        let long: Vec<Stored> = (1..=30)
+            .map(|n| make(peer, "note", &n.to_string(), n))
+            .collect();
+        let last = make(peer, "request", "now", 31);
+        let capped = context(&home, &id, &long, &last);
+        assert_eq!(capped.len(), THREAD_CONTEXT);
+        assert_eq!(capped[0]["text"], "11");
         fs::remove_dir_all(home).unwrap();
     }
 
