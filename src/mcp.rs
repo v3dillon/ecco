@@ -142,7 +142,6 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
                     to,
                     encrypt,
                 },
-                str_arg("idempotency_key").as_deref(),
             )
             .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))
         }
@@ -354,7 +353,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("automatic durable retry identity"));
-        assert!(send["inputSchema"]["properties"]["idempotency_key"].is_null());
         let claim = defs
             .as_array()
             .unwrap()

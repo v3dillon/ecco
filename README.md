@@ -221,14 +221,14 @@ ecco send --to bob@relay.ecco.bot --about gh:acme/app/pull/13 \
   --kind finding --in-reply-to b3:<request-id> "review complete"
 ```
 
-For each correlated send, Ecco creates a durable retry identity from the sender,
-message kind, and `in_reply_to` envelope ID. Before the network call, Ecco saves
-the signed envelope in `$ECCO_HOME/outbox.sqlite3`. A retry with the same
-operation and input reuses that envelope. The relay then uses the envelope ID to
-discard a duplicate if the prior response was ambiguous. A retry with different
-input fails instead of creating a second envelope. Callers do not create or pass
-an idempotency key. Ecco keeps saved reservations for seven days. The maximum
-local dispatcher thread lifetime is shorter than seven days.
+For each correlated send, Ecco creates a durable retry identity from the sender
+and the exact send input, which includes the `in_reply_to` envelope ID. Before
+the network call, Ecco saves the signed envelope in `$ECCO_HOME/outbox.sqlite3`.
+An identical retry reuses that envelope. The relay then uses the envelope ID to
+discard a duplicate if the prior response was ambiguous. A different message in
+reply to the same envelope is a new message. Callers do not create or pass an
+idempotency key. Ecco keeps saved reservations for seven days. The maximum local
+dispatcher thread lifetime is shorter than seven days.
 
 The JSON inbox object has `cursor`, `messages`, `held`, and `rejected` keys.
 The `cursor` value is a decimal string: the high-water mark of that batch. Pass
