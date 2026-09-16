@@ -23,8 +23,12 @@ mod handler;
 
 const MAX_ATTEMPTS: i64 = 4;
 const MAX_REQUEST_TEXT_BYTES: usize = 64 * 1024;
-/// Earlier messages a handler sees alongside a request.
-const THREAD_CONTEXT: usize = 20;
+/// Text of earlier messages a handler sees alongside a request, by default.
+const DEFAULT_CONTEXT_BYTES: u32 = 24 * 1024;
+const MAX_CONTEXT_BYTES: u32 = 1024 * 1024;
+fn default_context_bytes() -> u32 {
+    DEFAULT_CONTEXT_BYTES
+}
 const SQLITE_SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -62,6 +66,9 @@ pub enum DispatcherCmd {
         /// Seconds one handler run may take
         #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u32).range(1..=86400))]
         timeout_seconds: u32,
+        /// Bytes of earlier messages passed to the handler with each request
+        #[arg(long, default_value_t = DEFAULT_CONTEXT_BYTES, value_parser = clap::value_parser!(u32).range(1..=MAX_CONTEXT_BYTES as i64))]
+        thread_context_bytes: u32,
         /// Requests per conversation before follow-ups stop
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=32))]
         max_thread_requests: u32,
@@ -85,6 +92,9 @@ pub struct Config {
     work_dir: PathBuf,
     handler: Handler,
     timeout_seconds: u32,
+    /// Added after the first release; older files load with the default.
+    #[serde(default = "default_context_bytes")]
+    context_bytes: u32,
     max_thread_requests: u32,
     thread_ttl_seconds: u32,
 }
@@ -116,6 +126,7 @@ fn validate(home: &Path, cfg: &Config) -> Result<(), String> {
         return Err("--workdir must be an existing absolute directory other than /".into());
     }
     if !(1..=86400).contains(&cfg.timeout_seconds)
+        || !(1..=MAX_CONTEXT_BYTES).contains(&cfg.context_bytes)
         || !(1..=32).contains(&cfg.max_thread_requests)
         || !(1..=86400).contains(&cfg.thread_ttl_seconds)
     {
@@ -133,6 +144,7 @@ pub fn command(home: &Path, cmd: DispatcherCmd) -> Result<(), String> {
             handler_arg,
             handler_env,
             timeout_seconds,
+            thread_context_bytes,
             max_thread_requests,
             thread_ttl_seconds,
         } => {
@@ -145,6 +157,7 @@ pub fn command(home: &Path, cmd: DispatcherCmd) -> Result<(), String> {
                     env: handler_env,
                 },
                 timeout_seconds,
+                context_bytes: thread_context_bytes,
                 max_thread_requests,
                 thread_ttl_seconds,
             };
@@ -252,34 +265,69 @@ fn ingest(
     tx.commit().map_err(|e| e.to_string())
 }
 
-/// The conversation before `request`, as the handler sees it: trusted senders
-/// only, oldest first, decrypted where sealed to us, the last `THREAD_CONTEXT`.
-fn context(home: &Path, id: &Identity, thread: &[Stored], request: &Stored) -> Vec<Value> {
+/// The message this one answers, read from the body we can see (an encrypted
+/// body keeps `in_reply_to` inside the ciphertext).
+fn in_reply_to(id: &Identity, stored: &Stored) -> Option<String> {
+    let (body, _) = crate::agent_surface::resolved_body(id, stored);
+    body["in_reply_to"].as_str().map(str::to_owned)
+}
+
+/// The conversation before `request`, as the handler sees it: the request's
+/// reply chain first, then the newest other messages, whole messages only,
+/// until `budget` bytes of text are spent. Trusted senders only, oldest
+/// first, decrypted where sealed to us.
+fn context(
+    home: &Path,
+    id: &Identity,
+    thread: &[Stored],
+    request: &Stored,
+    budget: usize,
+) -> Vec<Value> {
     let (visible, _, _) = crate::agent_surface::partition(home, id, thread.to_vec());
-    let mut prior: Vec<&Stored> = visible.iter().filter(|s| s.tseq < request.tseq).collect();
-    prior.sort_by_key(|s| s.tseq);
-    prior
+    let by_id: BTreeMap<&str, &Stored> = visible.iter().map(|s| (s.env.id.as_str(), s)).collect();
+    let mut chain: Vec<&Stored> = Vec::new();
+    let mut parent = in_reply_to(id, request);
+    while let Some(found) = parent.as_deref().and_then(|p| by_id.get(p)) {
+        if chain.iter().any(|c| c.env.id == found.env.id) {
+            break;
+        }
+        chain.push(found);
+        parent = in_reply_to(id, found);
+    }
+    let mut recent: Vec<&Stored> = visible
         .iter()
-        .rev()
-        .take(THREAD_CONTEXT)
-        .rev()
-        .map(|s| {
-            let (body, _) = crate::agent_surface::resolved_body(id, s);
-            json!({ "id": s.env.id, "from": s.env.from, "kind": s.env.kind, "text": body["text"] })
-        })
-        .collect()
+        .filter(|s| s.tseq < request.tseq && !chain.iter().any(|c| c.env.id == s.env.id))
+        .collect();
+    recent.sort_by_key(|s| std::cmp::Reverse(s.tseq));
+    let mut chosen: Vec<(u64, Value)> = Vec::new();
+    let mut spent = 0;
+    for s in chain.into_iter().chain(recent) {
+        let (body, _) = crate::agent_surface::resolved_body(id, s);
+        let text = body["text"].clone();
+        spent += text.as_str().map_or(0, str::len);
+        if spent > budget {
+            break;
+        }
+        chosen.push((
+            s.tseq,
+            json!({ "id": s.env.id, "from": s.env.from, "kind": s.env.kind, "text": text }),
+        ));
+    }
+    chosen.sort_by_key(|(tseq, _)| *tseq);
+    chosen.into_iter().map(|(_, m)| m).collect()
 }
 
 /// Our reply (or, with `follow`, our follow-up request) to `request`, if sent.
 fn correlated<'a>(
+    id: &Identity,
     thread: &'a [Stored],
-    self_addr: &str,
     request: &str,
     follow: bool,
 ) -> Option<&'a Stored> {
+    let self_addr = id.addr();
     thread.iter().find(|s| {
         s.env.from == self_addr
-            && s.env.body["in_reply_to"] == request
+            && in_reply_to(id, s).as_deref() == Some(request)
             && if follow {
                 s.env.kind == "request"
             } else {
@@ -369,7 +417,7 @@ fn execute(
         return Err("request sender is no longer trusted and allowed".into());
     }
     let thread = client::thread(id, &request.env.about, 0, 0)?;
-    let replied = correlated(&thread, &id.addr(), &request.env.id, false).is_some();
+    let replied = correlated(id, &thread, &request.env.id, false).is_some();
     if replied && saved.is_none() {
         return Ok("completed");
     }
@@ -386,7 +434,7 @@ fn execute(
                 "about": request.env.about,
                 "text": text,
             },
-            "thread": context(home, id, &thread, request),
+            "thread": context(home, id, &thread, request, cfg.context_bytes as usize),
         });
         let result = cfg.handler.run(
             &cfg.work_dir,
@@ -404,7 +452,7 @@ fn execute(
         send(home, id, request, &result.kind, &result.text)?;
     }
     if let Some(text) = &result.follow_up {
-        if correlated(&thread, &id.addr(), &request.env.id, true).is_none()
+        if correlated(id, &thread, &request.env.id, true).is_none()
             && follow_allowed(&thread, request, id, cfg, envelope::now())
         {
             send(home, id, request, "request", text)?;
@@ -515,6 +563,7 @@ mod tests {
                 env: vec![],
             },
             timeout_seconds: 900,
+            context_bytes: DEFAULT_CONTEXT_BYTES,
             max_thread_requests: 8,
             thread_ttl_seconds: 3600,
         }
@@ -575,16 +624,16 @@ mod tests {
     }
 
     #[test]
-    fn handler_context_is_the_trusted_conversation_before_the_request() {
+    fn handler_context_is_the_reply_chain_then_recent_messages_within_the_budget() {
         let (home, id) = home("context");
         let peer = "peer@relay.test";
-        let make = |from: &str, kind: &str, text: &str, n: u64| Stored {
+        let make = |from: &str, kind: &str, text: &str, parent: Option<&str>, n: u64| Stored {
             gseq: n,
             tseq: n,
             received_at: n,
             env: envelope::Envelope::seal(
                 "topic".into(),
-                json!({"text": text}),
+                crate::message_body(text.into(), parent.map(str::to_string)),
                 from.into(),
                 kind.into(),
                 vec![],
@@ -593,61 +642,64 @@ mod tests {
                 &id.agent_key(),
             ),
         };
-        let sealed = envelope::seal_body(
-            &json!({"text":"sealed to me"}),
-            &[(id.addr(), id.root_key().verifying_key())],
-        )
-        .unwrap();
-        let mut thread = vec![
-            make(peer, "request", "first", 1),
-            make(&id.addr(), "finding", "answer", 2),
-            make("stranger@relay.test", "note", "held", 3),
-            make(peer, "request", "second", 5),
-            make(peer, "note", "after", 6),
-        ];
-        thread.insert(
-            3,
-            Stored {
-                gseq: 4,
-                tseq: 4,
-                received_at: 4,
-                env: envelope::Envelope::seal(
-                    "topic".into(),
-                    sealed,
-                    peer.into(),
-                    "note".into(),
-                    vec![],
-                    vec![id.addr()],
-                    4,
-                    &id.agent_key(),
-                ),
-            },
-        );
-        let request = thread[4].clone();
-        let seen: Vec<(String, String)> = context(&home, &id, &thread, &request)
-            .iter()
-            .map(|m| {
-                (
-                    m["from"].as_str().unwrap().to_string(),
-                    m["text"].as_str().unwrap().to_string(),
+        let texts = |messages: &[Value]| -> Vec<String> {
+            messages
+                .iter()
+                .map(|m| m["text"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // A conversation: request, answer, follow-up; a stranger's note; unrelated chatter; a sealed note.
+        let first = make(peer, "request", "first", None, 1);
+        let answer = make(&id.addr(), "finding", "answer", Some(&first.env.id), 2);
+        let stranger = make("stranger@relay.test", "note", "held", None, 3);
+        let sealed = Stored {
+            gseq: 4,
+            tseq: 4,
+            received_at: 4,
+            env: envelope::Envelope::seal(
+                "topic".into(),
+                envelope::seal_body(
+                    &json!({"text":"sealed to me"}),
+                    &[(id.addr(), id.root_key().verifying_key())],
                 )
-            })
+                .unwrap(),
+                peer.into(),
+                "note".into(),
+                vec![],
+                vec![id.addr()],
+                4,
+                &id.agent_key(),
+            ),
+        };
+        let chatter: Vec<Stored> = (5..=30)
+            .map(|n| make(peer, "note", &format!("chatter {n}"), None, n))
             .collect();
-        assert_eq!(
-            seen,
-            vec![
-                (peer.to_string(), "first".to_string()),
-                (id.addr(), "answer".to_string()),
-                (peer.to_string(), "sealed to me".to_string()),
-            ]
+        let follow = make(peer, "request", "second", Some(&answer.env.id), 31);
+        let after = make(peer, "note", "after", None, 32);
+        let mut thread = vec![first, answer, stranger, sealed];
+        thread.extend(chatter);
+        thread.push(follow.clone());
+        thread.push(after);
+        // Everything fits: trusted messages before the request, oldest first, decrypted.
+        let all = context(&home, &id, &thread, &follow, 1 << 20);
+        assert_eq!(all.len(), 29); // 3 kept, 26 chatter; the stranger's note is held
+        assert_eq!(texts(&all[..3]), ["first", "answer", "sealed to me"]);
+        assert_eq!(texts(&all[28..]), ["chatter 30"]);
+        // A tight budget keeps the reply chain and the newest chatter, whole messages only.
+        let tight = context(
+            &home,
+            &id,
+            &thread,
+            &follow,
+            "first".len() + "answer".len() + "chatter 30".len() + 3,
         );
-        let long: Vec<Stored> = (1..=30)
-            .map(|n| make(peer, "note", &n.to_string(), n))
-            .collect();
-        let last = make(peer, "request", "now", 31);
-        let capped = context(&home, &id, &long, &last);
-        assert_eq!(capped.len(), THREAD_CONTEXT);
-        assert_eq!(capped[0]["text"], "11");
+        assert_eq!(texts(&tight), ["first", "answer", "chatter 30"]);
+        // A request with no lineage gets the newest messages that fit.
+        let fresh = make(peer, "request", "new topic", None, 33);
+        thread.push(fresh.clone());
+        let recent = context(&home, &id, &thread, &fresh, "after".len() + "second".len());
+        assert_eq!(texts(&recent), ["second", "after"]);
+        assert!(context(&home, &id, &thread, &fresh, 1).is_empty());
         fs::remove_dir_all(home).unwrap();
     }
 

@@ -151,10 +151,12 @@ ecco dispatcher status       # configuration and job counts
 {"schema":"ecco-dispatch-v1","type":"request","envelope":{"id":"b3:...","from":"peer@relay","about":"topic","text":"Review this change"},"thread":[{"id":"b3:...","from":"peer@relay","kind":"request","text":"..."},{"id":"b3:...","from":"you@relay","kind":"finding","text":"..."}]}
 ```
 
-`thread` is the conversation so far on that anchor: earlier messages from
-trusted senders, oldest first, the last 20, decrypted where sealed to you.
-Each auto-reply starts a fresh handler run, so this is how a handler follows
-a back-and-forth.
+`thread` is the conversation so far on that anchor, oldest first: the
+request's reply chain, then the newest other messages from trusted senders,
+whole messages only, until `--thread-context-bytes` of text (default 24 KB)
+are spent, decrypted where sealed to you. Each auto-reply starts a fresh
+handler run, so this is how a handler follows a back-and-forth without being
+handed an unbounded history.
 
 ```json
 {"kind":"finding","text":"The answer","follow_up":null}
