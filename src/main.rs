@@ -157,6 +157,11 @@ enum Cmd {
     Reject { id: String },
     /// Serve ecco as MCP tools over stdio (for agent harnesses)
     Mcp,
+    /// Send a signed POST as this identity: JSON from stdin, the reply to stdout (README §5)
+    Call {
+        /// Full HTTPS URL, or a path on the service your relay advertises
+        url: String,
+    },
     /// Answer trusted requests with a local handler (README, "Automatic replies")
     Dispatcher {
         #[command(subcommand)]
@@ -556,6 +561,22 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
         Cmd::Approve { id: target } => decide(home, &target, "approves"),
         Cmd::Reject { id: target } => decide(home, &target, "rejects"),
         Cmd::Mcp => mcp::run(home),
+        Cmd::Call { url } => {
+            let id = Identity::load(home)?;
+            let url = if url.starts_with('/') {
+                let service = registration::discover(&id.relay)?
+                    .ok_or("your relay advertises no service; give ecco call a full URL")?;
+                format!("{service}{url}")
+            } else {
+                url
+            };
+            let mut body = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut body)
+                .map_err(|e| e.to_string())?;
+            serde_json::from_str::<Value>(&body).map_err(|e| format!("stdin is not JSON: {e}"))?;
+            print!("{}", client::call(&id, &url, &body)?);
+            Ok(())
+        }
         Cmd::Resolve { addr } => {
             let own = Identity::load(home).ok();
             let token = own.as_ref().and_then(|id| token_for(id, &addr));
@@ -972,6 +993,18 @@ mod tests {
         assert!(err.contains("not overwritten"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{invalid");
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn call_takes_one_url_or_path() {
+        assert!(matches!(
+            Cli::try_parse_from(["ecco", "call", "/api/traces"]).unwrap().cmd,
+            Cmd::Call { ref url } if url == "/api/traces"
+        ));
+        assert!(Cli::try_parse_from(["ecco", "call"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ecco", "call", "https://a.test/x", "--header", "k:v"]).is_err()
+        );
     }
 
     #[test]

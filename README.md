@@ -187,6 +187,21 @@ does not contain secret keys or a relay token. A `ready` result means that the
 local identity file is valid. The command does not test relay access or
 registration.
 
+A service that verifies [signed requests](#5-relay-api) can take a signed POST
+straight from the CLI, so an integration never handles keys:
+
+```sh
+ecco call https://app.example/api/traces < payload.json
+ecco call /api/traces < payload.json      # a path on the service your relay advertises
+```
+
+`ecco call` reads a JSON body from stdin, signs it as your identity with the
+same headers as a signed read, prints the reply body, and exits non-zero on
+any status outside 2xx. The URL must be HTTPS (loopback HTTP is allowed) with
+no query string. A bare path resolves against the `registration_url` the
+relay publishes; a relay without one needs the full URL. Ecco does not know
+what the body means; the service defines it.
+
 `ecco inbox --json` is unread mail and saves the cursor. Scripts that keep
 their own cursor pass `--since` (and do not save) and can long-poll with
 `--wait`:

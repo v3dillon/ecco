@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 use std::{
     fs,
+    io::Write,
     net::{TcpListener, TcpStream},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -163,6 +164,96 @@ fn relay_reports_stored_envelopes_and_the_dispatcher_answers_trusted_requests() 
     assert_eq!(fs::read(alice.join("identity.json")).unwrap(), before);
     let bob_addr = format!("bob@{authority}");
     let alice_addr = format!("alice@{authority}");
+
+    // `ecco call`: a signed POST any service can verify with the agent key the relay publishes for the address.
+    let hook = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let hook_url = format!("http://{}/hook", hook.server_addr());
+    let profile: Value = serde_json::from_str(
+        &ureq::get(&format!("{relay}/addr/alice"))
+            .call()
+            .unwrap()
+            .into_string()
+            .unwrap(),
+    )
+    .unwrap();
+    let agent_key = {
+        let hex_key = profile["delegations"][0]["key"].as_str().unwrap();
+        let bytes: [u8; 32] = hex::decode(hex_key.strip_prefix("ed25519:").unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        ed25519_dalek::VerifyingKey::from_bytes(&bytes).unwrap()
+    };
+    let expected_addr = alice_addr.clone();
+    let hook_thread = std::thread::spawn(move || {
+        use ed25519_dalek::Verifier;
+        let mut request = hook
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .expect("call");
+        let header = |name: &str| {
+            request
+                .headers()
+                .iter()
+                .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+                .map(|h| h.value.as_str().to_string())
+                .unwrap()
+        };
+        assert_eq!(header("x-ecco-addr"), expected_addr);
+        let ts: u64 = header("x-ecco-ts").parse().unwrap();
+        let sig: [u8; 64] = hex::decode(header("x-ecco-sig").strip_prefix("ed25519:").unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut body = String::new();
+        request.as_reader().read_to_string(&mut body).unwrap();
+        let message = format!(
+            "POST\n/hook\n{ts}\nb3:{}",
+            blake3::hash(body.as_bytes()).to_hex()
+        );
+        agent_key
+            .verify(
+                message.as_bytes(),
+                &ed25519_dalek::Signature::from_bytes(&sig),
+            )
+            .unwrap();
+        request
+            .respond(tiny_http::Response::from_string(r#"{"stored":true}"#))
+            .unwrap();
+        body
+    });
+    let mut child = Command::new(ECCO)
+        .arg("--home")
+        .arg(&alice)
+        .args(["call", &hook_url])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"agent":"x","transcript":"y"}"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), r#"{"stored":true}"#);
+    assert_eq!(
+        hook_thread.join().unwrap(),
+        r#"{"agent":"x","transcript":"y"}"#
+    );
+    // A bare path needs a service the relay advertises; this relay has none.
+    assert!(ecco(&alice, &[], &["call", "/hook"])
+        .unwrap_err()
+        .contains("advertises no service"));
 
     // Every stored envelope reaches the endpoint once, whoever reads it.
     let request: Value = serde_json::from_str(
