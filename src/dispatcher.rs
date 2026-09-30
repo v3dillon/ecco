@@ -393,6 +393,7 @@ fn send(
             body: crate::message_body(text.into(), Some(request.env.id.clone())),
             to: vec![request.env.from.clone()],
             encrypt: envelope::is_encrypted(&request.env.body),
+            key: None,
         },
     )?;
     client::send(id, &env).map(|_| ())
