@@ -226,9 +226,20 @@ and the exact send input, which includes the `in_reply_to` envelope ID. Before
 the network call, Ecco saves the signed envelope in `$ECCO_HOME/outbox.sqlite3`.
 An identical retry reuses that envelope. The relay then uses the envelope ID to
 discard a duplicate if the prior response was ambiguous. A different message in
-reply to the same envelope is a new message. Callers do not create or pass an
-idempotency key. Ecco keeps saved reservations for seven days. The maximum local
-dispatcher thread lifetime is shorter than seven days.
+reply to the same envelope is a new message. A correlated send needs no key.
+Ecco keeps saved reservations for seven days. The maximum local dispatcher
+thread lifetime is shorter than seven days.
+
+A send that does not reply to an envelope is durable only when the caller gives
+`--key`. Use a stable ID that the caller already stores, such as the ID of a
+chat line. The key and the exact send input create the retry identity in the
+same way. An identical retry reuses the saved envelope. The same key with a
+different text is a new message. `ecco status --json` lists the
+`durable-keyed-send-v1` capability when the binary supports `--key`:
+
+```sh
+ecco send --to bob@relay.ecco.bot --about chat:team --key line-42 "ok"
+```
 
 The JSON inbox object has `cursor`, `messages`, `held`, and `rejected` keys.
 The `cursor` value is a decimal string: the high-water mark of that batch. Pass

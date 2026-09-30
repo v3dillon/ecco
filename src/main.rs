@@ -21,7 +21,7 @@ use client::Stored;
 use envelope::Envelope;
 use identity::Identity;
 
-const CAPABILITIES: &[&str] = &[wire::DURABLE_CORRELATED_SEND];
+const CAPABILITIES: &[&str] = &[wire::DURABLE_CORRELATED_SEND, wire::DURABLE_KEYED_SEND];
 
 #[derive(Parser)]
 #[command(
@@ -109,6 +109,9 @@ enum Cmd {
         /// Envelope id of the request this message answers
         #[arg(long)]
         in_reply_to: Option<String>,
+        /// Your stable id for this message. A retry with the same key and input reuses the saved envelope
+        #[arg(long)]
+        key: Option<String>,
     },
     /// Coordinate exclusive work on a generic thread anchor
     Work {
@@ -385,6 +388,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
             kind,
             encrypt,
             in_reply_to,
+            key,
         } => {
             let id = Identity::load(home)?;
             let about = about.unwrap_or_else(|| dm_thread(&id.addr(), &to));
@@ -398,6 +402,7 @@ fn run(cmd: Cmd, home: &Path) -> Result<(), String> {
                     body,
                     to,
                     encrypt,
+                    key,
                 },
             )?;
             println!("{}", serde_json::to_string(&receipt).unwrap());
@@ -633,6 +638,7 @@ fn post(
             body,
             to,
             encrypt,
+            key: None,
         },
     )
 }
@@ -644,6 +650,10 @@ struct SendInput {
     body: Value,
     to: Vec<String>,
     encrypt: bool,
+    /// The caller's stable id for the message. Local only: it never goes on
+    /// the wire. Omitted when absent, so correlated sends keep their keys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
 }
 
 fn post_idempotent(
@@ -662,15 +672,19 @@ fn prepare_envelope(home: &Path, id: &Identity, input: SendInput) -> Result<Enve
     }
 }
 
-/// A correlated send is durable: this sender's exact input in reply to an
-/// envelope names one saved envelope. An identical retry reuses it. A different
-/// message in reply to the same envelope is a different message.
+/// A correlated or keyed send is durable: this sender's exact input, in reply
+/// to an envelope or under the caller's key, names one saved envelope. An
+/// identical retry reuses it. A different message is a different message.
 fn idempotency_key(id: &Identity, input: &SendInput) -> Option<String> {
-    if !input.body["in_reply_to"].is_string() {
+    let schema = if input.key.is_some() {
+        wire::DURABLE_KEYED_SEND
+    } else if input.body["in_reply_to"].is_string() {
+        wire::DURABLE_CORRELATED_SEND
+    } else {
         return None;
-    }
+    };
     let operation = serde_json::to_vec(&json!({
-        "schema": wire::DURABLE_CORRELATED_SEND,
+        "schema": schema,
         "from": id.addr(),
         "send": input,
     }))
@@ -696,6 +710,7 @@ fn post_envelope(
             body,
             to,
             encrypt,
+            key: None,
         },
     )?;
     let receipt = client::send(id, &env)?;
@@ -709,6 +724,7 @@ fn build_envelope(home: &Path, id: &Identity, input: SendInput) -> Result<Envelo
         body,
         to,
         encrypt,
+        key: _,
     } = input;
     let contacts = identity::contacts_load(home);
     for addr in &to {
@@ -1033,6 +1049,14 @@ mod tests {
                 ..
             } if id == "b3:request"
         ));
+        let cli = Cli::try_parse_from(["ecco", "send", "ok", "--key", "line-1"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Send {
+                key: Some(ref key),
+                ..
+            } if key == "line-1"
+        ));
         assert!(matches!(
             Cli::try_parse_from(["ecco", "log", "topic", "--json"])
                 .unwrap()
@@ -1054,7 +1078,7 @@ mod tests {
         assert_eq!(missing["schema"], wire::STATUS);
         assert_eq!(
             missing["capabilities"],
-            json!([wire::DURABLE_CORRELATED_SEND])
+            json!([wire::DURABLE_CORRELATED_SEND, wire::DURABLE_KEYED_SEND])
         );
         assert_eq!(missing["ready"], false);
         assert_eq!(missing["identity"]["state"], "missing");
@@ -1097,6 +1121,7 @@ mod tests {
             body: message_body(text.into(), Some("b3:request".into())),
             to: vec!["bob@relay.example".into()],
             encrypt: false,
+            key: None,
         };
         let first = idempotency_key(&id, &input("finding", "done")).unwrap();
         let retry = idempotency_key(&id, &input("finding", "done")).unwrap();
@@ -1105,6 +1130,12 @@ mod tests {
         assert_eq!(first, retry);
         assert_ne!(first, changed_text);
         assert_ne!(first, changed_kind);
+        // Without a key the input serializes as before, so reservations saved
+        // by an older binary still match after an upgrade.
+        assert!(serde_json::to_value(input("finding", "done"))
+            .unwrap()
+            .get("key")
+            .is_none());
         assert!(idempotency_key(
             &id,
             &SendInput {
@@ -1113,9 +1144,30 @@ mod tests {
                 body: message_body("ordinary".into(), None),
                 to: vec![],
                 encrypt: false,
+                key: None,
             }
         )
         .is_none());
+    }
+
+    #[test]
+    fn keyed_sends_derive_retry_keys_without_a_request() {
+        let id = Identity::generate("alice", "https://relay.example", None);
+        let input = |key: &str, text: &str| SendInput {
+            about: "topic".into(),
+            kind: "note".into(),
+            body: message_body(text.into(), None),
+            to: vec!["bob@relay.example".into()],
+            encrypt: false,
+            key: Some(key.into()),
+        };
+        let first = idempotency_key(&id, &input("line-1", "ok")).unwrap();
+        let retry = idempotency_key(&id, &input("line-1", "ok")).unwrap();
+        let same_text_new_key = idempotency_key(&id, &input("line-2", "ok")).unwrap();
+        let same_key_new_text = idempotency_key(&id, &input("line-1", "changed")).unwrap();
+        assert_eq!(first, retry);
+        assert_ne!(first, same_text_new_key);
+        assert_ne!(first, same_key_new_text);
     }
 
     #[test]
@@ -1128,12 +1180,36 @@ mod tests {
             body: message_body(text.into(), Some("b3:request".into())),
             to: vec![],
             encrypt: false,
+            key: None,
         };
         let first = prepare_envelope(&home, &id, input("done")).unwrap();
         let retry = prepare_envelope(&home, &id, input("done")).unwrap();
         let changed = prepare_envelope(&home, &id, input("changed")).unwrap();
         assert_eq!(first.id, retry.id);
         assert_ne!(first.id, changed.id);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn keyed_sends_reserve_one_envelope_per_key() {
+        let home = temp_home();
+        let id = Identity::generate("alice", "http://127.0.0.1:1", None);
+        let input = |key: &str| SendInput {
+            about: "topic".into(),
+            kind: "note".into(),
+            body: message_body("ok".into(), None),
+            to: vec![],
+            encrypt: false,
+            key: Some(key.into()),
+        };
+        let first = prepare_envelope(&home, &id, input("line-1")).unwrap();
+        // A rebuilt envelope takes a later `ts` and so a new id: the retry
+        // keeps the first id only because the outbox returns the saved one.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let retry = prepare_envelope(&home, &id, input("line-1")).unwrap();
+        let next = prepare_envelope(&home, &id, input("line-2")).unwrap();
+        assert_eq!(first.id, retry.id);
+        assert_ne!(first.id, next.id);
         let _ = std::fs::remove_dir_all(home);
     }
 }

@@ -141,6 +141,7 @@ fn call(home: &Path, name: &str, args: &Value) -> Result<String, String> {
                     body,
                     to,
                     encrypt,
+                    key: None,
                 },
             )
             .and_then(|r| serde_json::to_string(&r).map_err(|e| e.to_string()))

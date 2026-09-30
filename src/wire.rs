@@ -18,3 +18,5 @@ pub const DISPATCH: &str = "ecco-dispatch-v1";
 pub const STATUS: &str = "ecco-status-v1";
 /// Capability advertised by `ecco status`: correlated sends are idempotent.
 pub const DURABLE_CORRELATED_SEND: &str = "durable-correlated-send-v1";
+/// Capability advertised by `ecco status`: `send --key` makes a send idempotent.
+pub const DURABLE_KEYED_SEND: &str = "durable-keyed-send-v1";
