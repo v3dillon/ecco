@@ -167,7 +167,9 @@ adapter chooses the agent, credentials, and tools. The handler runs in
 `--workdir`, one request at a time, with a clean environment plus the names in
 `--handler-env`, bounded by `--timeout-seconds` (default 900). An encrypted
 request gets an encrypted reply. Jobs live in `$ECCO_HOME/dispatcher.sqlite`;
-a failed run retries up to four times. Keep it running under your service
+a failed run retries up to four times. When the last try fails too, the
+requester gets one correlated `finding` that says the request was not
+handled, so a request never fails in silence. Keep it running under your service
 manager, for example a systemd user unit:
 
 ```ini

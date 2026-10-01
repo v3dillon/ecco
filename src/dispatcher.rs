@@ -1,6 +1,8 @@
 //! Local durable dispatch: a trusted, allow-listed `request` starts your
 //! handler, and its one result goes back as a correlated `finding` or
-//! `proposal`. Agent launch, credentials, and permissions live in the handler.
+//! `proposal`. A request whose handler fails every attempt gets one
+//! correlated `finding` that says so, never silence. Agent launch,
+//! credentials, and permissions live in the handler.
 use crate::{
     client::{self, Stored},
     envelope,
@@ -41,9 +43,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   result TEXT,
   next_at INTEGER NOT NULL DEFAULT 0
 );";
-/// Jobs ready to run: new, or retrying and past their backoff.
-const SQLITE_READY: &str = "SELECT payload,result,attempts FROM jobs
-     WHERE status IN ('received','retrying') AND next_at<=unixepoch() ORDER BY rowid LIMIT 20";
+/// Jobs ready to run: new, retrying, or owing the requester a failure
+/// notice, and past their backoff.
+const SQLITE_READY: &str = "SELECT payload,result,attempts,status FROM jobs
+     WHERE status IN ('received','retrying','notify') AND next_at<=unixepoch() ORDER BY rowid LIMIT 20";
 
 #[derive(Subcommand)]
 pub enum DispatcherCmd {
@@ -399,6 +402,41 @@ fn send(
     client::send(id, &env).map(|_| ())
 }
 
+/// The sender is still allowed and trusted.
+fn trusted(home: &Path, id: &Identity, cfg: &Config, request: &Stored) -> bool {
+    cfg.allow.contains(&request.env.from)
+        && identity::standing(
+            &identity::contacts_load(home),
+            &id.addr(),
+            &request.env.from,
+        ) == identity::Standing::Trusted
+}
+
+/// What the requester reads when the handler failed every attempt.
+fn failure_text() -> String {
+    format!(
+        "This request was not handled. The handler failed {MAX_ATTEMPTS} times, so the dispatcher stopped trying. Send the request again later."
+    )
+}
+
+/// Tell the requester that its request failed: one correlated finding,
+/// unless a reply went out already or the sender is no longer trusted.
+fn notify_failure(
+    home: &Path,
+    id: &Identity,
+    cfg: &Config,
+    request: &Stored,
+) -> Result<(), String> {
+    if !trusted(home, id, cfg, request) {
+        return Ok(());
+    }
+    let thread = client::thread(id, &request.env.about, 0, 0)?;
+    if correlated(id, &thread, &request.env.id, false).is_some() {
+        return Ok(());
+    }
+    send(home, id, request, "finding", &failure_text())
+}
+
 fn execute(
     db: &Connection,
     home: &Path,
@@ -407,13 +445,7 @@ fn execute(
     request: &Stored,
     saved: Option<&str>,
 ) -> Result<&'static str, String> {
-    if !cfg.allow.contains(&request.env.from)
-        || identity::standing(
-            &identity::contacts_load(home),
-            &id.addr(),
-            &request.env.from,
-        ) != identity::Standing::Trusted
-    {
+    if !trusted(home, id, cfg, request) {
         return Err("request sender is no longer trusted and allowed".into());
     }
     let thread = client::thread(id, &request.env.about, 0, 0)?;
@@ -471,32 +503,53 @@ fn process_ready(
     id: &Identity,
     cfg: &Config,
 ) -> Result<(), String> {
-    let jobs: Vec<(String, Option<String>, i64)> = db
+    let jobs: Vec<(String, Option<String>, i64, String)> = db
         .prepare(SQLITE_READY)
         .map_err(|e| e.to_string())?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
         .map_err(|e| e.to_string())?
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
-    for (payload, saved, attempts) in jobs {
+    for (payload, saved, attempts, status) in jobs {
         if local::cancelled() {
             break;
         }
         let request: Stored = serde_json::from_str(&payload).map_err(|e| e.to_string())?;
         let attempt = attempts + 1;
+        // A notice stays `notify` while it is sent, so a crash never runs
+        // the handler again; the correlated check keeps it to one message.
+        let running = if status == "notify" {
+            "notify"
+        } else {
+            "running"
+        };
         db.execute(
-            "UPDATE jobs SET status='running',attempts=? WHERE id=?",
-            rusqlite::params![attempt, request.env.id],
+            "UPDATE jobs SET status=?,attempts=? WHERE id=?",
+            rusqlite::params![running, attempt, request.env.id],
         )
         .map_err(|e| e.to_string())?;
-        let (status, delay) = match execute(db, home, id, cfg, &request, saved.as_deref()) {
-            Ok(status) => (status, 0),
-            Err(e) => {
-                eprintln!("dispatcher request {}: {e}", request.env.id);
-                if attempt >= MAX_ATTEMPTS {
-                    ("failed", 0)
-                } else {
-                    ("retrying", 2i64 << attempt)
+        let (status, delay) = if status == "notify" {
+            match notify_failure(home, id, cfg, &request) {
+                Ok(()) => ("failed", 0),
+                Err(e) => {
+                    eprintln!("dispatcher request {}: failure notice: {e}", request.env.id);
+                    if attempt >= 2 * MAX_ATTEMPTS {
+                        ("failed", 0)
+                    } else {
+                        ("notify", 2i64 << (attempt - MAX_ATTEMPTS))
+                    }
+                }
+            }
+        } else {
+            match execute(db, home, id, cfg, &request, saved.as_deref()) {
+                Ok(status) => (status, 0),
+                Err(e) => {
+                    eprintln!("dispatcher request {}: {e}", request.env.id);
+                    if attempt >= MAX_ATTEMPTS {
+                        ("notify", 0)
+                    } else {
+                        ("retrying", 2i64 << attempt)
+                    }
                 }
             }
         };

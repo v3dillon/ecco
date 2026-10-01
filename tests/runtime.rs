@@ -431,8 +431,70 @@ fn relay_reports_stored_envelopes_and_the_dispatcher_answers_trusted_requests() 
     let seen = serde_json::to_string(&private_events).unwrap();
     assert!(!seen.contains("secret-dispatch") && !seen.contains("pong"));
 
+    // A handler that fails every attempt: the requester hears so, once.
+    ecco(
+        &bob,
+        &[],
+        &[
+            "send",
+            "--to",
+            &alice_addr,
+            "--about",
+            "broken",
+            "--kind",
+            "request",
+            "this will fail",
+        ],
+    )
+    .unwrap();
+    let broken = || -> (String, i64) {
+        db.query_row(
+            "SELECT status,attempts FROM jobs ORDER BY rowid DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+    for attempt in 1..=4 {
+        db.execute("UPDATE jobs SET next_at=0", []).unwrap();
+        ecco(&alice, &[], &["dispatcher", "run", "--once"]).unwrap(); // no worker env: the handler fails
+        let expected = if attempt < 4 { "retrying" } else { "notify" };
+        assert_eq!(broken(), (expected.to_string(), attempt));
+    }
+    assert!(thread(&bob, "broken")
+        .iter()
+        .all(|m| m["env"]["from"] != alice_addr));
+    ecco(&alice, &[], &["dispatcher", "run", "--once"]).unwrap();
+    assert_eq!(broken(), ("failed".to_string(), 5));
+    db.execute(
+        "UPDATE jobs SET status='notify',next_at=0 WHERE status='failed'",
+        [],
+    )
+    .unwrap();
+    ecco(&alice, &[], &["dispatcher", "run", "--once"]).unwrap(); // a repeat sends nothing new
+    let notices: Vec<Value> = thread(&bob, "broken")
+        .into_iter()
+        .filter(|m| m["env"]["from"] == alice_addr)
+        .collect();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0]["env"]["kind"], "finding");
+    let failed_request = thread(&bob, "broken")
+        .into_iter()
+        .find(|m| m["env"]["kind"] == "request")
+        .unwrap();
+    assert_eq!(
+        notices[0]["env"]["body"]["in_reply_to"],
+        failed_request["env"]["id"]
+    );
+    assert!(notices[0]["env"]["body"]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("This request was not handled."));
+    assert_eq!(fs::read_to_string(&calls).unwrap(), "030"); // the failing runs leave no mark
+
     let status_text = ecco(&alice, &[], &["dispatcher", "status"]).unwrap();
     assert!(status_text.contains("completed: 3"), "{status_text}");
+    assert!(status_text.contains("failed: 1"), "{status_text}");
     drop(db);
     fs::remove_dir_all(root).unwrap();
 }
